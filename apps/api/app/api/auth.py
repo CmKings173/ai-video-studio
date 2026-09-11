@@ -1,7 +1,7 @@
 from datetime import timedelta
 
 from fastapi import APIRouter, Depends, Request, Response
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from apps.api.app.api.deps import AuthContext, auth_context, current_user, require_csrf
@@ -25,6 +25,7 @@ async def login(
     session: AsyncSession = Depends(get_session),
     settings: Settings = Depends(get_settings),
 ) -> LoginDTO:
+    await session.execute(delete(AuthSession).where(AuthSession.expires_at <= utcnow()))
     email = payload.email.strip().lower()
     client_host = request.client.host if request.client else "unknown"
     throttle_key = f"{client_host}:{email}"

@@ -22,6 +22,7 @@ from apps.api.app.schemas.api import (
     VideoDTO,
     VideoPatch,
 )
+from apps.api.app.services.domain_guards import require_active_brand
 from apps.api.app.services.idempotency import claim, complete
 from apps.api.app.services.storyboard_service import StoryboardService
 
@@ -98,10 +99,7 @@ async def create_video(
                 "Selected product belongs to a different brand",
                 422,
             )
-    if payload.brand_id:
-        brand = await session.get(Brand, str(payload.brand_id))
-        if brand is None or brand.archived:
-            raise AppError("BRAND_NOT_ACTIVE", "Brand is missing or archived", 409)
+    await require_active_brand(session, str(payload.brand_id) if payload.brand_id else None)
     video = Video(**payload.model_dump(mode="json"), created_by=user.id)
     session.add(video)
     await session.flush()

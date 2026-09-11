@@ -12,7 +12,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from apps.api.app.core.errors import AppError
 from apps.api.app.db.models import (
     Asset,
-    Brand,
     FinalVideo,
     FinalVideoScene,
     Product,
@@ -22,6 +21,7 @@ from apps.api.app.db.models import (
     Video,
 )
 from apps.api.app.schemas.api import AssemblyRequest
+from apps.api.app.services.domain_guards import require_active_brand
 
 
 def manifest_hash(value: dict[str, Any]) -> str:
@@ -59,9 +59,7 @@ class AssemblyService:
         if product is not None and product.archived:
             raise AppError("PRODUCT_NOT_ACTIVE", "Product is archived", 409)
         brand_id = video.brand_id or (product.brand_id if product else None)
-        brand = await session.get(Brand, brand_id) if brand_id else None
-        if brand is not None and brand.archived:
-            raise AppError("BRAND_NOT_ACTIVE", "Brand is archived", 409)
+        await require_active_brand(session, brand_id)
         active = await session.scalar(
             select(FinalVideo.id)
             .where(

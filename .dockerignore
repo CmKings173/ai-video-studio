@@ -1,10 +1,14 @@
 .git
+.gitignore
+.dockerignore
 .venv
+tests
+docs
+tasks
+*.env
+*.env.*
 **/__pycache__
 **/.pytest_cache
 Calliope
 h3-webui
 minimax-h3-frontend
-docs
-tasks
-

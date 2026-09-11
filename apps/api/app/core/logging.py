@@ -24,6 +24,11 @@ class JsonFormatter(logging.Formatter):
             "generation_id",
             "comfy_prompt_id",
             "final_video_id",
+            "object_key",
+            "error_type",
+            "error_code",
+            "attempt_no",
+            "phase",
         ):
             if hasattr(record, name):
                 value[name] = getattr(record, name)

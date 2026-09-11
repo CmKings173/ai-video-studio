@@ -62,6 +62,13 @@ async def require_csrf(
     return context.user
 
 
+async def require_admin_csrf(user: User = Depends(require_csrf)) -> User:
+    """Require both a valid CSRF token and administrator role."""
+    if user.role != "ADMIN":
+        raise AppError("FORBIDDEN", "Administrator access required", 403)
+    return user
+
+
 def parse_revision(value: str | None) -> int:
     if value is None:
         raise AppError("PRECONDITION_REQUIRED", "If-Match revision is required", 428)

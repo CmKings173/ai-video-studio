@@ -371,6 +371,8 @@
         "properties": {
           "deleted_older_than_hours": {
             "default": 168,
+            "deprecated": true,
+            "description": "Deprecated compatibility field; runtime retention settings are authoritative.",
             "maximum": 8760.0,
             "minimum": 1.0,
             "title": "Deleted Older Than Hours",
@@ -383,6 +385,8 @@
           },
           "pending_older_than_hours": {
             "default": 24,
+            "deprecated": true,
+            "description": "Deprecated compatibility field; runtime retention settings are authoritative.",
             "maximum": 8760.0,
             "minimum": 1.0,
             "title": "Pending Older Than Hours",

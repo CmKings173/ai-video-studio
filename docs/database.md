@@ -21,8 +21,8 @@ transaction after a crash. Staging objects older than
 | PostgreSQL backup | daily custom-format dump | `infra/scripts/backup.ps1` |
 | MinIO backup | daily data copy plus checksum manifest | `infra/scripts/backup.ps1` |
 | Failed/temp asset retention | 24 hours | `RETENTION_FAILED_HOURS` |
-| Unselected generation retention | 30 days | `RETENTION_UNSELECTED_GENERATION_DAYS` |
-| Deleted asset record retention | 7 days by default | cleanup request and audit log |
+| Pending/temp asset retention | 24 hours by default | `PENDING_ASSET_RETENTION_HOURS` / `ORPHAN_OBJECT_RETENTION_HOURS` |
+| Deleted asset record retention | 7 days by default | `DELETED_ASSET_RETENTION_HOURS` and cleanup audit |
 
 RPO/RTO are targets until a restore drill records measured values. Never delete
 the source database or MinIO bucket as part of a routine backup. Restore into an

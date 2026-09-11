@@ -5,7 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from apps.api.app.api.common import pagination
 from apps.api.app.api.deps import expected_revision, require_csrf, require_editor
 from apps.api.app.core.errors import AppError
-from apps.api.app.db.models import Asset, Brand, Product, User, Video
+from apps.api.app.db.models import Asset, Product, User, Video
 from apps.api.app.db.session import get_session
 from apps.api.app.schemas.api import (
     AssetDTO,
@@ -15,6 +15,7 @@ from apps.api.app.schemas.api import (
     ProductPatch,
     VideoDTO,
 )
+from apps.api.app.services.domain_guards import require_active_brand
 
 router = APIRouter(prefix="/products", tags=["products"])
 
@@ -66,8 +67,7 @@ async def create_product(
     user: User = Depends(require_csrf),
     session: AsyncSession = Depends(get_session),
 ) -> ProductDTO:
-    if payload.brand_id and await session.get(Brand, str(payload.brand_id)) is None:
-        raise AppError("BRAND_NOT_FOUND", "Brand not found", 404)
+    await require_active_brand(session, str(payload.brand_id) if payload.brand_id else None)
     product = Product(**payload.model_dump(mode="json"), created_by=user.id)
     session.add(product)
     await session.flush()
@@ -98,12 +98,7 @@ async def patch_product(
     if product is None:
         raise AppError("PRODUCT_NOT_FOUND", "Product not found", 404)
     values = payload.model_dump(exclude_unset=True, mode="json")
-    if (
-        "brand_id" in values
-        and values["brand_id"]
-        and await session.get(Brand, values["brand_id"]) is None
-    ):
-        raise AppError("BRAND_NOT_FOUND", "Brand not found", 404)
+    await require_active_brand(session, values.get("brand_id"))
     if product.revision != revision:
         raise AppError(
             "REVISION_CONFLICT",

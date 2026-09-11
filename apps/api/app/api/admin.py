@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from apps.api.app.api.assets import store
 from apps.api.app.api.common import pagination
-from apps.api.app.api.deps import require_admin, require_csrf
+from apps.api.app.api.deps import require_admin, require_admin_csrf
 from apps.api.app.core.config import Settings, get_settings
 from apps.api.app.core.errors import AppError
 from apps.api.app.core.security import hash_password
@@ -91,11 +91,9 @@ async def list_users(
 @router.post("/users", response_model=UserDTO, status_code=201)
 async def create_user(
     payload: UserCreate,
-    admin: User = Depends(require_csrf),
+    admin: User = Depends(require_admin_csrf),
     session: AsyncSession = Depends(get_session),
 ) -> UserDTO:
-    if admin.role != "ADMIN":
-        raise AppError("FORBIDDEN", "Administrator access required", 403)
     email = _email(payload.email)
     if await session.scalar(select(User.id).where(User.email == email)):
         raise AppError("EMAIL_IN_USE", "Email address is already in use", 409)
@@ -118,11 +116,9 @@ async def create_user(
 async def patch_user(
     user_id: str,
     payload: UserPatch,
-    admin: User = Depends(require_csrf),
+    admin: User = Depends(require_admin_csrf),
     session: AsyncSession = Depends(get_session),
 ) -> UserDTO:
-    if admin.role != "ADMIN":
-        raise AppError("FORBIDDEN", "Administrator access required", 403)
     # Serialize every active-admin mutation in a deterministic order. Locking
     # only the target row lets two admins concurrently demote/disable the last
     # two accounts after both observe the same count.
@@ -213,11 +209,9 @@ def _approved(payload: WorkflowCreate) -> ApprovedWorkflow:
 @router.post("/workflows", response_model=WorkflowDTO, status_code=201)
 async def create_workflow(
     payload: WorkflowCreate,
-    admin: User = Depends(require_csrf),
+    admin: User = Depends(require_admin_csrf),
     session: AsyncSession = Depends(get_session),
 ) -> WorkflowDTO:
-    if admin.role != "ADMIN":
-        raise AppError("FORBIDDEN", "Administrator access required", 403)
     approved = _approved(payload)
     record = WorkflowRecord(
         **payload.model_dump(mode="json"),
@@ -241,11 +235,9 @@ async def create_workflow(
 async def approve_workflow(
     workflow_id: str,
     payload: WorkflowApproval,
-    admin: User = Depends(require_csrf),
+    admin: User = Depends(require_admin_csrf),
     session: AsyncSession = Depends(get_session),
 ) -> WorkflowDTO:
-    if admin.role != "ADMIN":
-        raise AppError("FORBIDDEN", "Administrator access required", 403)
     record = await session.get(WorkflowRecord, workflow_id, with_for_update=True)
     if record is None:
         raise AppError("WORKFLOW_NOT_FOUND", "Workflow was not found", 404)
@@ -350,13 +342,11 @@ async def storage_summary(
 @router.post("/storage/cleanup", response_model=CleanupResultDTO)
 async def cleanup_storage(
     payload: CleanupRequest,
-    admin: User = Depends(require_csrf),
+    admin: User = Depends(require_admin_csrf),
     session: AsyncSession = Depends(get_session),
     asset_store: AssetStore = Depends(store),
     settings: Settings = Depends(get_settings),
 ) -> CleanupResultDTO:
-    if admin.role != "ADMIN":
-        raise AppError("FORBIDDEN", "Administrator access required", 403)
     now = utcnow()
     policy = RetentionPolicy.from_settings(settings)
     rows = list(
@@ -405,13 +395,11 @@ async def cleanup_storage(
 
 @router.post("/storage/reconcile", response_model=ReconciliationDTO)
 async def reconcile_storage(
-    admin: User = Depends(require_csrf),
+    admin: User = Depends(require_admin_csrf),
     factory=Depends(get_session_factory),
     settings: Settings = Depends(get_settings),
     asset_store: AssetStore = Depends(store),
 ) -> ReconciliationDTO:
-    if admin.role != "ADMIN":
-        raise AppError("FORBIDDEN", "Administrator access required", 403)
     report = await AssetReconciler(factory, asset_store, settings).run()
     return ReconciliationDTO(
         missing_objects=report.missing_objects,

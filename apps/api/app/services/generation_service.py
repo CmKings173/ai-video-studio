@@ -14,7 +14,6 @@ from apps.api.app.core.config import Settings
 from apps.api.app.core.errors import AppError
 from apps.api.app.db.models import (
     Asset,
-    Brand,
     GenerationAsset,
     Product,
     Project,
@@ -24,6 +23,7 @@ from apps.api.app.db.models import (
     WorkflowRecord,
 )
 from apps.api.app.schemas.api import GenerationRequest
+from apps.api.app.services.domain_guards import require_active_brand
 from apps.api.app.services.h3_validator import (
     H3Profile,
     H3Request,
@@ -322,9 +322,7 @@ class GenerationService:
         if product is not None and product.archived:
             raise AppError("PRODUCT_NOT_ACTIVE", "Product is archived", 409)
         brand_id = video.brand_id or (product.brand_id if product else None)
-        brand = await session.get(Brand, brand_id) if brand_id else None
-        if brand is not None and brand.archived:
-            raise AppError("BRAND_NOT_ACTIVE", "Brand is archived", 409)
+        brand = await require_active_brand(session, brand_id)
         prompt_result = await self.prompt_engine.compose(
             {
                 "brief": video.brief,

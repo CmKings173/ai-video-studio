@@ -1,7 +1,10 @@
+FROM ghcr.io/astral-sh/uv:0.11.32 AS uv
 FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PYTHONPATH=/app
 WORKDIR /app
+
+COPY --from=uv /uv /uvx /bin/
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ffmpeg curl \
@@ -13,8 +16,8 @@ COPY migrations ./migrations
 COPY alembic.ini ./alembic.ini
 COPY workflows ./workflows
 COPY infra ./infra
-COPY pyproject.toml ./
-RUN pip install --no-cache-dir .
+COPY pyproject.toml uv.lock ./
+RUN uv pip install --system --locked --no-cache .
 
 RUN useradd --create-home --uid 10001 studio \
     && mkdir -p /workspace \
