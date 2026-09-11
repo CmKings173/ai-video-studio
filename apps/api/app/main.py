@@ -38,6 +38,7 @@ from apps.api.app.core.config import get_settings
 from apps.api.app.core.errors import AppError
 from apps.api.app.core.logging import configure_logging, request_id_context
 from apps.api.app.core.metrics import metrics
+from apps.api.app.core.request_limits import RequestBodyLimitMiddleware
 from apps.api.app.core.security import hash_password
 from apps.api.app.db.models import User
 from apps.api.app.db.session import SessionFactory, engine
@@ -125,6 +126,9 @@ app.add_middleware(
 )
 
 
+app.add_middleware(RequestBodyLimitMiddleware, max_bytes=settings.request_body_max_bytes)
+
+
 def _error_payload(
     request: Request, code: str, message: str, details: dict | list | None = None
 ) -> dict:
@@ -142,30 +146,6 @@ def _error_payload(
 @app.middleware("http")
 async def request_context(request: Request, call_next):
     started_at = time.perf_counter()
-    content_length = request.headers.get("content-length")
-    if content_length:
-        try:
-            if int(content_length) > settings.request_body_max_bytes:
-                request_id = uuid4().hex
-                request.state.request_id = request_id
-                return JSONResponse(
-                    _error_payload(
-                        request,
-                        "REQUEST_BODY_TOO_LARGE",
-                        "Request body exceeds the configured limit",
-                    ),
-                    status_code=413,
-                    headers={
-                        "X-Request-ID": request_id,
-                        "X-Content-Type-Options": "nosniff",
-                        "X-Frame-Options": "DENY",
-                        "Referrer-Policy": "no-referrer",
-                        "Cache-Control": "no-store",
-                        "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'",
-                    },
-                )
-        except ValueError:
-            pass
     supplied = request.headers.get("X-Request-ID", "")
     request_id = supplied if REQUEST_ID.fullmatch(supplied) else uuid4().hex
     request.state.request_id = request_id
@@ -306,11 +286,7 @@ for api_router in routers:
 def _error_response(description: str) -> dict:
     return {
         "description": description,
-        "content": {
-            "application/json": {
-                "schema": {"$ref": "#/components/schemas/ErrorEnvelope"}
-            }
-        },
+        "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorEnvelope"}}},
     }
 
 
@@ -324,9 +300,7 @@ def public_openapi() -> dict:
         routes=app.routes,
     )
     components = schema.setdefault("components", {})
-    model_schema = ErrorEnvelope.model_json_schema(
-        ref_template="#/components/schemas/{model}"
-    )
+    model_schema = ErrorEnvelope.model_json_schema(ref_template="#/components/schemas/{model}")
     definitions = model_schema.pop("$defs", {})
     components.setdefault("schemas", {}).update(definitions)
     components["schemas"]["ErrorEnvelope"] = model_schema

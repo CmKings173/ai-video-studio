@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
+from uuid import uuid4
 
 import httpx
 import pytest
@@ -91,9 +92,7 @@ async def test_csrf_and_editor_admin_boundaries_are_enforced(session_factory):
         )
         csrf = login.json()["csrf_token"]
 
-        denied = await client.post(
-            "/api/v1/projects", json={"name": "Campaign", "description": ""}
-        )
+        denied = await client.post("/api/v1/projects", json={"name": "Campaign", "description": ""})
         assert denied.status_code == 403
         assert denied.json()["error"]["code"] == "CSRF_INVALID"
 
@@ -137,6 +136,30 @@ async def test_error_envelope_is_consistent_and_does_not_echo_password(session_f
 
 
 @pytest.mark.asyncio
+async def test_repeated_failed_logins_are_throttled_without_account_enumeration(
+    session_factory,
+):
+    email = f"throttle-{uuid4().hex}@example.test"
+    await seed_user(session_factory, email=email, password="correct horse battery")
+    async with api_client(session_factory) as client:
+        for _ in range(5):
+            response = await client.post(
+                "/api/v1/auth/login",
+                json={"email": email, "password": "wrong-password"},
+            )
+            assert response.status_code == 401
+            assert response.json()["error"]["code"] == "INVALID_CREDENTIALS"
+
+        blocked = await client.post(
+            "/api/v1/auth/login",
+            json={"email": email, "password": "wrong-password"},
+        )
+        assert blocked.status_code == 429
+        assert blocked.json()["error"]["code"] == "LOGIN_RATE_LIMITED"
+        assert "password" not in blocked.text.lower()
+
+
+@pytest.mark.asyncio
 async def test_logout_requires_csrf_and_revokes_server_session(session_factory):
     await seed_user(
         session_factory,
@@ -151,8 +174,6 @@ async def test_logout_requires_csrf_and_revokes_server_session(session_factory):
         csrf = login.json()["csrf_token"]
         assert (await client.post("/api/v1/auth/logout")).status_code == 403
         assert (
-            await client.post(
-                "/api/v1/auth/logout", headers={"X-CSRF-Token": csrf}
-            )
+            await client.post("/api/v1/auth/logout", headers={"X-CSRF-Token": csrf})
         ).status_code == 204
         assert (await client.get("/api/v1/auth/me")).status_code == 401

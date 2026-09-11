@@ -1,12 +1,13 @@
 from datetime import timedelta
 
-from fastapi import APIRouter, Depends, Response
+from fastapi import APIRouter, Depends, Request, Response
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from apps.api.app.api.deps import AuthContext, auth_context, current_user, require_csrf
 from apps.api.app.core.config import Settings, get_settings
 from apps.api.app.core.errors import AppError
+from apps.api.app.core.login_throttle import login_throttle
 from apps.api.app.core.security import hash_token, new_token, verify_password
 from apps.api.app.db.models import Session as AuthSession
 from apps.api.app.db.models import User, utcnow
@@ -18,16 +19,31 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 
 @router.post("/login", response_model=LoginDTO)
 async def login(
+    request: Request,
     payload: Login,
     response: Response,
     session: AsyncSession = Depends(get_session),
     settings: Settings = Depends(get_settings),
 ) -> LoginDTO:
-    user = await session.scalar(select(User).where(User.email == payload.email.lower()))
+    email = payload.email.strip().lower()
+    client_host = request.client.host if request.client else "unknown"
+    throttle_key = f"{client_host}:{email}"
+    retry_after = login_throttle.retry_after(throttle_key)
+    if retry_after:
+        raise AppError(
+            "LOGIN_RATE_LIMITED",
+            "Too many login attempts; try again later",
+            429,
+            {"retry_after_seconds": retry_after},
+        )
+    user = await session.scalar(select(User).where(User.email == email))
     if user is None or not verify_password(payload.password, user.password_hash):
+        login_throttle.record_failure(throttle_key)
         raise AppError("INVALID_CREDENTIALS", "Invalid email or password", 401)
     if not user.is_active:
+        login_throttle.record_failure(throttle_key)
         raise AppError("ACCOUNT_DISABLED", "Account is disabled", 403)
+    login_throttle.record_success(throttle_key)
     token, csrf = new_token(), new_token()
     session.add(
         AuthSession(
