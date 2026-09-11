@@ -2,7 +2,7 @@ groups:
   - name: ai-video-studio
     rules:
       - alert: StudioApiDown
-        expr: studio_postgres_up == 0 or studio_minio_up == 0 or studio_comfyui_up == 0
+        expr: up{job="ai-video-studio-api"} == 0 or studio_postgres_up == 0 or studio_minio_up == 0 or studio_comfyui_up == 0
         for: 5m
         annotations:
           summary: "AI Video Studio dependency is unavailable"

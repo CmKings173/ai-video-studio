@@ -92,6 +92,15 @@ async def _refresh_database_gauges(session: AsyncSession, settings: Settings) ->
             metrics.set("studio_backup_age_seconds", -1)
     else:
         metrics.set("studio_backup_age_seconds", -1)
+    metrics.set("studio_backup_configured", int(settings.backup_status_file is not None))
+
+
+async def _health_gauge(name: str, check) -> None:
+    try:
+        healthy = bool(await check())
+    except Exception:
+        healthy = False
+    metrics.set(name, int(healthy))
 
 
 @router.get("/metrics", include_in_schema=False)
@@ -104,9 +113,16 @@ async def prometheus_metrics(
     expected = f"Bearer {settings.metrics_token}" if settings.metrics_token else ""
     if not expected or not hmac.compare_digest(supplied, expected):
         raise AppError("METRICS_UNAUTHORIZED", "Metrics authentication required", 401)
-    async with factory() as session:
-        await _refresh_database_gauges(session, settings)
-    metrics.set("studio_postgres_up", 1)
-    metrics.set("studio_minio_up", int(await AssetStore(settings).health()))
-    metrics.set("studio_comfyui_up", int(await ComfyAdapter(settings).health()))
+    try:
+        async with factory() as session:
+            await _refresh_database_gauges(session, settings)
+    except Exception:
+        metrics.set("studio_postgres_up", 0)
+        metrics.inc("studio_metrics_refresh_errors_total")
+    else:
+        metrics.set("studio_postgres_up", 1)
+    store = AssetStore(settings)
+    adapter = ComfyAdapter(settings)
+    await _health_gauge("studio_minio_up", store.health)
+    await _health_gauge("studio_comfyui_up", adapter.health)
     return PlainTextResponse(metrics.render(), media_type="text/plain; version=0.0.4")
