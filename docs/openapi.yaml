@@ -1805,11 +1805,19 @@
             },
             "title": "Repaired Assets",
             "type": "array"
+          },
+          "unavailable_objects": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Unavailable Objects",
+            "type": "array"
           }
         },
         "required": [
           "missing_objects",
           "corrupt_objects",
+          "unavailable_objects",
           "orphan_objects",
           "repaired_assets"
         ],

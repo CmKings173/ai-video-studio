@@ -8,19 +8,36 @@ import logging
 from dataclasses import dataclass, field
 from datetime import timedelta
 
+from botocore.exceptions import ClientError
 from sqlalchemy import select
 
 from apps.api.app.db.models import Asset, utcnow
 from apps.api.app.integrations.media import inspect_media
+from apps.api.app.integrations.minio import AssetObjectMissingError
 from apps.api.app.services.asset_service import upload_staging_key
 
 logger = logging.getLogger(__name__)
+
+
+_MISSING_CODES = {"404", "NoSuchKey", "NoSuchObject", "NoSuchBucket", "NotFound"}
+
+
+def _is_confirmed_missing(exc: BaseException) -> bool:
+    if isinstance(exc, (AssetObjectMissingError, KeyError, FileNotFoundError)):
+        return True
+    if isinstance(exc, ClientError):
+        error = exc.response.get("Error", {})
+        code = str(error.get("Code", ""))
+        status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+        return code in _MISSING_CODES or status == 404
+    return False
 
 
 @dataclass
 class ReconciliationReport:
     missing_objects: list[str] = field(default_factory=list)
     corrupt_objects: list[str] = field(default_factory=list)
+    unavailable_objects: list[str] = field(default_factory=list)
     orphan_objects: list[str] = field(default_factory=list)
     repaired_assets: list[str] = field(default_factory=list)
 
@@ -30,6 +47,12 @@ class AssetReconciler:
         self.factory = factory
         self.store = store
         self.settings = settings
+
+    async def _mark_ready_failed(self, asset_id: str) -> None:
+        async with self.factory() as session, session.begin():
+            asset = await session.get(Asset, asset_id, with_for_update=True)
+            if asset and asset.status == "READY":
+                asset.status = "FAILED"
 
     async def _snapshots(self) -> list[dict]:
         async with self.factory() as session:
@@ -131,20 +154,38 @@ class AssetReconciler:
                             snapshot["object_key"], self.settings.max_upload_bytes
                         )
                         corrupt = hashlib.sha256(data).hexdigest() != snapshot["checksum"]
-                    except Exception:
-                        corrupt = True
+                    except Exception as exc:
+                        if _is_confirmed_missing(exc):
+                            report.missing_objects.append(snapshot["object_key"])
+                            await self._mark_ready_failed(snapshot["id"])
+                        else:
+                            report.unavailable_objects.append(snapshot["object_key"])
+                            logger.warning(
+                                "asset_reconciliation_storage_unavailable",
+                                extra={
+                                    "object_key": snapshot["object_key"],
+                                    "error_type": type(exc).__name__,
+                                },
+                            )
+                        continue
                 if corrupt:
                     report.corrupt_objects.append(snapshot["object_key"])
-                    async with self.factory() as session, session.begin():
-                        asset = await session.get(Asset, snapshot["id"], with_for_update=True)
-                        if asset and asset.status == "READY":
-                            asset.status = "FAILED"
-            except Exception:
-                report.missing_objects.append(snapshot["object_key"])
-                async with self.factory() as session, session.begin():
-                    asset = await session.get(Asset, snapshot["id"], with_for_update=True)
-                    if asset and asset.status == "READY":
-                        asset.status = "FAILED"
+                    await self._mark_ready_failed(snapshot["id"])
+            except Exception as exc:
+                # A READY row may only be failed on a confirmed not-found result.
+                # Unknown/transient failures are reported without mutating business state.
+                if _is_confirmed_missing(exc):
+                    report.missing_objects.append(snapshot["object_key"])
+                    await self._mark_ready_failed(snapshot["id"])
+                else:
+                    report.unavailable_objects.append(snapshot["object_key"])
+                    logger.warning(
+                        "asset_reconciliation_storage_unavailable",
+                        extra={
+                            "object_key": snapshot["object_key"],
+                            "error_type": type(exc).__name__,
+                        },
+                    )
         if inspect_orphans:
             for item in await self.store.list_objects():
                 if item["key"] not in known_keys:
@@ -176,6 +217,7 @@ class AssetReconciler:
         if (
             report.missing_objects
             or report.corrupt_objects
+            or report.unavailable_objects
             or report.orphan_objects
             or report.repaired_assets
         ):
@@ -184,6 +226,7 @@ class AssetReconciler:
                 extra={
                     "missing_objects": report.missing_objects,
                     "corrupt_objects": report.corrupt_objects,
+                    "unavailable_objects": report.unavailable_objects,
                     "orphan_objects": report.orphan_objects,
                     "repaired_assets": report.repaired_assets,
                 },

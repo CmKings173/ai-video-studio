@@ -537,5 +537,6 @@ class CleanupResultDTO(Output):
 class ReconciliationDTO(Output):
     missing_objects: list[str]
     corrupt_objects: list[str]
+    unavailable_objects: list[str]
     orphan_objects: list[str]
     repaired_assets: list[str]

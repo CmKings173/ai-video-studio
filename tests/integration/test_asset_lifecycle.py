@@ -6,6 +6,7 @@ from io import BytesIO
 from types import SimpleNamespace
 
 import pytest
+from botocore.exceptions import ClientError
 from PIL import Image
 
 from apps.api.app.db.models import Asset, FinalVideo, Project, User, Video, utcnow
@@ -62,6 +63,15 @@ class FakeStore:
 
     async def delete(self, key: str) -> None:
         self.objects.pop(key, None)
+
+
+class TemporarilyUnavailableStore(FakeStore):
+    def __init__(self, error: BaseException | None = None):
+        super().__init__()
+        self.error = error or TimeoutError("MinIO request timed out")
+
+    async def head(self, key: str) -> dict:
+        raise self.error
 
 
 def png_bytes() -> bytes:
@@ -211,6 +221,52 @@ async def test_reconciler_marks_corrupt_ready_object_failed(session_factory, tmp
     assert report.corrupt_objects == ["assets/corrupt.png"]
     async with session_factory() as session:
         assert (await session.get(Asset, asset.id)).status == "FAILED"
+
+
+@pytest.mark.parametrize(
+    "storage_error",
+    [
+        TimeoutError("MinIO request timed out"),
+        ConnectionError("connection reset by peer"),
+        ClientError(
+            {
+                "Error": {"Code": "InternalError"},
+                "ResponseMetadata": {"HTTPStatusCode": 503},
+            },
+            "HeadObject",
+        ),
+    ],
+    ids=["timeout", "connection", "server-error"],
+)
+@pytest.mark.asyncio
+async def test_reconciler_does_not_fail_ready_asset_when_storage_is_temporarily_unavailable(
+    session_factory, tmp_path, storage_error
+):
+    user_id, project_id = await seed_owner(session_factory)
+    store = TemporarilyUnavailableStore(storage_error)
+    async with session_factory() as session, session.begin():
+        asset = Asset(
+            project_id=project_id,
+            kind="IMAGE",
+            role="PRODUCT_IMAGE",
+            filename="available-after-retry.png",
+            content_type="image/png",
+            object_key="assets/temporarily-unavailable.png",
+            status="READY",
+            size_bytes=10,
+            checksum="a" * 64,
+            created_by=user_id,
+        )
+        session.add(asset)
+        await session.flush()
+
+    report = await AssetReconciler(session_factory, store, settings(tmp_path)).run(
+        inspect_orphans=False
+    )
+
+    assert report.unavailable_objects == [asset.object_key]
+    async with session_factory() as session:
+        assert (await session.get(Asset, asset.id)).status == "READY"
 
 
 @pytest.mark.asyncio

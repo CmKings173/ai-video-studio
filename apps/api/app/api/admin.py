@@ -416,6 +416,7 @@ async def reconcile_storage(
     return ReconciliationDTO(
         missing_objects=report.missing_objects,
         corrupt_objects=report.corrupt_objects,
+        unavailable_objects=report.unavailable_objects,
         orphan_objects=report.orphan_objects,
         repaired_assets=report.repaired_assets,
     )

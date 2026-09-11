@@ -9,11 +9,55 @@ from urllib.parse import quote
 
 import boto3
 from botocore.config import Config
-from botocore.exceptions import ClientError
+from botocore.exceptions import (
+    BotoCoreError,
+    ClientError,
+    ConnectionClosedError,
+    ConnectTimeoutError,
+    EndpointConnectionError,
+    ReadTimeoutError,
+)
 
 
 class AssetStoreError(RuntimeError):
     pass
+
+
+class AssetObjectMissingError(AssetStoreError):
+    """Raised only when the object store confirms an object is absent."""
+
+
+class AssetStoreUnavailableError(AssetStoreError):
+    """Raised when the object store cannot answer reliably right now."""
+
+
+def _translate_storage_error(exc: BaseException) -> AssetStoreError:
+    if isinstance(exc, ClientError):
+        error = exc.response.get("Error", {})
+        code = str(error.get("Code", ""))
+        status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+        if (
+            code in {"404", "NoSuchKey", "NoSuchObject", "NoSuchBucket", "NotFound"}
+            or status == 404
+        ):
+            return AssetObjectMissingError("Object is missing")
+        return AssetStoreUnavailableError(
+            f"Object store request failed ({code or status or 'unknown'})"
+        )
+    if isinstance(
+        exc,
+        (
+            BotoCoreError,
+            ConnectionClosedError,
+            ConnectTimeoutError,
+            EndpointConnectionError,
+            ReadTimeoutError,
+            OSError,
+            TimeoutError,
+        ),
+    ):
+        return AssetStoreUnavailableError("Object store is temporarily unavailable")
+    return AssetStoreUnavailableError("Object store failed without a reliable result")
 
 
 class AssetStore:
@@ -91,9 +135,12 @@ class AssetStore:
             await asyncio.to_thread(self.client.create_bucket, Bucket=self.bucket)
 
     async def head(self, key: str) -> dict:
-        value = await asyncio.to_thread(
-            self.client.head_object, Bucket=self.bucket, Key=self._key(key)
-        )
+        try:
+            value = await asyncio.to_thread(
+                self.client.head_object, Bucket=self.bucket, Key=self._key(key)
+            )
+        except (ClientError, BotoCoreError, OSError, TimeoutError) as exc:
+            raise _translate_storage_error(exc) from exc
         return {
             **value,
             "size": int(value["ContentLength"]),
@@ -120,7 +167,10 @@ class AssetStore:
             finally:
                 body.close()
 
-        return await asyncio.to_thread(fetch)
+        try:
+            return await asyncio.to_thread(fetch)
+        except (ClientError, BotoCoreError, OSError, TimeoutError) as exc:
+            raise _translate_storage_error(exc) from exc
 
     get_bytes = read
 
