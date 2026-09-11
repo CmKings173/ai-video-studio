@@ -1,0 +1,10 @@
+.git
+.venv
+**/__pycache__
+**/.pytest_cache
+Calliope
+h3-webui
+minimax-h3-frontend
+docs
+tasks
+

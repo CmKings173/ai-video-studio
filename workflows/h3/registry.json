@@ -1,0 +1,154 @@
+{
+  "schema_version": 1,
+  "workflows": [
+    {
+      "code": "H3_T2V_STANDARD",
+      "mode": "t2v",
+      "version": "2026-09-10-reference",
+      "file": "video_minimax_h3_t2v.api.json",
+      "source": "minimax-h3-frontend/resources/workflows_api/video_minimax_h3_t2v.api.json",
+      "slots": {
+        "PROMPT": ["104", "prompt"],
+        "SEED": ["15", "noise_seed"],
+        "DURATION": ["111", "value"],
+        "STEPS": ["9", "steps"],
+        "ASPECT_RATIO": ["115", "aspect_ratio"],
+        "OUTPUT_PREFIX": ["92", "filename_prefix"]
+      },
+      "required_slots": ["PROMPT", "SEED", "DURATION", "STEPS", "ASPECT_RATIO", "OUTPUT_PREFIX"],
+      "profile": {
+        "canvas_multiple": 32,
+        "max_pixels": 2088960,
+        "fps": 24,
+        "frame_base": 5,
+        "frame_step": 17,
+        "max_reference_images": 0,
+        "max_reference_audio": 0,
+        "max_reference_videos": 0,
+        "output_node": "92",
+        "aspect_ratio_values": {
+          "9:16": "9:16 (Portrait)",
+          "16:9": "16:9 (Widescreen)",
+          "1:1": "1:1 (Square)"
+        },
+        "provenance": "minimax-h3-frontend/resources/workflows_api/video_minimax_h3_t2v.api.json",
+        "poc_verified": false
+      },
+      "auto_approve": false
+    },
+    {
+      "code": "H3_I2V_STANDARD",
+      "mode": "i2v",
+      "version": "2026-09-10-reference",
+      "file": "video_minimax_h3_i2v.api.json",
+      "source": "minimax-h3-frontend/resources/workflows_api/video_minimax_h3_i2v.api.json",
+      "slots": {
+        "PROMPT": ["104", "prompt"],
+        "SEED": ["15", "noise_seed"],
+        "DURATION": ["111", "value"],
+        "STEPS": ["9", "steps"],
+        "ASPECT_RATIO": ["115", "aspect_ratio"],
+        "OUTPUT_PREFIX": ["92", "filename_prefix"],
+        "FIRST_FRAME": ["114", "image"]
+      },
+      "required_slots": ["PROMPT", "SEED", "DURATION", "STEPS", "ASPECT_RATIO", "OUTPUT_PREFIX", "FIRST_FRAME"],
+      "profile": {
+        "canvas_multiple": 32,
+        "max_pixels": 2088960,
+        "fps": 24,
+        "frame_base": 5,
+        "frame_step": 17,
+        "max_reference_images": 0,
+        "max_reference_audio": 0,
+        "max_reference_videos": 0,
+        "output_node": "92",
+        "aspect_ratio_values": {
+          "9:16": "9:16 (Portrait)",
+          "16:9": "16:9 (Widescreen)",
+          "1:1": "1:1 (Square)"
+        },
+        "provenance": "minimax-h3-frontend/resources/workflows_api/video_minimax_h3_i2v.api.json",
+        "poc_verified": false
+      },
+      "auto_approve": false
+    },
+    {
+      "code": "H3_FIRST_LAST_STANDARD",
+      "mode": "i2v_first_last",
+      "version": "2026-09-10-reference",
+      "file": "video_minimax_h3_i2v.api.json",
+      "source": "minimax-h3-frontend/resources/workflows_api/video_minimax_h3_i2v.api.json",
+      "derive": {
+        "type": "first_last",
+        "loader_node": "116",
+        "target_node": "104"
+      },
+      "slots": {
+        "PROMPT": ["104", "prompt"],
+        "SEED": ["15", "noise_seed"],
+        "DURATION": ["111", "value"],
+        "STEPS": ["9", "steps"],
+        "ASPECT_RATIO": ["115", "aspect_ratio"],
+        "OUTPUT_PREFIX": ["92", "filename_prefix"],
+        "FIRST_FRAME": ["114", "image"],
+        "LAST_FRAME": ["116", "image"]
+      },
+      "required_slots": ["PROMPT", "SEED", "DURATION", "STEPS", "ASPECT_RATIO", "OUTPUT_PREFIX", "FIRST_FRAME", "LAST_FRAME"],
+      "profile": {
+        "canvas_multiple": 32,
+        "max_pixels": 2088960,
+        "fps": 24,
+        "frame_base": 5,
+        "frame_step": 17,
+        "max_reference_images": 0,
+        "max_reference_audio": 0,
+        "max_reference_videos": 0,
+        "output_node": "92",
+        "aspect_ratio_values": {
+          "9:16": "9:16 (Portrait)",
+          "16:9": "16:9 (Widescreen)",
+          "1:1": "1:1 (Square)"
+        },
+        "provenance": "derived from minimax-h3-frontend i2v API workflow",
+        "poc_verified": false
+      },
+      "auto_approve": false
+    },
+    {
+      "code": "H3_R2V_1_IMAGE_REFERENCE",
+      "mode": "r2v",
+      "version": "2026-09-10-reference",
+      "file": "video_minimax_h3_r2v_1ref.api.json",
+      "source": "Calliope/example_ComfyUI_workflows/video_minimax_h3_r2v_API.json",
+      "slots": {
+        "PROMPT": ["138", "value"],
+        "SEED": ["171", "noise_seed"],
+        "DURATION": ["132", "value"],
+        "STEPS": ["170", "steps"],
+        "ASPECT_RATIO": ["115", "aspect_ratio"],
+        "OUTPUT_PREFIX": ["176", "filename_prefix"],
+        "REFERENCE_IMAGE_1": ["148", "image"]
+      },
+      "required_slots": ["PROMPT", "SEED", "DURATION", "STEPS", "ASPECT_RATIO", "OUTPUT_PREFIX", "REFERENCE_IMAGE_1"],
+      "profile": {
+        "canvas_multiple": 32,
+        "max_pixels": 2088960,
+        "fps": 24,
+        "frame_base": 5,
+        "frame_step": 17,
+        "max_reference_images": 1,
+        "max_reference_audio": 0,
+        "max_reference_videos": 0,
+        "output_node": "176",
+        "aspect_ratio_values": {
+          "9:16": "9:16 (Portrait)",
+          "16:9": "16:9 (Widescreen)",
+          "1:1": "1:1 (Square)"
+        },
+        "provenance": "Calliope/example_ComfyUI_workflows/video_minimax_h3_r2v_API.json",
+        "poc_verified": false
+      },
+      "auto_approve": false
+    }
+  ]
+}

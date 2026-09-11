@@ -1,0 +1,33 @@
+groups:
+  - name: ai-video-studio
+    rules:
+      - alert: StudioApiDown
+        expr: studio_postgres_up == 0 or studio_minio_up == 0 or studio_comfyui_up == 0
+        for: 5m
+        annotations:
+          summary: "AI Video Studio dependency is unavailable"
+          runbook: "docs/runbook.md#health-and-first-response"
+      - alert: StudioGenerationQueueStalled
+        expr: studio_generation_queue_oldest_age_seconds > 900
+        for: 10m
+        annotations:
+          summary: "Generation queue oldest job is over 15 minutes old"
+          runbook: "docs/runbook.md#health-and-first-response"
+      - alert: StudioStaleGenerationLease
+        expr: studio_generation_stale_lease_count > 0
+        for: 5m
+        annotations:
+          summary: "Generation worker lease is stale"
+          runbook: "docs/runbook.md#health-and-first-response"
+      - alert: StudioWorkspaceDiskLow
+        expr: studio_workspace_free_bytes < 5368709120
+        for: 10m
+        annotations:
+          summary: "Worker workspace is below the 5 GiB watermark"
+          runbook: "docs/runbook.md#health-and-first-response"
+      - alert: StudioBackupStale
+        expr: studio_backup_age_seconds > 93600 or studio_backup_age_seconds < 0
+        for: 30m
+        annotations:
+          summary: "Backup evidence is older than the 24-hour RPO target"
+          runbook: "docs/runbook.md#backup-and-restore"

@@ -1,0 +1,134 @@
+[
+  {
+    "accepted": true,
+    "code": "H3_T2V_STANDARD",
+    "details": {
+      "output_node": "92",
+      "profile_poc_verified": false,
+      "provenance": "minimax-h3-frontend/resources/workflows_api/video_minimax_h3_t2v.api.json",
+      "required_slots": [
+        "ASPECT_RATIO",
+        "DURATION",
+        "OUTPUT_PREFIX",
+        "PROMPT",
+        "SEED",
+        "STEPS"
+      ],
+      "workflow_nodes": 17
+    },
+    "elapsed_seconds": null,
+    "error_code": null,
+    "error_message": null,
+    "executed": false,
+    "frames": 124,
+    "gpu_memory_mb": null,
+    "height": 864,
+    "mode": "t2v",
+    "output_kind": null,
+    "prompt_id": null,
+    "slot_map_hash": "9fd6493ab875d6a9d86bf3deaf8d47206426c3eac075b79651ccf3821f4cd46f",
+    "version": "2026-09-10-reference",
+    "width": 480,
+    "workflow_hash": "270d22068e1686d5ecdaeb89d8e5918167e980f8f589e011c52bb44dee7130dc"
+  },
+  {
+    "accepted": true,
+    "code": "H3_I2V_STANDARD",
+    "details": {
+      "output_node": "92",
+      "profile_poc_verified": false,
+      "provenance": "minimax-h3-frontend/resources/workflows_api/video_minimax_h3_i2v.api.json",
+      "required_slots": [
+        "ASPECT_RATIO",
+        "DURATION",
+        "FIRST_FRAME",
+        "OUTPUT_PREFIX",
+        "PROMPT",
+        "SEED",
+        "STEPS"
+      ],
+      "workflow_nodes": 18
+    },
+    "elapsed_seconds": null,
+    "error_code": null,
+    "error_message": null,
+    "executed": false,
+    "frames": 124,
+    "gpu_memory_mb": null,
+    "height": 864,
+    "mode": "i2v",
+    "output_kind": null,
+    "prompt_id": null,
+    "slot_map_hash": "8ec9955f9b6413d8a7f27357155f0f25535b4f2c3c098eda41b9156f2e0fa2b3",
+    "version": "2026-09-10-reference",
+    "width": 480,
+    "workflow_hash": "33559e140c1d26909f09983994b0349a1b5eab07b6f023104ca66568940acfdc"
+  },
+  {
+    "accepted": true,
+    "code": "H3_FIRST_LAST_STANDARD",
+    "details": {
+      "output_node": "92",
+      "profile_poc_verified": false,
+      "provenance": "derived from minimax-h3-frontend i2v API workflow",
+      "required_slots": [
+        "ASPECT_RATIO",
+        "DURATION",
+        "FIRST_FRAME",
+        "LAST_FRAME",
+        "OUTPUT_PREFIX",
+        "PROMPT",
+        "SEED",
+        "STEPS"
+      ],
+      "workflow_nodes": 19
+    },
+    "elapsed_seconds": null,
+    "error_code": null,
+    "error_message": null,
+    "executed": false,
+    "frames": 124,
+    "gpu_memory_mb": null,
+    "height": 864,
+    "mode": "i2v_first_last",
+    "output_kind": null,
+    "prompt_id": null,
+    "slot_map_hash": "4dd841706fd1ef6ab6ea09218a1c237bb727426b0f7a771d44b22bcbc714a058",
+    "version": "2026-09-10-reference",
+    "width": 480,
+    "workflow_hash": "6cc6d54083da8e994f6204de7f983f6eb0f772648fc7e854ef01789e8853eff8"
+  },
+  {
+    "accepted": true,
+    "code": "H3_R2V_1_IMAGE_REFERENCE",
+    "details": {
+      "output_node": "176",
+      "profile_poc_verified": false,
+      "provenance": "Calliope/example_ComfyUI_workflows/video_minimax_h3_r2v_API.json",
+      "required_slots": [
+        "ASPECT_RATIO",
+        "DURATION",
+        "OUTPUT_PREFIX",
+        "PROMPT",
+        "REFERENCE_IMAGE_1",
+        "SEED",
+        "STEPS"
+      ],
+      "workflow_nodes": 23
+    },
+    "elapsed_seconds": null,
+    "error_code": null,
+    "error_message": null,
+    "executed": false,
+    "frames": 124,
+    "gpu_memory_mb": null,
+    "height": 864,
+    "mode": "r2v",
+    "output_kind": null,
+    "prompt_id": null,
+    "slot_map_hash": "f166050ffe4265e8aaa5070171eb1dbebc2ec8e522b873f5491f7f703b220ad5",
+    "version": "2026-09-10-reference",
+    "width": 480,
+    "workflow_hash": "e97fe047bce437daf741d84fb8b2b7a2b1c54314c974d728a8d307fb3da0c13b"
+  }
+]
