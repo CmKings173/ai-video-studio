@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import shutil
-from datetime import timedelta
 from pathlib import Path
 
 from fastapi import APIRouter, Depends
@@ -45,6 +44,7 @@ from apps.api.app.schemas.api import (
 )
 from apps.api.app.services.asset_service import asset_is_referenced
 from apps.api.app.services.h3_validator import H3Profile
+from apps.api.app.services.retention import RetentionPolicy
 from apps.api.app.services.workflow_registry import ApprovedWorkflow, WorkflowSlotError
 from workers.reconciliation import AssetReconciler
 
@@ -353,22 +353,20 @@ async def cleanup_storage(
     admin: User = Depends(require_csrf),
     session: AsyncSession = Depends(get_session),
     asset_store: AssetStore = Depends(store),
+    settings: Settings = Depends(get_settings),
 ) -> CleanupResultDTO:
     if admin.role != "ADMIN":
         raise AppError("FORBIDDEN", "Administrator access required", 403)
     now = utcnow()
-    pending_cutoff = now - timedelta(hours=payload.pending_older_than_hours)
-    deleted_cutoff = now - timedelta(hours=payload.deleted_older_than_hours)
+    policy = RetentionPolicy.from_settings(settings)
     rows = list(
         (
             await session.scalars(
                 select(Asset)
                 .where(
-                    (
-                        Asset.status.in_({"PENDING", "PENDING_UPLOAD", "FAILED"})
-                        & (Asset.created_at < pending_cutoff)
+                    Asset.status.in_(
+                        {"PENDING", "PENDING_UPLOAD", "VALIDATING", "FAILED", "DELETED"}
                     )
-                    | ((Asset.status == "DELETED") & (Asset.deleted_at < deleted_cutoff))
                 )
                 .order_by(Asset.created_at, Asset.id)
             )
@@ -377,6 +375,8 @@ async def cleanup_storage(
     candidates = []
     deletable = []
     for asset in rows:
+        if not policy.eligible(asset, now):
+            continue
         referenced = await asset_is_referenced(session, asset.id)
         candidates.append(
             {

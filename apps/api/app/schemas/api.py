@@ -523,8 +523,20 @@ class StorageSummaryDTO(Output):
 
 class CleanupRequest(Input):
     dry_run: bool = True
-    pending_older_than_hours: int = Field(default=24, ge=1, le=24 * 365)
-    deleted_older_than_hours: int = Field(default=168, ge=1, le=24 * 365)
+    pending_older_than_hours: int = Field(
+        default=24,
+        ge=1,
+        le=24 * 365,
+        deprecated=True,
+        description="Deprecated compatibility field; runtime retention settings are authoritative.",
+    )
+    deleted_older_than_hours: int = Field(
+        default=168,
+        ge=1,
+        le=24 * 365,
+        deprecated=True,
+        description="Deprecated compatibility field; runtime retention settings are authoritative.",
+    )
 
 
 class CleanupResultDTO(Output):

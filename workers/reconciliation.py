@@ -14,7 +14,8 @@ from sqlalchemy import select
 from apps.api.app.db.models import Asset, utcnow
 from apps.api.app.integrations.media import inspect_media
 from apps.api.app.integrations.minio import AssetObjectMissingError
-from apps.api.app.services.asset_service import upload_staging_key
+from apps.api.app.services.asset_service import asset_is_referenced, upload_staging_key
+from apps.api.app.services.retention import RetentionPolicy
 
 logger = logging.getLogger(__name__)
 
@@ -211,9 +212,43 @@ class AssetReconciler:
                 deleted.append(item["key"])
         return deleted
 
+    async def cleanup_assets(self, *, dry_run: bool = False) -> list[str]:
+        """Apply the same protected, runtime-configured retention policy as admin cleanup."""
+        now = utcnow()
+        policy = RetentionPolicy.from_settings(self.settings)
+        async with self.factory() as session:
+            rows = list(
+                (
+                    await session.scalars(
+                        select(Asset).where(
+                            Asset.status.in_(
+                                {"PENDING", "PENDING_UPLOAD", "VALIDATING", "FAILED", "DELETED"}
+                            )
+                        )
+                    )
+                ).all()
+            )
+            candidates = []
+            for row in rows:
+                if policy.eligible(row, now) and not await asset_is_referenced(session, row.id):
+                    candidates.append((row.id, row.object_key))
+        if dry_run:
+            return [key for _, key in candidates]
+        deleted: list[str] = []
+        for asset_id, object_key in candidates:
+            await self.store.delete(object_key)
+            async with self.factory() as session, session.begin():
+                asset = await session.get(Asset, asset_id, with_for_update=True)
+                if asset is None or await asset_is_referenced(session, asset.id):
+                    continue
+                asset.status = "DELETED"
+                asset.deleted_at = asset.deleted_at or now
+                deleted.append(object_key)
+        return deleted
     async def run_once(self) -> bool:
         report = await self.run()
         await self.cleanup_staging()
+        await self.cleanup_assets()
         if (
             report.missing_objects
             or report.corrupt_objects
