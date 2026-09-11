@@ -15,6 +15,7 @@ from uuid import NAMESPACE_URL, uuid4, uuid5
 from sqlalchemy import select, text
 
 from apps.api.app.db.models import Asset, Scene, SceneGeneration, Video, utcnow
+from apps.api.app.integrations.media import MediaValidationError, inspect_media
 
 logger = logging.getLogger(__name__)
 GENERATION_TERMINAL = frozenset({"COMPLETED", "FAILED", "CANCELLED"})
@@ -88,6 +89,22 @@ def check_checksum(data: bytes, checksum: str | None) -> str:
     return actual
 
 
+async def validate_generated_video(
+    data: bytes,
+    filename: str,
+    ffprobe_binary: str = "ffprobe",
+    *,
+    comfy_kind: str | None = None,
+    metadata: dict | None = None,
+) -> dict:
+    """Validate an external generation result before it becomes a VIDEO asset."""
+    if comfy_kind is not None and comfy_kind != "videos":
+        raise MediaValidationError("output kind is not videos")
+    inspected = metadata or await inspect_media(data, "video/mp4", filename, ffprobe_binary)
+    if inspected.get("kind") not in (None, "VIDEO") or not inspected.get("has_video"):
+        raise MediaValidationError("generated output has no video stream")
+    return inspected
+
 async def save_output(
     factory,
     store,
@@ -100,6 +117,10 @@ async def save_output(
     metadata: dict,
 ) -> str:
     """Persist intent before object I/O; repeat collection repairs partial writes."""
+    if role in {"GENERATED_VIDEO", "FINAL_VIDEO"} and (
+        metadata.get("kind") not in (None, "VIDEO") or not metadata.get("has_video")
+    ):
+        raise ValueError("OUTPUT_NOT_VIDEO")
     checksum = check_checksum(data, None)
     asset_id = str(uuid5(NAMESPACE_URL, f"ai-video-studio:{role}:{owner_id}"))
     object_key = f"outputs/{role.lower()}/{owner_id}/{checksum}.mp4"
@@ -158,3 +179,5 @@ async def service_loop(worker, poll_seconds: float) -> None:
             worked = False
         if not worked:
             await asyncio.sleep(max(0.1, poll_seconds))
+
+

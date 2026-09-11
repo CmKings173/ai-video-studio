@@ -356,7 +356,13 @@ async def test_save_output_repairs_ready_database_row_when_object_is_missing(
     user_id, project_id = await seed_owner(session_factory)
     store = FakeStore()
     data = b"generated-video-bytes"
-    metadata = {"width": 480, "height": 864, "duration_seconds": 5.0}
+    metadata = {
+        "kind": "VIDEO",
+        "has_video": True,
+        "width": 480,
+        "height": 864,
+        "duration_seconds": 5.0,
+    }
 
     asset_id = await save_output(
         session_factory,
@@ -390,3 +396,4 @@ async def test_save_output_repairs_ready_database_row_when_object_is_missing(
         repaired = await session.get(Asset, asset_id)
         assert repaired.status == "READY"
         assert repaired.checksum == hashlib.sha256(data).hexdigest()
+

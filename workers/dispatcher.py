@@ -22,6 +22,7 @@ from workers.common import (
     save_output,
     service_loop,
     staging_directory,
+    validate_generated_video,
     worker_id,
 )
 
@@ -460,13 +461,25 @@ class Dispatcher:
                 generation.id, "FAILED", "COMFY_OUTPUT_MISSING", "Completed graph produced no video"
             )
             return
-        data = await self.adapter.download(outputs[0])
+        output = outputs[0]
+        data = await self.adapter.download(output)
         if len(data) > self.settings.max_upload_bytes:
             raise ValueError("OUTPUT_TOO_LARGE")
         async with staging_directory(self.settings, f"generation-{generation.id}-") as directory:
             path = directory / "output.mp4"
             await asyncio.to_thread(path.write_bytes, data)
             metadata = await self.ffmpeg.probe(path)
+        try:
+            metadata = await validate_generated_video(
+                data,
+                output["filename"],
+                getattr(self.settings, "ffprobe_binary", "ffprobe"),
+                comfy_kind=output.get("kind"),
+                metadata=metadata,
+            )
+        except ValueError as exc:
+            await self._finish(generation.id, "FAILED", "COMFY_OUTPUT_INVALID", str(exc))
+            return
         async with self.factory() as session:
             video = await session.get(Video, generation.video_id)
         asset_id = await save_output(
@@ -624,3 +637,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
