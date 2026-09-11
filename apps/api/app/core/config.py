@@ -2,6 +2,7 @@
 
 from functools import lru_cache
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -75,17 +76,41 @@ class Settings(BaseSettings):
         if self.app_env.lower() == "production":
             if not self.cookie_secure:
                 raise ValueError("Production requires COOKIE_SECURE=true")
+            database = urlsplit(self.database_url)
+            if (
+                database.scheme != "postgresql+asyncpg"
+                or not database.hostname
+                or not database.password
+            ):
+                raise ValueError("Production requires a PostgreSQL database URL with a password")
+            if database.password.lower() in {"studio", "password", "change-me", "changeme"}:
+                raise ValueError("Production database password is unsafe")
             if not self.minio_access_key or not self.minio_secret_key:
                 raise ValueError("Production requires MinIO credentials")
-            if "*" in self.allowed_origins:
+            if self.minio_access_key.lower() in {
+                "studio",
+                "minio",
+                "access",
+            } or self.minio_secret_key.lower() in {
+                "studio",
+                "studio-change-me",
+                "change-me",
+                "secret",
+            }:
+                raise ValueError("Production MinIO credentials are unsafe")
+            if "*" in self.allowed_origins or not self.allowed_origins:
                 raise ValueError("Credentialed CORS requires explicit origins")
-            if self.bootstrap_admin_password in {
+            if not self.bootstrap_admin_password or self.bootstrap_admin_password in {
                 "change-this-password",
                 "password",
                 "admin",
             }:
-                raise ValueError("Production bootstrap password is unsafe")
-            if len(self.metrics_token) < 32 or self.metrics_token.startswith("replace-with"):
+                raise ValueError("Production bootstrap password is unsafe or missing")
+            if (
+                len(self.metrics_token) < 32
+                or self.metrics_token.startswith("replace-with")
+                or self.metrics_token.lower() in {"metrics", "change-me"}
+            ):
                 raise ValueError("Production requires a metrics token of at least 32 characters")
         if self.bootstrap_admin_password and len(self.bootstrap_admin_password) < 12:
             raise ValueError("Bootstrap administrator password must be at least 12 characters")
