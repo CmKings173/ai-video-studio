@@ -79,8 +79,11 @@ async def _refresh_database_gauges(session: AsyncSession, settings: Settings) ->
     )
     metrics.set("studio_generation_stale_lease_count", stale_generation or 0)
     metrics.set("studio_assembly_stale_lease_count", stale_assembly or 0)
-    free_bytes = await to_thread(shutil.disk_usage, settings.workspace_root)
-    metrics.set("studio_workspace_free_bytes", free_bytes.free)
+    try:
+        free_bytes = await to_thread(shutil.disk_usage, settings.workspace_root)
+        metrics.set("studio_workspace_free_bytes", free_bytes.free)
+    except OSError:
+        metrics.set("studio_workspace_free_bytes", -1)
     if settings.backup_status_file:
         try:
             modified = await to_thread(settings.backup_status_file.stat)
