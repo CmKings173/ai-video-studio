@@ -215,7 +215,12 @@ class AssetStore:
         return await self.put(immutable_key, await self.read(staging_key), content_type)
 
     async def delete(self, key: str) -> None:
-        await asyncio.to_thread(self.client.delete_object, Bucket=self.bucket, Key=self._key(key))
+        try:
+            await asyncio.to_thread(
+                self.client.delete_object, Bucket=self.bucket, Key=self._key(key)
+            )
+        except (ClientError, BotoCoreError, OSError, TimeoutError) as exc:
+            raise _translate_storage_error(exc) from exc
 
     async def list_objects(self, prefix: str = "") -> list[dict]:
         if prefix:

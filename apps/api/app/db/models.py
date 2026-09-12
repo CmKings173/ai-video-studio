@@ -95,7 +95,8 @@ class Asset(Identity, Base):
     __table_args__ = (
         CheckConstraint("kind IN ('IMAGE','VIDEO','AUDIO')", name="kind"),
         CheckConstraint(
-            "status IN ('PENDING','PENDING_UPLOAD','VALIDATING','READY','FAILED','DELETED')",
+            "status IN ('PENDING','PENDING_UPLOAD','VALIDATING','READY','FAILED',"
+            "'DELETING','DELETED')",
             name="status",
         ),
         CheckConstraint("size_bytes >= 0", name="size_nonnegative"),
@@ -106,6 +107,9 @@ class Asset(Identity, Base):
         ),
         CheckConstraint("project_id IS NULL OR product_id IS NULL", name="single_business_scope"),
         Index("ix_assets_status_created_at", "status", "created_at"),
+        Index("ix_assets_retention_failed", "status", "failed_at", "id"),
+        Index("ix_assets_retention_deleted", "status", "deleted_at", "id"),
+        Index("ix_assets_retention_deleting", "status", "updated_at", "id"),
         Index("ix_assets_created_by", "created_by"),
     )
     project_id: Mapped[str | None] = mapped_column(
@@ -126,6 +130,7 @@ class Asset(Identity, Base):
     height: Mapped[int | None] = mapped_column(Integer)
     duration_seconds: Mapped[float | None] = mapped_column(Float)
     created_by: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"))
+    failed_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
     deleted_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
 
 

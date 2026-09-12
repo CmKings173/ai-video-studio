@@ -57,6 +57,8 @@ class Settings(BaseSettings):
     backup_rpo_hours: int = Field(default=24, ge=1, le=168)
     backup_rto_hours: int = Field(default=4, ge=1, le=72)
     retention_failed_hours: int = Field(default=24, ge=1)
+    retention_deleting_retry_hours: int = Field(default=1, ge=1)
+    retention_batch_size: int = Field(default=200, ge=1, le=1000)
     backup_status_file: Path | None = None
 
     @field_validator("database_url")

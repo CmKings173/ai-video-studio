@@ -28,8 +28,12 @@ async def login(
     await session.execute(delete(AuthSession).where(AuthSession.expires_at <= utcnow()))
     email = payload.email.strip().lower()
     client_host = request.client.host if request.client else "unknown"
-    throttle_key = f"{client_host}:{email}"
-    retry_after = login_throttle.retry_after(throttle_key)
+    throttle_keys = (
+        f"ip:{client_host}",
+        f"identity:{email}",
+        f"attempt:{client_host}:{email}",
+    )
+    retry_after = login_throttle.retry_after_any(throttle_keys)
     if retry_after:
         raise AppError(
             "LOGIN_RATE_LIMITED",
@@ -39,12 +43,12 @@ async def login(
         )
     user = await session.scalar(select(User).where(User.email == email))
     if user is None or not verify_password(payload.password, user.password_hash):
-        login_throttle.record_failure(throttle_key)
+        login_throttle.record_failure_many(throttle_keys)
         raise AppError("INVALID_CREDENTIALS", "Invalid email or password", 401)
     if not user.is_active:
-        login_throttle.record_failure(throttle_key)
+        login_throttle.record_failure_many(throttle_keys)
         raise AppError("ACCOUNT_DISABLED", "Account is disabled", 403)
-    login_throttle.record_success(throttle_key)
+    login_throttle.record_success_many(throttle_keys)
     token, csrf = new_token(), new_token()
     session.add(
         AuthSession(

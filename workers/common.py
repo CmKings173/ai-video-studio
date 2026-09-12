@@ -130,6 +130,8 @@ async def save_output(
         if asset is not None:
             if asset.checksum and asset.checksum != checksum:
                 raise ValueError("IMMUTABLE_OUTPUT_CONFLICT")
+            if asset.status not in {"PENDING_UPLOAD", "READY"}:
+                raise ValueError("ASSET_STATE_CONFLICT")
             recorded_ready = asset.status == "READY"
         else:
             asset = Asset(
@@ -156,12 +158,14 @@ async def save_output(
                 if asset is None or (asset.checksum and asset.checksum != checksum):
                     raise ValueError("IMMUTABLE_OUTPUT_CONFLICT") from None
                 asset.status = "PENDING_UPLOAD"
+                asset.failed_at = None
     await store.put_bytes(object_key, data, "video/mp4")
     # A read-after-write verifies bytes, not an S3 multipart ETag.
     check_checksum(await store.get_bytes(object_key), checksum)
     async with factory() as session, session.begin():
         asset = await session.get(Asset, asset_id, with_for_update=True)
         asset.status = "READY"
+        asset.failed_at = None
         asset.width = metadata.get("width")
         asset.height = metadata.get("height")
         asset.duration_seconds = metadata.get("duration_seconds", metadata.get("duration"))

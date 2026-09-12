@@ -42,9 +42,8 @@ from apps.api.app.schemas.api import (
     WorkflowCreate,
     WorkflowDTO,
 )
-from apps.api.app.services.asset_service import asset_is_referenced
+from apps.api.app.services.asset_retention import AssetRetentionService
 from apps.api.app.services.h3_validator import H3Profile
-from apps.api.app.services.retention import RetentionPolicy
 from apps.api.app.services.workflow_registry import ApprovedWorkflow, WorkflowSlotError
 from workers.reconciliation import AssetReconciler
 
@@ -343,53 +342,19 @@ async def storage_summary(
 async def cleanup_storage(
     payload: CleanupRequest,
     admin: User = Depends(require_admin_csrf),
-    session: AsyncSession = Depends(get_session),
+    factory=Depends(get_session_factory),
     asset_store: AssetStore = Depends(store),
     settings: Settings = Depends(get_settings),
 ) -> CleanupResultDTO:
-    now = utcnow()
-    policy = RetentionPolicy.from_settings(settings)
-    rows = list(
-        (
-            await session.scalars(
-                select(Asset)
-                .where(
-                    Asset.status.in_(
-                        {"PENDING", "PENDING_UPLOAD", "VALIDATING", "FAILED", "DELETED"}
-                    )
-                )
-                .order_by(Asset.created_at, Asset.id)
-            )
-        ).all()
+    result = await AssetRetentionService(factory, asset_store, settings).cleanup(
+        dry_run=payload.dry_run
     )
-    candidates = []
-    deletable = []
-    for asset in rows:
-        if not policy.eligible(asset, now):
-            continue
-        referenced = await asset_is_referenced(session, asset.id)
-        candidates.append(
-            {
-                "asset_id": asset.id,
-                "object_key": asset.object_key,
-                "status": asset.status,
-                "referenced": referenced,
-            }
-        )
-        if not referenced:
-            deletable.append(asset)
-    deleted_objects = 0
-    if not payload.dry_run:
-        for asset in deletable:
-            await asset_store.delete(asset.object_key)
-            asset.status = "DELETED"
-            asset.deleted_at = asset.deleted_at or now
-            deleted_objects += 1
     return CleanupResultDTO(
         dry_run=payload.dry_run,
-        candidates=candidates,
-        deleted_objects=deleted_objects,
-        retained_records=len(deletable),
+        candidates=result.candidates,
+        deleted_objects=result.deleted_objects,
+        retained_records=result.retained_records,
+        has_more=result.has_more,
     )
 
 

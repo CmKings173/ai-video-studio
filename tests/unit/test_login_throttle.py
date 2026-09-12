@@ -30,3 +30,16 @@ def test_login_throttle_evicts_oldest_entries_when_bounded():
 
     assert limiter.size == 2
     assert limiter.retry_after("a") == 0
+
+
+def test_login_throttle_multi_dimension_helpers_use_any_bucket_and_clear():
+    limiter = LoginThrottle(
+        max_entries=4, max_failures=2, base_delay_seconds=10, clock=lambda: 100.0
+    )
+    limiter.record_failure_many(("ip:1.2.3.4", "identity:user@example.test"))
+    limiter.record_failure_many(("ip:1.2.3.4", "identity:user@example.test"))
+    assert limiter.retry_after_any(("ip:1.2.3.4", "identity:other@example.test")) == 10
+    limiter.record_success_many(("ip:1.2.3.4", "identity:user@example.test"))
+    assert limiter.retry_after_any(("ip:1.2.3.3", "identity:user@example.test")) == 0
+    limiter.clear()
+    assert limiter.size == 0

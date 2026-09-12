@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import hashlib
+from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
-from sqlalchemy import select
+from sqlalchemy import exists, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from apps.api.app.core.config import Settings
@@ -12,17 +13,24 @@ from apps.api.app.core.errors import AppError
 from apps.api.app.db.models import (
     Asset,
     FinalVideo,
+    FinalVideoScene,
     GenerationAsset,
     Product,
     Project,
     SceneGeneration,
 )
 from apps.api.app.integrations.media import (
+    MediaInspectionError,
     MediaValidationError,
     inspect_media,
     kind_for_content_type,
 )
-from apps.api.app.integrations.minio import AssetStore, AssetStoreError
+from apps.api.app.integrations.minio import (
+    AssetObjectMissingError,
+    AssetStore,
+    AssetStoreError,
+    AssetStoreUnavailableError,
+)
 from apps.api.app.schemas.api import AssetComplete, UploadRequest
 
 
@@ -119,45 +127,87 @@ async def complete_asset(
             "ASSET_STATE_CONFLICT", "Asset cannot be completed in its current state", 409
         )
     asset.status = "VALIDATING"
+    asset.failed_at = None
     await session.flush()
+    staging_key = upload_staging_key(asset)
     try:
-        staging_key = upload_staging_key(asset)
         try:
             head = await store.head(staging_key)
             source_key = staging_key
-        except Exception:
-            # A worker/reconciler may have promoted the object before the
-            # request transaction committed.  The immutable key is therefore
-            # also a valid recovery source.
+        except (AssetObjectMissingError, KeyError, FileNotFoundError):
+            # A reconciler may have promoted the object before this request
+            # committed. The immutable key is a valid recovery source.
             try:
                 head = await store.head(asset.object_key)
-            except Exception as exc:
+            except (AssetObjectMissingError, KeyError, FileNotFoundError) as exc:
                 raise MediaValidationError("uploaded object is missing") from exc
+            except (AssetStoreUnavailableError, TimeoutError, ConnectionError) as exc:
+                raise AppError(
+                    "ASSET_STORE_UNAVAILABLE",
+                    "Object storage is temporarily unavailable",
+                    503,
+                ) from exc
             source_key = asset.object_key
+        except (AssetStoreUnavailableError, TimeoutError, ConnectionError) as exc:
+            raise AppError(
+                "ASSET_STORE_UNAVAILABLE",
+                "Object storage is temporarily unavailable",
+                503,
+            ) from exc
+        except AssetStoreError as exc:
+            raise MediaValidationError(str(exc)) from exc
         if head["size"] <= 0 or head["size"] > settings.max_upload_bytes:
             raise MediaValidationError("uploaded object size is invalid")
         if head["size"] != asset.size_bytes:
             raise MediaValidationError("uploaded object size does not match request")
         if head["content_type"].split(";", 1)[0] != asset.content_type:
             raise MediaValidationError("uploaded content type does not match request")
-        data = await store.read(source_key, settings.max_upload_bytes)
+        try:
+            data = await store.read(source_key, settings.max_upload_bytes)
+        except (AssetStoreUnavailableError, TimeoutError, ConnectionError) as exc:
+            raise AppError(
+                "ASSET_STORE_UNAVAILABLE",
+                "Object storage is temporarily unavailable",
+                503,
+            ) from exc
+        except (AssetObjectMissingError, KeyError, FileNotFoundError) as exc:
+            raise MediaValidationError("uploaded object is missing") from exc
+        except AssetStoreError as exc:
+            raise MediaValidationError(str(exc)) from exc
         checksum = hashlib.sha256(data).hexdigest()
         if payload.checksum_sha256 and checksum.lower() != payload.checksum_sha256.lower():
             raise MediaValidationError("uploaded checksum does not match")
-        metadata = await inspect_media(
-            data, asset.content_type, asset.filename, settings.ffprobe_binary
-        )
+        try:
+            metadata = await inspect_media(
+                data, asset.content_type, asset.filename, settings.ffprobe_binary
+            )
+        except MediaInspectionError as exc:
+            raise AppError(
+                "MEDIA_INSPECTION_UNAVAILABLE",
+                "Media inspection is temporarily unavailable",
+                503,
+            ) from exc
         duration = metadata.get("duration_seconds")
         if duration is not None and duration > settings.max_media_seconds:
             raise MediaValidationError("media duration exceeds configured limit")
-    except (AssetStoreError, MediaValidationError) as exc:
+    except AppError:
+        raise
+    except MediaValidationError as exc:
         asset.status = "FAILED"
+        asset.failed_at = datetime.now(UTC)
         raise AppError("ASSET_VALIDATION_FAILED", str(exc), 422) from exc
     if source_key != asset.object_key:
         try:
             await store.put_bytes(asset.object_key, data, asset.content_type)
+        except (AssetStoreUnavailableError, TimeoutError, ConnectionError) as exc:
+            raise AppError(
+                "ASSET_STORE_UNAVAILABLE",
+                "Object storage is temporarily unavailable",
+                503,
+            ) from exc
         except (AssetStoreError, RuntimeError) as exc:
             asset.status = "FAILED"
+            asset.failed_at = datetime.now(UTC)
             raise AppError(
                 "ASSET_PROMOTION_FAILED",
                 "Validated upload could not be committed to its immutable object",
@@ -169,19 +219,28 @@ async def complete_asset(
     asset.height = metadata.get("height")
     asset.duration_seconds = duration
     asset.status = "READY"
+    asset.failed_at = None
     return asset
 
 
-async def asset_is_referenced(session: AsyncSession, asset_id: str) -> bool:
-    checks = (
-        select(GenerationAsset.id).where(GenerationAsset.asset_id == asset_id).limit(1),
-        select(SceneGeneration.id).where(SceneGeneration.output_asset_id == asset_id).limit(1),
-        select(FinalVideo.id).where(FinalVideo.output_asset_id == asset_id).limit(1),
-        select(FinalVideo.id)
-        .where(FinalVideo.background_audio_asset_id == asset_id)
-        .limit(1),
+def asset_reference_exists(asset_id):
+    """Return one SQL predicate covering every durable asset reference."""
+    return or_(
+        exists(select(1).select_from(GenerationAsset).where(GenerationAsset.asset_id == asset_id)),
+        exists(
+            select(1)
+            .select_from(SceneGeneration)
+            .where(SceneGeneration.output_asset_id == asset_id)
+        ),
+        exists(select(1).select_from(FinalVideo).where(FinalVideo.output_asset_id == asset_id)),
+        exists(
+            select(1)
+            .select_from(FinalVideo)
+            .where(FinalVideo.background_audio_asset_id == asset_id)
+        ),
+        exists(select(1).select_from(FinalVideoScene).where(FinalVideoScene.asset_id == asset_id)),
     )
-    for query in checks:
-        if await session.scalar(query):
-            return True
-    return False
+
+
+async def asset_is_referenced(session: AsyncSession, asset_id: str) -> bool:
+    return bool(await session.scalar(select(asset_reference_exists(asset_id))))

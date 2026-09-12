@@ -414,6 +414,11 @@
             "title": "Dry Run",
             "type": "boolean"
           },
+          "has_more": {
+            "default": false,
+            "title": "Has More",
+            "type": "boolean"
+          },
           "retained_records": {
             "title": "Retained Records",
             "type": "integer"

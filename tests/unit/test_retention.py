@@ -12,7 +12,20 @@ def test_retention_policy_uses_runtime_windows_and_status_timestamps():
         SimpleNamespace(status="PENDING_UPLOAD", created_at=now - timedelta(hours=3)), now
     )
     assert not policy.eligible(
-        SimpleNamespace(status="FAILED", created_at=now - timedelta(hours=3)), now
+        SimpleNamespace(
+            status="FAILED",
+            created_at=now - timedelta(days=30),
+            failed_at=now - timedelta(hours=3),
+        ),
+        now,
+    )
+    assert policy.eligible(
+        SimpleNamespace(
+            status="FAILED",
+            created_at=now - timedelta(days=30),
+            failed_at=now - timedelta(hours=5),
+        ),
+        now,
     )
     assert policy.eligible(
         SimpleNamespace(status="DELETED", deleted_at=now - timedelta(hours=9)), now

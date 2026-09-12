@@ -76,6 +76,26 @@ async def test_scene_order_is_unique_per_video(session_factory):
 
 
 @pytest.mark.asyncio
+async def test_asset_deleting_state_is_a_supported_claim_state(session_factory):
+    ids = await seed(session_factory)
+    async with session_factory() as session, session.begin():
+        asset = Asset(
+            project_id=ids["project"],
+            kind="IMAGE",
+            role="PRODUCT_IMAGE",
+            filename="claim.png",
+            content_type="image/png",
+            object_key="uploads/claim.png",
+            status="DELETING",
+            size_bytes=1,
+            created_by=ids["user"],
+        )
+        session.add(asset)
+        await session.flush()
+        assert asset.status == "DELETING"
+
+
+@pytest.mark.asyncio
 async def test_asset_cannot_have_project_and_product_scope(session_factory):
     ids = await seed(session_factory)
     async with session_factory() as session:

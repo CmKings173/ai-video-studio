@@ -544,6 +544,7 @@ class CleanupResultDTO(Output):
     candidates: list[dict[str, Any]]
     deleted_objects: int
     retained_records: int
+    has_more: bool = False
 
 
 class ReconciliationDTO(Output):

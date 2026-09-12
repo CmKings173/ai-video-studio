@@ -13,7 +13,11 @@ from PIL import Image, UnidentifiedImageError
 
 
 class MediaValidationError(ValueError):
-    pass
+    """The bytes are confirmed invalid for the declared media contract."""
+
+
+class MediaInspectionError(RuntimeError):
+    """Media tooling could not inspect the bytes; retry without marking corrupt."""
 
 
 IMAGE_TYPES = {"image/png", "image/jpeg", "image/webp"}
@@ -33,24 +37,27 @@ def kind_for_content_type(content_type: str) -> str:
 
 
 async def _ffprobe(path: Path, binary: str, timeout_seconds: int = 30) -> dict[str, Any]:
-    process = await asyncio.create_subprocess_exec(
-        binary,
-        "-v",
-        "error",
-        "-show_streams",
-        "-show_format",
-        "-of",
-        "json",
-        str(path),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
+    try:
+        process = await asyncio.create_subprocess_exec(
+            binary,
+            "-v",
+            "error",
+            "-show_streams",
+            "-show_format",
+            "-of",
+            "json",
+            str(path),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except (OSError, ValueError) as exc:
+        raise MediaInspectionError("media inspection tool is unavailable") from exc
     try:
         stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout_seconds)
     except TimeoutError as exc:
         process.kill()
         await process.wait()
-        raise MediaValidationError("media inspection timed out") from exc
+        raise MediaInspectionError("media inspection timed out") from exc
     if process.returncode != 0:
         raise MediaValidationError(
             f"invalid media: {stderr.decode('utf-8', errors='replace')[-500:]}"
@@ -58,7 +65,7 @@ async def _ffprobe(path: Path, binary: str, timeout_seconds: int = 30) -> dict[s
     try:
         return json.loads(stdout)
     except json.JSONDecodeError as exc:
-        raise MediaValidationError("ffprobe returned invalid metadata") from exc
+        raise MediaInspectionError("ffprobe returned invalid metadata") from exc
 
 
 async def inspect_path(path: Path, ffprobe_binary: str = "ffprobe") -> dict[str, Any]:

@@ -73,6 +73,23 @@ class LoginThrottle:
         with self._lock:
             self._entries.pop(key, None)
 
+
+    def retry_after_any(self, keys: tuple[str, ...] | list[str]) -> int:
+        return max((self.retry_after(key) for key in keys), default=0)
+
+    def record_failure_many(self, keys: tuple[str, ...] | list[str]) -> None:
+        for key in dict.fromkeys(keys):
+            self.record_failure(key)
+
+    def record_success_many(self, keys: tuple[str, ...] | list[str]) -> None:
+        with self._lock:
+            for key in dict.fromkeys(keys):
+                self._entries.pop(key, None)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._entries.clear()
+
     def _purge(self, now: float) -> None:
         expired = [
             key

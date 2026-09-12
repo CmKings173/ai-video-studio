@@ -12,15 +12,33 @@ from botocore.exceptions import ClientError
 from sqlalchemy import select
 
 from apps.api.app.db.models import Asset, utcnow
-from apps.api.app.integrations.media import inspect_media
-from apps.api.app.integrations.minio import AssetObjectMissingError
-from apps.api.app.services.asset_service import asset_is_referenced, upload_staging_key
-from apps.api.app.services.retention import RetentionPolicy
+from apps.api.app.integrations.media import (
+    MediaInspectionError,
+    MediaValidationError,
+    inspect_media,
+)
+from apps.api.app.integrations.minio import (
+    AssetObjectMissingError,
+    AssetStoreError,
+    AssetStoreUnavailableError,
+)
+from apps.api.app.services.asset_retention import AssetRetentionService
+from apps.api.app.services.asset_service import upload_staging_key
 
 logger = logging.getLogger(__name__)
 
 
 _MISSING_CODES = {"404", "NoSuchKey", "NoSuchObject", "NoSuchBucket", "NotFound"}
+_STORAGE_ERRORS = (
+    AssetObjectMissingError,
+    AssetStoreUnavailableError,
+    AssetStoreError,
+    TimeoutError,
+    ConnectionError,
+    KeyError,
+    FileNotFoundError,
+    ClientError,
+)
 
 
 def _is_confirmed_missing(exc: BaseException) -> bool:
@@ -48,12 +66,35 @@ class AssetReconciler:
         self.factory = factory
         self.store = store
         self.settings = settings
+        self.retention = AssetRetentionService(factory, store, settings)
 
     async def _mark_ready_failed(self, asset_id: str) -> None:
         async with self.factory() as session, session.begin():
             asset = await session.get(Asset, asset_id, with_for_update=True)
             if asset and asset.status == "READY":
                 asset.status = "FAILED"
+                asset.failed_at = utcnow()
+
+    async def _mark_pending_failed(self, asset_id: str) -> None:
+        async with self.factory() as session, session.begin():
+            asset = await session.get(Asset, asset_id, with_for_update=True)
+            if asset and asset.status in {"PENDING", "PENDING_UPLOAD", "VALIDATING"}:
+                asset.status = "FAILED"
+                asset.failed_at = utcnow()
+
+    def _unavailable(
+        self, report: ReconciliationReport, snapshot: dict, operation: str, exc: BaseException
+    ) -> None:
+        report.unavailable_objects.append(snapshot["object_key"])
+        logger.warning(
+            "asset_reconciliation_storage_unavailable",
+            extra={
+                "asset_id": snapshot["id"],
+                "object_key": snapshot["object_key"],
+                "error_type": type(exc).__name__,
+                "operation": operation,
+            },
+        )
 
     async def _snapshots(self) -> list[dict]:
         async with self.factory() as session:
@@ -78,26 +119,43 @@ class AssetReconciler:
         source_key = snapshot["object_key"]
         try:
             data = await self.store.get_bytes(source_key)
-        except Exception:
+        except (AssetObjectMissingError, KeyError, FileNotFoundError):
             source_key = upload_staging_key(asset_id=snapshot["id"])
             try:
                 data = await self.store.get_bytes(source_key)
-            except Exception:
+            except (AssetObjectMissingError, KeyError, FileNotFoundError) as exc:
+                report.missing_objects.append(snapshot["object_key"])
+                await self._mark_pending_failed(snapshot["id"])
+                logger.warning(
+                    "asset_reconciliation_object_missing",
+                    extra={
+                        "asset_id": snapshot["id"],
+                        "object_key": source_key,
+                        "error_type": type(exc).__name__,
+                        "operation": "read",
+                    },
+                )
                 return
+            except (
+                AssetStoreUnavailableError,
+                AssetStoreError,
+                TimeoutError,
+                ConnectionError,
+            ) as exc:
+                self._unavailable(report, snapshot, "read_staging", exc)
+                return
+        except (AssetStoreUnavailableError, AssetStoreError, TimeoutError, ConnectionError) as exc:
+            self._unavailable(report, snapshot, "read_primary", exc)
+            return
+
         checksum = hashlib.sha256(data).hexdigest()
         if snapshot["size_bytes"] and len(data) != snapshot["size_bytes"]:
             report.corrupt_objects.append(source_key)
-            async with self.factory() as session, session.begin():
-                asset = await session.get(Asset, snapshot["id"], with_for_update=True)
-                if asset and asset.status in {"PENDING", "PENDING_UPLOAD", "VALIDATING"}:
-                    asset.status = "FAILED"
+            await self._mark_pending_failed(snapshot["id"])
             return
         if snapshot["checksum"] and checksum != snapshot["checksum"]:
             report.corrupt_objects.append(source_key)
-            async with self.factory() as session, session.begin():
-                asset = await session.get(Asset, snapshot["id"], with_for_update=True)
-                if asset and asset.status in {"PENDING", "PENDING_UPLOAD", "VALIDATING"}:
-                    asset.status = "FAILED"
+            await self._mark_pending_failed(snapshot["id"])
             return
         try:
             metadata = await inspect_media(
@@ -106,18 +164,25 @@ class AssetReconciler:
                 snapshot["filename"],
                 self.settings.ffprobe_binary,
             )
-        except Exception:
+        except MediaValidationError:
             report.corrupt_objects.append(source_key)
-            async with self.factory() as session, session.begin():
-                asset = await session.get(Asset, snapshot["id"], with_for_update=True)
-                if asset and asset.status in {"PENDING", "PENDING_UPLOAD", "VALIDATING"}:
-                    asset.status = "FAILED"
+            await self._mark_pending_failed(snapshot["id"])
+            return
+        except MediaInspectionError as exc:
+            self._unavailable(report, snapshot, "inspect_media", exc)
             return
         if source_key != snapshot["object_key"]:
             try:
-                await self.store.put_bytes(snapshot["object_key"], data, snapshot["content_type"])
-            except Exception:
-                report.corrupt_objects.append(snapshot["object_key"])
+                await self.store.put_bytes(
+                    snapshot["object_key"], data, snapshot["content_type"]
+                )
+            except (
+                AssetStoreUnavailableError,
+                AssetStoreError,
+                TimeoutError,
+                ConnectionError,
+            ) as exc:
+                self._unavailable(report, snapshot, "promote", exc)
                 return
         async with self.factory() as session, session.begin():
             asset = await session.get(Asset, snapshot["id"], with_for_update=True)
@@ -129,6 +194,7 @@ class AssetReconciler:
             asset.height = metadata.get("height")
             asset.duration_seconds = metadata.get("duration_seconds")
             asset.status = "READY"
+            asset.failed_at = None
             report.repaired_assets.append(asset.id)
 
     async def run(self, *, inspect_orphans: bool = True) -> ReconciliationReport:
@@ -155,7 +221,7 @@ class AssetReconciler:
                             snapshot["object_key"], self.settings.max_upload_bytes
                         )
                         corrupt = hashlib.sha256(data).hexdigest() != snapshot["checksum"]
-                    except Exception as exc:
+                    except _STORAGE_ERRORS as exc:
                         if _is_confirmed_missing(exc):
                             report.missing_objects.append(snapshot["object_key"])
                             await self._mark_ready_failed(snapshot["id"])
@@ -172,7 +238,7 @@ class AssetReconciler:
                 if corrupt:
                     report.corrupt_objects.append(snapshot["object_key"])
                     await self._mark_ready_failed(snapshot["id"])
-            except Exception as exc:
+            except _STORAGE_ERRORS as exc:
                 # A READY row may only be failed on a confirmed not-found result.
                 # Unknown/transient failures are reported without mutating business state.
                 if _is_confirmed_missing(exc):
@@ -213,38 +279,11 @@ class AssetReconciler:
         return deleted
 
     async def cleanup_assets(self, *, dry_run: bool = False) -> list[str]:
-        """Apply the same protected, runtime-configured retention policy as admin cleanup."""
-        now = utcnow()
-        policy = RetentionPolicy.from_settings(self.settings)
-        async with self.factory() as session:
-            rows = list(
-                (
-                    await session.scalars(
-                        select(Asset).where(
-                            Asset.status.in_(
-                                {"PENDING", "PENDING_UPLOAD", "VALIDATING", "FAILED", "DELETED"}
-                            )
-                        )
-                    )
-                ).all()
-            )
-            candidates = []
-            for row in rows:
-                if policy.eligible(row, now) and not await asset_is_referenced(session, row.id):
-                    candidates.append((row.id, row.object_key))
+        """Use the shared claim protocol for bounded, retryable cleanup."""
+        result = await self.retention.cleanup(dry_run=dry_run)
         if dry_run:
-            return [key for _, key in candidates]
-        deleted: list[str] = []
-        for asset_id, object_key in candidates:
-            await self.store.delete(object_key)
-            async with self.factory() as session, session.begin():
-                asset = await session.get(Asset, asset_id, with_for_update=True)
-                if asset is None or await asset_is_referenced(session, asset.id):
-                    continue
-                asset.status = "DELETED"
-                asset.deleted_at = asset.deleted_at or now
-                deleted.append(object_key)
-        return deleted
+            return [item["object_key"] for item in result.candidates]
+        return list(result.deleted_keys)
     async def run_once(self) -> bool:
         report = await self.run()
         await self.cleanup_staging()

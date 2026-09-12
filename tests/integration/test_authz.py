@@ -8,14 +8,22 @@ import httpx
 import pytest
 
 from apps.api.app.core.config import get_settings
+from apps.api.app.core.login_throttle import login_throttle
 from apps.api.app.core.security import hash_password
 from apps.api.app.db.models import User
 from apps.api.app.db.session import get_session
 from apps.api.app.main import app
 
 
+@pytest.fixture(autouse=True)
+def clean_login_throttle():
+    login_throttle.clear()
+    yield
+    login_throttle.clear()
+
+
 @asynccontextmanager
-async def api_client(session_factory):
+async def api_client(session_factory, *, client=("127.0.0.1", 12345)):
     async def session_override():
         async with session_factory() as session:
             try:
@@ -33,7 +41,7 @@ async def api_client(session_factory):
     )
     app.dependency_overrides[get_session] = session_override
     app.dependency_overrides[get_settings] = lambda: settings
-    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False, client=client)
     try:
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
             yield client
@@ -177,3 +185,37 @@ async def test_logout_requires_csrf_and_revokes_server_session(session_factory):
             await client.post("/api/v1/auth/logout", headers={"X-CSRF-Token": csrf})
         ).status_code == 204
         assert (await client.get("/api/v1/auth/me")).status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_login_throttle_blocks_many_emails_from_one_ip(session_factory):
+    async with api_client(session_factory, client=("10.10.10.10", 12345)) as client:
+        for index in range(5):
+            response = await client.post(
+                "/api/v1/auth/login",
+                json={"email": f"unknown-{index}@example.test", "password": "wrong"},
+            )
+            assert response.status_code == 401
+        blocked = await client.post(
+            "/api/v1/auth/login",
+            json={"email": "another@example.test", "password": "wrong"},
+        )
+        assert blocked.status_code == 429
+
+
+@pytest.mark.asyncio
+async def test_login_throttle_blocks_one_email_from_many_ips(session_factory):
+    email = f"identity-{uuid4().hex}@example.test"
+    for index in range(5):
+        async with api_client(session_factory, client=(f"10.10.20.{index + 1}", 12345)) as client:
+            response = await client.post(
+                "/api/v1/auth/login",
+                json={"email": email, "password": "wrong"},
+            )
+            assert response.status_code == 401
+    async with api_client(session_factory, client=("10.10.20.99", 12345)) as client:
+        blocked = await client.post(
+            "/api/v1/auth/login",
+            json={"email": email, "password": "wrong"},
+        )
+    assert blocked.status_code == 429
