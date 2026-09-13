@@ -219,3 +219,41 @@ async def test_login_throttle_blocks_one_email_from_many_ips(session_factory):
             json={"email": email, "password": "wrong"},
         )
     assert blocked.status_code == 429
+
+
+@pytest.mark.asyncio
+async def test_login_success_does_not_clear_ip_throttle_history(session_factory):
+    valid_email = f"valid-{uuid4().hex}@example.test"
+    await seed_user(session_factory, email=valid_email, password="correct password")
+
+    ip = "10.10.30.30"
+    async with api_client(session_factory, client=(ip, 12345)) as client:
+        # 4 failed login attempts from same IP across different emails
+        for index in range(4):
+            response = await client.post(
+                "/api/v1/auth/login",
+                json={"email": f"failed-{index}-{uuid4().hex}@example.test", "password": "wrong"},
+            )
+            assert response.status_code == 401
+
+        # 1 successful login from the same IP to a valid account
+        success = await client.post(
+            "/api/v1/auth/login",
+            json={"email": valid_email, "password": "correct password"},
+        )
+        assert success.status_code == 200
+
+        # Further failed attempts from the same IP must still count toward IP threshold
+        fifth_failure = await client.post(
+            "/api/v1/auth/login",
+            json={"email": f"another-1-{uuid4().hex}@example.test", "password": "wrong"},
+        )
+        assert fifth_failure.status_code == 401
+
+        # 6th attempt is blocked because IP has 5 failures recorded
+        blocked = await client.post(
+            "/api/v1/auth/login",
+            json={"email": f"another-2-{uuid4().hex}@example.test", "password": "wrong"},
+        )
+        assert blocked.status_code == 429
+        assert blocked.json()["error"]["code"] == "LOGIN_RATE_LIMITED"

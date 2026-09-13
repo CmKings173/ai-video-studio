@@ -86,6 +86,16 @@ class LoginThrottle:
             for key in dict.fromkeys(keys):
                 self._entries.pop(key, None)
 
+    def record_login_success(
+        self,
+        *,
+        ip_key: str | None = None,
+        identity_key: str,
+        attempt_key: str,
+    ) -> None:
+        """Reset identity and attempt history upon successful login; IP history decays naturally."""
+        self.record_success_many((identity_key, attempt_key))
+
     def clear(self) -> None:
         with self._lock:
             self._entries.clear()

@@ -7,10 +7,11 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import and_, case, or_, select
+from sqlalchemy import and_, case, func, or_, select
 
 from apps.api.app.db.models import Asset, utcnow
 from apps.api.app.integrations.minio import AssetStoreError
+from apps.api.app.services.asset_claims import clear_claim
 from apps.api.app.services.asset_service import asset_reference_exists
 from apps.api.app.services.retention import RetentionPolicy
 
@@ -41,13 +42,17 @@ class AssetRetentionService:
         self.store = store
         self.policy = RetentionPolicy.from_settings(settings)
         self.batch_size = int(getattr(settings, "retention_batch_size", 200))
+        self.claim_timeout_seconds = int(
+            getattr(settings, "asset_operation_claim_timeout_seconds", 900)
+        )
 
     def _eligibility(self, now: datetime):
         pending_cutoff = now - timedelta(hours=self.policy.pending_hours)
         failed_cutoff = now - timedelta(hours=self.policy.failed_hours)
         deleted_cutoff = now - timedelta(hours=self.policy.deleted_hours)
         deleting_cutoff = now - timedelta(hours=self.policy.deleting_retry_hours)
-        return or_(
+        active_claim_cutoff = now - timedelta(seconds=self.claim_timeout_seconds)
+        eligible = or_(
             and_(
                 Asset.status.in_({"PENDING", "PENDING_UPLOAD", "VALIDATING"}),
                 Asset.created_at < pending_cutoff,
@@ -61,16 +66,29 @@ class AssetRetentionService:
                 Asset.status == "DELETED",
                 Asset.deleted_at.is_not(None),
                 Asset.deleted_at < deleted_cutoff,
+                Asset.purged_at.is_(None),
             ),
-            and_(Asset.status == "DELETING", Asset.updated_at < deleting_cutoff),
+            and_(
+                Asset.status == "DELETING",
+                func.coalesce(Asset.delete_claimed_at, Asset.updated_at) < deleting_cutoff,
+            ),
         )
+        claim_available = or_(
+            Asset.operation_claim_id.is_(None),
+            Asset.operation_claimed_at.is_(None),
+            Asset.operation_claimed_at < active_claim_cutoff,
+        )
+        return and_(eligible, claim_available)
 
     @staticmethod
     def _order_timestamp():
         return case(
             (Asset.status == "FAILED", Asset.failed_at),
             (Asset.status == "DELETED", Asset.deleted_at),
-            (Asset.status == "DELETING", Asset.updated_at),
+            (
+                Asset.status == "DELETING",
+                func.coalesce(Asset.delete_claimed_at, Asset.updated_at),
+            ),
             else_=Asset.created_at,
         )
 
@@ -129,7 +147,9 @@ class AssetRetentionService:
             for asset in rows:
                 if asset.id not in still_unreferenced:
                     continue
+                clear_claim(asset)
                 asset.status = "DELETING"
+                asset.delete_claimed_at = now
                 claims.append(RetentionCandidate(asset.id, asset.object_key, asset.status))
             return claims
 
@@ -142,6 +162,9 @@ class AssetRetentionService:
                 return False
             asset.status = "DELETED"
             asset.deleted_at = asset.deleted_at or now
+            asset.purged_at = now
+            asset.delete_claimed_at = None
+            clear_claim(asset)
             return True
 
     async def cleanup(
@@ -181,6 +204,19 @@ class AssetRetentionService:
             if await self.finalize(item.asset_id, now=now):
                 deleted_objects += 1
                 deleted_keys.append(item.object_key)
+        has_more = False
+        if len(claims) == self.batch_size:
+            async with self.factory() as session:
+                more_id = await session.scalar(
+                    select(Asset.id)
+                    .where(
+                        self._eligibility(now),
+                        ~asset_reference_exists(Asset.id),
+                        ~Asset.id.in_([c.asset_id for c in claims]),
+                    )
+                    .limit(1)
+                )
+                has_more = more_id is not None
         return RetentionCleanupResult(
-            candidates, deleted_objects, failed, False, tuple(deleted_keys)
+            candidates, deleted_objects, failed, has_more, tuple(deleted_keys)
         )

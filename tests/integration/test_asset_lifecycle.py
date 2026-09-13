@@ -9,6 +9,7 @@ import pytest
 from botocore.exceptions import ClientError
 from PIL import Image
 
+from apps.api.app.api.assets import delete_asset, upload_url
 from apps.api.app.core.errors import AppError
 from apps.api.app.db.models import (
     Asset,
@@ -22,6 +23,7 @@ from apps.api.app.db.models import (
     WorkflowRecord,
     utcnow,
 )
+from apps.api.app.integrations.minio import AssetStoreUnavailableError
 from apps.api.app.schemas.api import AssetComplete, UploadRequest
 from apps.api.app.services.asset_retention import AssetRetentionService
 from apps.api.app.services.asset_service import (
@@ -30,6 +32,7 @@ from apps.api.app.services.asset_service import (
     create_pending_asset,
     upload_staging_key,
 )
+from apps.api.app.services.idempotency import claim
 from workers.common import save_output
 from workers.reconciliation import AssetReconciler
 
@@ -38,6 +41,7 @@ class FakeStore:
     def __init__(self):
         self.objects: dict[str, tuple[bytes, str]] = {}
         self.put_count = 0
+        self.deleted_calls: list[str] = []
 
     async def presign_upload(self, key: str, content_type: str) -> dict:
         return {"url": "https://upload.invalid", "fields": {"key": key, "type": content_type}}
@@ -49,6 +53,8 @@ class FakeStore:
             raise RuntimeError("immutable conflict")
         self.objects[key] = (data, content_type)
         return {"key": key, "size": len(data), "checksum": hashlib.sha256(data).hexdigest()}
+
+    put = put_bytes
 
     async def get_bytes(self, key: str, max_bytes: int | None = None) -> bytes:
         data = self.objects[key][0]
@@ -75,6 +81,7 @@ class FakeStore:
         ]
 
     async def delete(self, key: str) -> None:
+        self.deleted_calls.append(key)
         self.objects.pop(key, None)
 
 
@@ -480,6 +487,83 @@ async def test_background_audio_is_a_protected_final_reference(session_factory, 
         )
         session.add(final)
         await session.flush()
+        # background_audio_asset_id alone protects asset (no FinalVideoScene referencing asset)
+        assert await asset_is_referenced(session, asset.id)
+
+
+@pytest.mark.asyncio
+async def test_final_video_scene_is_a_protected_final_reference(session_factory, tmp_path):
+    user_id, project_id = await seed_owner(session_factory)
+    async with session_factory() as session, session.begin():
+        video = Video(
+            project_id=project_id,
+            title="Scene reference",
+            kind="LONG_VIDEO",
+            target_duration=30,
+            aspect_ratio="16:9",
+            brief="brief",
+            created_by=user_id,
+        )
+        session.add(video)
+        await session.flush()
+        asset = Asset(
+            project_id=project_id,
+            kind="VIDEO",
+            role="GENERATED_VIDEO",
+            filename="scene.mp4",
+            content_type="video/mp4",
+            object_key="assets/scene.mp4",
+            status="READY",
+            size_bytes=10,
+            checksum="b" * 64,
+            created_by=user_id,
+        )
+        session.add(asset)
+        await session.flush()
+        workflow = WorkflowRecord(
+            code="RETENTION_SCENE_REF",
+            mode="t2v",
+            version="1",
+            workflow={"1": {"class_type": "Text", "inputs": {"text": "prompt"}}},
+            slots={},
+            required_slots=[],
+            profile={},
+            workflow_hash="d" * 64,
+            slot_map_hash="e" * 64,
+            enabled=True,
+            created_by=user_id,
+        )
+        session.add(workflow)
+        await session.flush()
+        scene = Scene(video_id=video.id, scene_order=0, prompt="prompt", duration_seconds=5)
+        session.add(scene)
+        await session.flush()
+        generation = SceneGeneration(
+            video_id=video.id,
+            scene_id=scene.id,
+            mode="t2v",
+            workflow_id=workflow.id,
+            generation_no=1,
+            operation="ORIGINAL",
+            status="COMPLETED",
+            phase="COMPLETED",
+            input_snapshot={"workflow": workflow.workflow, "slots": {}, "assets": []},
+            created_by=user_id,
+        )
+        session.add(generation)
+        await session.flush()
+        final = FinalVideo(
+            video_id=video.id,
+            version_no=1,
+            status="QUEUED",
+            manifest={},
+            manifest_hash="c" * 64,
+            assembly_config={},
+            background_audio_asset_id=None,
+            created_by=user_id,
+        )
+        session.add(final)
+        await session.flush()
         session.add(
             FinalVideoScene(
                 final_video_id=final.id,
@@ -491,6 +575,7 @@ async def test_background_audio_is_a_protected_final_reference(session_factory, 
             )
         )
         await session.flush()
+        # FinalVideoScene.asset_id alone protects asset (background_audio_asset_id is None)
         assert await asset_is_referenced(session, asset.id)
 
 
@@ -553,6 +638,7 @@ async def test_retention_delete_failure_leaves_deleting_for_stale_retry(
     async with session_factory() as session, session.begin():
         asset = await session.get(Asset, asset_id, with_for_update=True)
         assert asset.status == "DELETING"
+        asset.delete_claimed_at = now - timedelta(hours=2)
         asset.updated_at = now - timedelta(hours=2)
     second = await service.cleanup(now=now)
     assert second.deleted_objects == 1
@@ -731,3 +817,580 @@ async def test_reconciler_reports_pending_storage_unavailable_without_marking_fa
     assert report.corrupt_objects == []
     async with session_factory() as session:
         assert (await session.get(Asset, asset.id)).status == "PENDING_UPLOAD"
+
+
+@pytest.mark.asyncio
+async def test_retention_physical_purge_terminal_semantics_and_idempotent_retry(
+    session_factory, tmp_path
+):
+    """Mandatory test: purge succeeds -> purged_at set;
+    second cleanup does not claim or re-delete."""
+    user_id, project_id = await seed_owner(session_factory)
+    store = FakeStore()
+    now = utcnow()
+    cutoff_deleted = now - timedelta(hours=200)
+
+    # Seed asset 1: soft-deleted 200 hours ago (> 168h cutoff)
+    async with session_factory() as session, session.begin():
+        asset1 = Asset(
+            project_id=project_id,
+            kind="VIDEO",
+            role="GENERATED_VIDEO",
+            filename="purge1.mp4",
+            content_type="video/mp4",
+            object_key="outputs/purge1.mp4",
+            status="DELETED",
+            deleted_at=cutoff_deleted,
+            purged_at=None,
+            size_bytes=100,
+            created_by=user_id,
+        )
+        session.add(asset1)
+        await session.flush()
+        asset1_id = asset1.id
+        store.objects[asset1.object_key] = (b"video-bytes", "video/mp4")
+
+    service = AssetRetentionService(session_factory, store, settings(tmp_path))
+
+    # Test 1: cleanup() -> object deleted, status DELETED, purged_at set
+    result1 = await service.cleanup(now=now)
+    assert result1.deleted_objects == 1
+    assert asset1.object_key not in store.objects
+    assert asset1.object_key in store.deleted_calls
+
+    async with session_factory() as session:
+        refreshed = await session.get(Asset, asset1_id)
+        assert refreshed.status == "DELETED"
+        assert refreshed.purged_at is not None
+        assert refreshed.deleted_at == cutoff_deleted
+
+    # Test 2 - critical regression: second cleanup() -> same asset NOT claimed,
+    # store.delete NOT called again
+    initial_deleted_calls = len(store.deleted_calls)
+    result2 = await service.cleanup(now=now)
+    assert result2.deleted_objects == 0
+    assert len(result2.candidates) == 0
+    assert len(store.deleted_calls) == initial_deleted_calls
+
+    # Test 3: physical delete fails -> status remains DELETING, purged_at remains NULL
+    async with session_factory() as session, session.begin():
+        asset2 = Asset(
+            project_id=project_id,
+            kind="VIDEO",
+            role="GENERATED_VIDEO",
+            filename="purge2.mp4",
+            content_type="video/mp4",
+            object_key="outputs/purge2.mp4",
+            status="DELETED",
+            deleted_at=cutoff_deleted,
+            purged_at=None,
+            size_bytes=100,
+            created_by=user_id,
+        )
+        session.add(asset2)
+        await session.flush()
+        asset2_id = asset2.id
+        store.objects[asset2.object_key] = (b"video-bytes-2", "video/mp4")
+
+    flaky_store = FlakyDeleteStore()
+    flaky_store.objects[asset2.object_key] = (b"video-bytes-2", "video/mp4")
+    flaky_service = AssetRetentionService(session_factory, flaky_store, settings(tmp_path))
+
+    # Cleanup fails object delete
+    failed_result = await flaky_service.cleanup(now=now)
+    assert failed_result.deleted_objects == 0
+    assert failed_result.retained_records == 1
+
+    async with session_factory() as session:
+        deleting_row = await session.get(Asset, asset2_id)
+        assert deleting_row.status == "DELETING"
+        assert deleting_row.purged_at is None
+        assert deleting_row.delete_claimed_at == now
+
+    # Immediate second cleanup must NOT claim it because delete_claimed_at is recent
+    immediate_retry = await flaky_service.cleanup(now=now + timedelta(minutes=5))
+    assert len(immediate_retry.candidates) == 0
+
+    # Retry later (after 1 hour retry interval) succeeds
+    retry_later = await flaky_service.cleanup(now=now + timedelta(hours=2))
+    assert retry_later.deleted_objects == 1
+
+    async with session_factory() as session:
+        final_row = await session.get(Asset, asset2_id)
+        assert final_row.status == "DELETED"
+        assert final_row.purged_at is not None
+
+
+@pytest.mark.asyncio
+async def test_retention_cleanup_returns_has_more_true_when_more_eligible_assets_remain(
+    session_factory, tmp_path
+):
+    """Mandatory test: batch_size = 2 with 3+ eligible assets returns
+    has_more = True, then False."""
+    user_id, project_id = await seed_owner(session_factory)
+    store = FakeStore()
+    now = utcnow()
+    cutoff = now - timedelta(hours=200)
+
+    async with session_factory() as session, session.begin():
+        for i in range(3):
+            asset = Asset(
+                project_id=project_id,
+                kind="VIDEO",
+                role="GENERATED_VIDEO",
+                filename=f"batch_{i}.mp4",
+                content_type="video/mp4",
+                object_key=f"outputs/batch_{i}.mp4",
+                status="DELETED",
+                deleted_at=cutoff,
+                purged_at=None,
+                size_bytes=100,
+                created_by=user_id,
+            )
+            session.add(asset)
+            store.objects[asset.object_key] = (b"bytes", "video/mp4")
+
+    test_settings = settings(tmp_path)
+    test_settings.retention_batch_size = 2
+    service = AssetRetentionService(session_factory, store, test_settings)
+
+    # First cleanup processes 2 items, has_more must be True
+    res1 = await service.cleanup(now=now)
+    assert len(res1.candidates) == 2
+    assert res1.deleted_objects == 2
+    assert res1.has_more is True
+
+    # Second cleanup processes the 3rd item, has_more must be False
+    res2 = await service.cleanup(now=now)
+    assert len(res2.candidates) == 1
+    assert res2.deleted_objects == 1
+    assert res2.has_more is False
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_cleanup_staging_deletes_expired_unreferenced_staging(
+    session_factory, tmp_path
+):
+    """Mandatory test: stale failed/pending upload does not leave staging bytes forever."""
+    user_id, project_id = await seed_owner(session_factory)
+    store = FakeStore()
+    now = utcnow()
+
+    # Asset 1: FAILED (terminal)
+    # Asset 2: PENDING_UPLOAD (active in-flight)
+    async with session_factory() as session, session.begin():
+        asset1 = Asset(
+            id="term-failed-asset",
+            project_id=project_id,
+            kind="VIDEO",
+            role="REFERENCE_VIDEO",
+            filename="term.mp4",
+            content_type="video/mp4",
+            object_key="assets/term.mp4",
+            status="FAILED",
+            failed_at=now - timedelta(hours=48),
+            size_bytes=100,
+            created_by=user_id,
+        )
+        asset2 = Asset(
+            id="active-upload-asset",
+            project_id=project_id,
+            kind="VIDEO",
+            role="REFERENCE_VIDEO",
+            filename="active.mp4",
+            content_type="video/mp4",
+            object_key="assets/active.mp4",
+            status="PENDING_UPLOAD",
+            size_bytes=100,
+            created_by=user_id,
+        )
+        session.add_all([asset1, asset2])
+
+    staging1 = "staging/assets/term-failed-asset/upload"
+    staging2 = "staging/assets/active-upload-asset/upload"
+    store.objects[staging1] = (b"staging1-bytes", "video/mp4")
+    store.objects[staging2] = (b"staging2-bytes", "video/mp4")
+
+    reconciler = AssetReconciler(session_factory, store, settings(tmp_path))
+
+    # Override list_objects to simulate older timestamps (> 24h orphan retention cutoff)
+    async def list_old_staging(prefix=""):
+        return [
+            {"key": staging1, "size": 100, "last_modified": now - timedelta(hours=48)},
+            {"key": staging2, "size": 100, "last_modified": now - timedelta(hours=48)},
+        ]
+    store.list_objects = list_old_staging
+
+    deleted = await reconciler.cleanup_staging()
+    assert staging1 in deleted
+    assert staging1 not in store.objects
+    # Active upload staging is preserved despite age
+    assert staging2 not in deleted
+    assert staging2 in store.objects
+
+
+@pytest.mark.asyncio
+async def test_delete_asset_endpoint_is_idempotent_on_deleting_asset(session_factory):
+    """Mandatory test: simulate asset = DELETING, DELETE /asset ->
+    expected: status still DELETING."""
+    user_id, project_id = await seed_owner(session_factory)
+    async with session_factory() as session, session.begin():
+        user = await session.get(User, user_id)
+        asset = Asset(
+            project_id=project_id,
+            kind="VIDEO",
+            role="REFERENCE_VIDEO",
+            filename="deleting.mp4",
+            content_type="video/mp4",
+            object_key="assets/deleting.mp4",
+            status="DELETING",
+            delete_claimed_at=utcnow(),
+            size_bytes=100,
+            created_by=user_id,
+        )
+        session.add(asset)
+        await session.flush()
+        asset_id = asset.id
+
+    # Call direct delete_asset
+    async with session_factory() as session, session.begin():
+        user = await session.get(User, user_id)
+        await delete_asset(asset_id, user=user, session=session)
+
+    # In DB, status must STILL be DELETING (not overwritten to DELETED)
+    async with session_factory() as session:
+        refreshed = await session.get(Asset, asset_id)
+        assert refreshed.status == "DELETING"
+
+
+@pytest.mark.asyncio
+async def test_upload_replay_rejects_deleting_asset(session_factory, tmp_path):
+    """Mandatory test: idempotency replay with asset status DELETING
+    returns 409 ASSET_STATE_CONFLICT."""
+    from apps.api.app.services.idempotency import complete as complete_idempotency
+    user_id, project_id = await seed_owner(session_factory)
+    store = FakeStore()
+    app_settings = settings(tmp_path)
+    app_settings.idempotency_hours = 24
+
+    req_payload = UploadRequest(
+        role="PRODUCT_IMAGE",
+        filename="replay.png",
+        content_type="image/png",
+        size_bytes=100,
+        project_id=project_id,
+    )
+
+    async with session_factory() as session, session.begin():
+        user = await session.get(User, user_id)
+        asset = Asset(
+            project_id=project_id,
+            kind="IMAGE",
+            role="PRODUCT_IMAGE",
+            filename="replay.png",
+            content_type="image/png",
+            object_key="assets/replay.png",
+            status="DELETING",
+            delete_claimed_at=utcnow(),
+            size_bytes=100,
+            created_by=user_id,
+        )
+        session.add(asset)
+        await session.flush()
+        asset_id = asset.id
+
+        # Seed idempotency record completed pointing to this DELETING asset
+        record, _ = await claim(
+            session,
+            user_id=user_id,
+            operation="asset-upload-url",
+            key="replay-key-123",
+            payload=req_payload.model_dump(mode="json"),
+            hours=24,
+        )
+        complete_idempotency(record, {"asset_id": asset_id}, 201)
+
+    # Replay upload_url call
+    async with session_factory() as session, session.begin():
+        user = await session.get(User, user_id)
+        with pytest.raises(AppError) as exc_info:
+            await upload_url(
+                payload=req_payload,
+                user=user,
+                session=session,
+                key="replay-key-123",
+                settings=app_settings,
+                asset_store=store,
+            )
+        assert exc_info.value.status_code == 409
+        assert exc_info.value.code == "ASSET_STATE_CONFLICT"
+
+
+@pytest.mark.asyncio
+async def test_save_output_guards_against_concurrent_deleting_and_storage_unavailable(
+    session_factory, tmp_path
+):
+    """Mandatory tests: save_output rejects DELETING transition,
+    and storage unavailable does not downgrade READY."""
+    user_id, project_id = await seed_owner(session_factory)
+    store = FakeStore()
+    data = b"video-content-data"
+    metadata = {
+        "kind": "VIDEO",
+        "has_video": True,
+        "width": 640,
+        "height": 360,
+        "duration_seconds": 3.0,
+    }
+
+    # 1. State conflict race: asset becomes DELETING before final commit
+    # We subclass store to simulate concurrent state change during put_bytes
+    class MutatingStore(FakeStore):
+        async def put_bytes(self, key, data, content_type):
+            # Simulate retention claiming asset concurrently
+            async with session_factory() as session, session.begin():
+                row = await session.get(Asset, asset_id, with_for_update=True)
+                row.status = "DELETING"
+            return await super().put_bytes(key, data, content_type)
+
+    import uuid
+    from uuid import NAMESPACE_URL, uuid5
+    role = "GENERATED_VIDEO"
+    owner_id = f"gen-{uuid.uuid4().hex}"
+    asset_id = str(uuid5(NAMESPACE_URL, f"ai-video-studio:{role}:{owner_id}"))
+
+    mutating_store = MutatingStore()
+    with pytest.raises(ValueError, match="ASSET_STATE_CONFLICT"):
+        await save_output(
+            session_factory,
+            mutating_store,
+            owner_id=owner_id,
+            role=role,
+            project_id=project_id,
+            created_by=user_id,
+            data=data,
+            metadata=metadata,
+        )
+
+    async with session_factory() as session:
+        row = await session.get(Asset, asset_id)
+        assert row.status == "DELETING"  # Must NOT be READY
+
+    # 2. READY asset + transient storage unavailable does NOT downgrade to PENDING_UPLOAD
+    class UnavailableStore(FakeStore):
+        async def get_bytes(self, key, max_bytes=None):
+            raise AssetStoreUnavailableError("503 Service Unavailable")
+
+    # Create a READY asset
+    ready_owner = f"gen-ready-{uuid.uuid4().hex}"
+    ready_id = await save_output(
+        session_factory,
+        store,
+        owner_id=ready_owner,
+        role=role,
+        project_id=project_id,
+        created_by=user_id,
+        data=data,
+        metadata=metadata,
+    )
+
+    async with session_factory() as session:
+        ready_row = await session.get(Asset, ready_id)
+        assert ready_row.status == "READY"
+
+    # Save output replay with storage temporarily unavailable
+    unavail_store = UnavailableStore()
+    with pytest.raises(AssetStoreUnavailableError):
+        await save_output(
+            session_factory,
+            unavail_store,
+            owner_id=ready_owner,
+            role=role,
+            project_id=project_id,
+            created_by=user_id,
+            data=data,
+            metadata=metadata,
+        )
+
+    # In DB, status MUST remain READY (not downgraded to PENDING_UPLOAD)
+    async with session_factory() as session:
+        refreshed_ready = await session.get(Asset, ready_id)
+        assert refreshed_ready.status == "READY"
+
+
+@pytest.mark.asyncio
+async def test_reconciler_fresh_upload_grace_and_stale_upload_policy(session_factory, tmp_path):
+    """Mandatory test: fresh PENDING_UPLOAD stays pending;
+    stale PENDING_UPLOAD transitions to FAILED."""
+    user_id, project_id = await seed_owner(session_factory)
+    store = FakeStore()
+    now = utcnow()
+
+    async with session_factory() as session, session.begin():
+        # Fresh asset (created 2 minutes ago < 15 min grace)
+        fresh_asset = Asset(
+            project_id=project_id,
+            kind="VIDEO",
+            role="REFERENCE_VIDEO",
+            filename="fresh.mp4",
+            content_type="video/mp4",
+            object_key="assets/fresh.mp4",
+            status="PENDING_UPLOAD",
+            created_at=now - timedelta(minutes=2),
+            size_bytes=100,
+            created_by=user_id,
+        )
+        # Stale asset (created 30 minutes ago > 15 min grace)
+        stale_asset = Asset(
+            project_id=project_id,
+            kind="VIDEO",
+            role="REFERENCE_VIDEO",
+            filename="stale.mp4",
+            content_type="video/mp4",
+            object_key="assets/stale.mp4",
+            status="PENDING_UPLOAD",
+            created_at=now - timedelta(minutes=30),
+            size_bytes=100,
+            created_by=user_id,
+        )
+        session.add_all([fresh_asset, stale_asset])
+        await session.flush()
+        fresh_id, stale_id = fresh_asset.id, stale_asset.id
+
+    reconciler = AssetReconciler(session_factory, store, settings(tmp_path))
+    report = await reconciler.run(inspect_orphans=False)
+
+    # Fresh asset is NOT reported missing or corrupt
+    assert "assets/fresh.mp4" not in report.missing_objects
+    assert "assets/fresh.mp4" not in report.corrupt_objects
+
+    # Stale asset IS reported missing
+    assert "assets/stale.mp4" in report.missing_objects
+
+    async with session_factory() as session:
+        fresh_row = await session.get(Asset, fresh_id)
+        assert fresh_row.status == "PENDING_UPLOAD"
+        assert fresh_row.failed_at is None
+
+        stale_row = await session.get(Asset, stale_id)
+        assert stale_row.status == "FAILED"
+        assert stale_row.failed_at is not None
+
+
+@pytest.mark.asyncio
+async def test_reconciler_promotion_vs_retention_race(session_factory, tmp_path):
+    """Mandatory test: reconciler reads staging, retention claims asset,
+    reconciler aborts and cleans orphan."""
+    import asyncio
+    user_id, project_id = await seed_owner(session_factory)
+    store = FakeStore()
+    now = utcnow()
+
+    async with session_factory() as session, session.begin():
+        asset = Asset(
+            project_id=project_id,
+            kind="IMAGE",
+            role="PRODUCT_IMAGE",
+            filename="race.png",
+            content_type="image/png",
+            object_key="assets/race.png",
+            status="PENDING_UPLOAD",
+            size_bytes=len(png_bytes()),
+            checksum=hashlib.sha256(png_bytes()).hexdigest(),
+            created_by=user_id,
+        )
+        session.add(asset)
+        await session.flush()
+        asset_id = asset.id
+
+    staging_key = upload_staging_key(asset_id=asset_id)
+    store.objects[staging_key] = (png_bytes(), "image/png")
+
+    put_started = asyncio.Event()
+    retention_done = asyncio.Event()
+
+    original_put = store.put_bytes
+
+    async def coordinated_put(key, data, content_type):
+        result = await original_put(key, data, content_type)
+        put_started.set()
+        await retention_done.wait()
+        return result
+
+    store.put_bytes = coordinated_put
+
+    reconciler = AssetReconciler(session_factory, store, settings(tmp_path))
+
+    async def run_reconciler():
+        snapshot = {
+            "id": asset_id,
+            "status": "PENDING_UPLOAD",
+            "object_key": "assets/race.png",
+            "checksum": hashlib.sha256(png_bytes()).hexdigest(),
+            "size_bytes": len(png_bytes()),
+            "content_type": "image/png",
+            "filename": "race.png",
+            "created_at": now - timedelta(hours=30),
+        }
+        report = SimpleNamespace(
+            missing_objects=[], corrupt_objects=[], unavailable_objects=[], repaired_assets=[]
+        )
+        await reconciler._repair_pending(snapshot, report)
+
+    async def run_retention():
+        await put_started.wait()
+        # Concurrent retention claims asset
+        async with session_factory() as session, session.begin():
+            row = await session.get(Asset, asset_id, with_for_update=True)
+            row.status = "DELETING"
+            row.delete_claimed_at = utcnow()
+        retention_done.set()
+
+    await asyncio.gather(run_reconciler(), run_retention())
+
+    # Asset must NOT be resurrected to READY
+    async with session_factory() as session:
+        row = await session.get(Asset, asset_id)
+        assert row.status == "DELETING"
+
+    # Canonical object must NOT remain an orphan in store
+    assert "assets/race.png" not in store.objects
+
+
+@pytest.mark.asyncio
+async def test_reconciler_nosuchbucket_keeps_ready_asset_unchanged(session_factory, tmp_path):
+    """Mandatory test: READY asset with store returning NoSuchBucket
+    remains READY, reported unavailable."""
+    user_id, project_id = await seed_owner(session_factory)
+
+    async with session_factory() as session, session.begin():
+        asset = Asset(
+            project_id=project_id,
+            kind="VIDEO",
+            role="FINAL_VIDEO",
+            filename="ready.mp4",
+            content_type="video/mp4",
+            object_key="outputs/ready.mp4",
+            status="READY",
+            size_bytes=100,
+            checksum="c" * 64,
+            created_by=user_id,
+        )
+        session.add(asset)
+        await session.flush()
+        asset_id = asset.id
+
+    class NoSuchBucketStore(FakeStore):
+        async def head(self, key):
+            raise AssetStoreUnavailableError("Storage bucket missing (NoSuchBucket)")
+
+    reconciler = AssetReconciler(session_factory, NoSuchBucketStore(), settings(tmp_path))
+    report = await reconciler.run(inspect_orphans=False)
+
+    assert "outputs/ready.mp4" in report.unavailable_objects
+    assert "outputs/ready.mp4" not in report.missing_objects
+    assert "outputs/ready.mp4" not in report.corrupt_objects
+
+    async with session_factory() as session:
+        row = await session.get(Asset, asset_id)
+        assert row.status == "READY"

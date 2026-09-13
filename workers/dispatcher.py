@@ -491,6 +491,9 @@ class Dispatcher:
             created_by=generation.created_by,
             data=data,
             metadata=metadata,
+            claim_timeout_seconds=getattr(
+                self.settings, "asset_operation_claim_timeout_seconds", 900
+            ),
         )
         await self._finish(generation.id, "COMPLETED", asset_id=asset_id)
 

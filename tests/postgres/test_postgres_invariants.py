@@ -129,6 +129,8 @@ async def _seed_dispatch_queue(factory):
     async with factory() as session, session.begin():
         suffix = uuid4().hex
         user = User(email=f"dispatch-{suffix}@example.test", name="PG", password_hash="hash")
+        session.add(user)
+        await session.flush()
         project = Project(name=f"Dispatch {suffix}", description="", created_by=user.id)
         workflow = WorkflowRecord(
             code=f"DISPATCH_{suffix}",
@@ -143,7 +145,7 @@ async def _seed_dispatch_queue(factory):
             enabled=True,
             created_by=user.id,
         )
-        session.add_all([user, project, workflow])
+        session.add_all([project, workflow])
         await session.flush()
         ids = []
         for index in range(2):
@@ -235,8 +237,10 @@ async def _seed_assembly_queue(factory):
     async with factory() as session, session.begin():
         suffix = uuid4().hex
         user = User(email=f"assembly-{suffix}@example.test", name="PG", password_hash="hash")
+        session.add(user)
+        await session.flush()
         project = Project(name=f"Assembly {suffix}", description="", created_by=user.id)
-        session.add_all([user, project])
+        session.add(project)
         await session.flush()
         ids = []
         for index in range(2):
@@ -268,6 +272,8 @@ async def _seed_assembly_queue(factory):
 
 @pytest.mark.asyncio
 async def test_postgres_assembler_concurrent_claims_are_unique(pg_engine):
+    """Concurrent workers may claim different queued finals for distinct videos,
+    never duplicate claims."""
     factory = async_sessionmaker(pg_engine, expire_on_commit=False)
     final_ids = await _seed_assembly_queue(factory)
     settings = SimpleNamespace(lease_seconds=30)
@@ -276,14 +282,53 @@ async def test_postgres_assembler_concurrent_claims_are_unique(pg_engine):
 
     claimed = await asyncio.gather(first.claim(), second.claim())
     winners = [item for item in claimed if item is not None]
-    assert len(winners) == 1
-    assert winners[0] in final_ids
+    assert len(winners) == 2
+    assert len(set(winners)) == 2
+    assert set(winners) == set(final_ids)
 
+
+@pytest.mark.asyncio
+async def test_postgres_assembler_cannot_double_claim_same_final(pg_engine):
+    """When only one final is queued, concurrent claims must yield exactly one winner."""
+    factory = async_sessionmaker(pg_engine, expire_on_commit=False)
     async with factory() as session, session.begin():
-        final = await session.get(FinalVideo, winners[0], with_for_update=True)
-        final.status = "FAILED"
-        final.claimed_by = None
-        final.lease_expires_at = None
+        suffix = uuid4().hex
+        user = User(email=f"single-{suffix}@example.test", name="PG", password_hash="hash")
+        session.add(user)
+        await session.flush()
+        project = Project(name=f"Single {suffix}", description="", created_by=user.id)
+        session.add(project)
+        await session.flush()
+        video = Video(
+            project_id=project.id,
+            title="Single assembly",
+            kind="LONG_VIDEO",
+            target_duration=30,
+            aspect_ratio="16:9",
+            brief="brief",
+            created_by=user.id,
+        )
+        session.add(video)
+        await session.flush()
+        final = FinalVideo(
+            video_id=video.id,
+            version_no=1,
+            status="QUEUED",
+            manifest={"scenes": []},
+            manifest_hash="e" * 64,
+            assembly_config={},
+            created_by=user.id,
+        )
+        session.add(final)
+        await session.flush()
+        final_id = final.id
 
-    next_claim = await second.claim()
-    assert next_claim in set(final_ids) - {winners[0]}
+    settings = SimpleNamespace(lease_seconds=30)
+    first = Assembler(factory, None, None, settings)
+    second = Assembler(factory, None, None, settings)
+
+    claimed = await asyncio.gather(first.claim(), second.claim())
+    winners = [item for item in claimed if item is not None]
+    assert len(winners) == 1
+    assert winners[0] == final_id
+    assert None in claimed

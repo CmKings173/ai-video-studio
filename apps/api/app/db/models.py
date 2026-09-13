@@ -106,10 +106,14 @@ class Asset(Identity, Base):
             "duration_seconds IS NULL OR duration_seconds > 0", name="duration_positive"
         ),
         CheckConstraint("project_id IS NULL OR product_id IS NULL", name="single_business_scope"),
+        CheckConstraint(
+            "operation_claim_type IS NULL OR operation_claim_type IN ('REPAIR','OUTPUT_WRITE')",
+            name="operation_claim_type",
+        ),
         Index("ix_assets_status_created_at", "status", "created_at"),
         Index("ix_assets_retention_failed", "status", "failed_at", "id"),
-        Index("ix_assets_retention_deleted", "status", "deleted_at", "id"),
-        Index("ix_assets_retention_deleting", "status", "updated_at", "id"),
+        Index("ix_assets_retention_deleted", "status", "deleted_at", "purged_at", "id"),
+        Index("ix_assets_retention_deleting", "status", "delete_claimed_at", "id"),
         Index("ix_assets_created_by", "created_by"),
     )
     project_id: Mapped[str | None] = mapped_column(
@@ -132,6 +136,11 @@ class Asset(Identity, Base):
     created_by: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"))
     failed_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
     deleted_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    purged_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    delete_claimed_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    operation_claim_id: Mapped[str | None] = mapped_column(String(64))
+    operation_claim_type: Mapped[str | None] = mapped_column(String(32))
+    operation_claimed_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
 
 
 class Video(Identity, Base):

@@ -36,9 +36,14 @@ def _translate_storage_error(exc: BaseException) -> AssetStoreError:
         error = exc.response.get("Error", {})
         code = str(error.get("Code", ""))
         status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
-        if (
-            code in {"404", "NoSuchKey", "NoSuchObject", "NoSuchBucket", "NotFound"}
-            or status == 404
+        if code == "NoSuchBucket":
+            return AssetStoreUnavailableError(f"Storage bucket missing ({code})")
+        if status == 503 or code in {"503", "SlowDown", "ServiceUnavailable"}:
+            return AssetStoreUnavailableError(
+                f"Object store service unavailable ({code or status})"
+            )
+        if code in {"NoSuchKey", "NoSuchObject"} or (
+            (code in {"404", "NotFound"} or status == 404) and code != "NoSuchBucket"
         ):
             return AssetObjectMissingError("Object is missing")
         return AssetStoreUnavailableError(
@@ -190,13 +195,15 @@ class AssetStore:
                 IfNoneMatch="*",
             )
         except ClientError as exc:
-            if str(exc.response.get("Error", {}).get("Code")) not in {
+            code = str(exc.response.get("Error", {}).get("Code", ""))
+            status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+            if code not in {
                 "PreconditionFailed",
                 "412",
                 "ConditionalRequestConflict",
                 "409",
-            }:
-                raise
+            } and status not in {409, 412}:
+                raise _translate_storage_error(exc) from exc
             # A replay can reuse exactly the same object; a conflicting writer
             # may never overwrite existing bytes under this immutable key.
             existing = await self.head(key)
@@ -204,6 +211,8 @@ class AssetStore:
                 raise AssetStoreError(
                     "Immutable object key already contains different data"
                 ) from exc
+        except (BotoCoreError, OSError, TimeoutError) as exc:
+            raise _translate_storage_error(exc) from exc
         return {"key": key, "checksum": checksum, "size": len(data), "content_type": content_type}
 
     put_bytes = put

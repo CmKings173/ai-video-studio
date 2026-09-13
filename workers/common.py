@@ -16,6 +16,17 @@ from sqlalchemy import select, text
 
 from apps.api.app.db.models import Asset, Scene, SceneGeneration, Video, utcnow
 from apps.api.app.integrations.media import MediaValidationError, inspect_media
+from apps.api.app.integrations.minio import (
+    AssetObjectMissingError,
+    AssetStoreError,
+    AssetStoreUnavailableError,
+)
+from apps.api.app.services.asset_claims import (
+    OUTPUT_WRITE_CLAIM,
+    acquire_claim,
+    clear_claim,
+    owns_claim,
+)
 
 logger = logging.getLogger(__name__)
 GENERATION_TERMINAL = frozenset({"COMPLETED", "FAILED", "CANCELLED"})
@@ -105,6 +116,14 @@ async def validate_generated_video(
         raise MediaValidationError("generated output has no video stream")
     return inspected
 
+
+async def _release_output_claim(factory, asset_id: str, claim_id: str) -> None:
+    async with factory() as session, session.begin():
+        asset = await session.get(Asset, asset_id, with_for_update=True)
+        if asset and owns_claim(asset, claim_id, OUTPUT_WRITE_CLAIM):
+            clear_claim(asset)
+
+
 async def save_output(
     factory,
     store,
@@ -115,8 +134,9 @@ async def save_output(
     created_by: str,
     data: bytes,
     metadata: dict,
+    claim_timeout_seconds: int = 900,
 ) -> str:
-    """Persist intent before object I/O; repeat collection repairs partial writes."""
+    """Persist output intent and own the asset through all canonical object I/O."""
     if role in {"GENERATED_VIDEO", "FINAL_VIDEO"} and (
         metadata.get("kind") not in (None, "VIDEO") or not metadata.get("has_video")
     ):
@@ -129,7 +149,7 @@ async def save_output(
         asset = await session.get(Asset, asset_id, with_for_update=True)
         if asset is not None:
             if asset.checksum and asset.checksum != checksum:
-                raise ValueError("IMMUTABLE_OUTPUT_CONFLICT")
+                raise ValueError("IMMUTABLE_OUTPUT_CONFLICT") from None
             if asset.status not in {"PENDING_UPLOAD", "READY"}:
                 raise ValueError("ASSET_STATE_CONFLICT")
             recorded_ready = asset.status == "READY"
@@ -148,27 +168,81 @@ async def save_output(
                 created_by=created_by,
             )
             session.add(asset)
+            await session.flush()
+        claim_id = await acquire_claim(
+            session,
+            asset_id,
+            OUTPUT_WRITE_CLAIM,
+            timeout_seconds=claim_timeout_seconds,
+            allowed_statuses={"PENDING_UPLOAD", "READY"},
+        )
+        if claim_id is None:
+            raise ValueError("ASSET_OPERATION_BUSY")
+
     if recorded_ready:
         try:
             check_checksum(await store.get_bytes(object_key), checksum)
-            return asset_id
-        except Exception:
+        except (AssetObjectMissingError, KeyError, FileNotFoundError):
             async with factory() as session, session.begin():
                 asset = await session.get(Asset, asset_id, with_for_update=True)
-                if asset is None or (asset.checksum and asset.checksum != checksum):
+                if not asset or not owns_claim(asset, claim_id, OUTPUT_WRITE_CLAIM):
+                    raise ValueError("ASSET_OPERATION_BUSY") from None
+                if asset.checksum and asset.checksum != checksum:
+                    clear_claim(asset)
                     raise ValueError("IMMUTABLE_OUTPUT_CONFLICT") from None
-                asset.status = "PENDING_UPLOAD"
-                asset.failed_at = None
-    await store.put_bytes(object_key, data, "video/mp4")
-    # A read-after-write verifies bytes, not an S3 multipart ETag.
-    check_checksum(await store.get_bytes(object_key), checksum)
+                if asset.status == "READY":
+                    asset.status = "PENDING_UPLOAD"
+                    asset.failed_at = None
+        except (
+            AssetStoreUnavailableError,
+            AssetStoreError,
+            TimeoutError,
+            ConnectionError,
+            OSError,
+        ):
+            await _release_output_claim(factory, asset_id, claim_id)
+            raise
+        else:
+            async with factory() as session, session.begin():
+                asset = await session.get(Asset, asset_id, with_for_update=True)
+                if not asset or not owns_claim(asset, claim_id, OUTPUT_WRITE_CLAIM):
+                    raise ValueError("ASSET_OPERATION_BUSY")
+                if asset.status != "READY":
+                    clear_claim(asset)
+                    raise ValueError("ASSET_STATE_CONFLICT")
+                clear_claim(asset)
+            return asset_id
+
+    try:
+        await store.put_bytes(object_key, data, "video/mp4")
+        # A read-after-write verifies bytes, not an S3 multipart ETag.
+        check_checksum(await store.get_bytes(object_key), checksum)
+    except (
+        AssetStoreUnavailableError,
+        AssetStoreError,
+        TimeoutError,
+        ConnectionError,
+        OSError,
+        ValueError,
+    ):
+        await _release_output_claim(factory, asset_id, claim_id)
+        raise
+
     async with factory() as session, session.begin():
         asset = await session.get(Asset, asset_id, with_for_update=True)
+        if not asset:
+            raise ValueError("ASSET_NOT_FOUND")
+        if not owns_claim(asset, claim_id, OUTPUT_WRITE_CLAIM):
+            raise ValueError("ASSET_OPERATION_BUSY")
+        if asset.status != "PENDING_UPLOAD":
+            clear_claim(asset)
+            raise ValueError("ASSET_STATE_CONFLICT")
         asset.status = "READY"
         asset.failed_at = None
         asset.width = metadata.get("width")
         asset.height = metadata.get("height")
         asset.duration_seconds = metadata.get("duration_seconds", metadata.get("duration"))
+        clear_claim(asset)
     return asset_id
 
 
@@ -183,5 +257,3 @@ async def service_loop(worker, poll_seconds: float) -> None:
             worked = False
         if not worked:
             await asyncio.sleep(max(0.1, poll_seconds))
-
-

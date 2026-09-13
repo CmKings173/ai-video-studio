@@ -22,13 +22,19 @@ from apps.api.app.integrations.minio import (
     AssetStoreError,
     AssetStoreUnavailableError,
 )
+from apps.api.app.services.asset_claims import (
+    REPAIR_CLAIM,
+    acquire_claim,
+    clear_claim,
+    owns_claim,
+)
 from apps.api.app.services.asset_retention import AssetRetentionService
 from apps.api.app.services.asset_service import upload_staging_key
 
 logger = logging.getLogger(__name__)
 
 
-_MISSING_CODES = {"404", "NoSuchKey", "NoSuchObject", "NoSuchBucket", "NotFound"}
+_MISSING_CODES = {"404", "NoSuchKey", "NoSuchObject", "NotFound"}
 _STORAGE_ERRORS = (
     AssetObjectMissingError,
     AssetStoreUnavailableError,
@@ -47,6 +53,8 @@ def _is_confirmed_missing(exc: BaseException) -> bool:
     if isinstance(exc, ClientError):
         error = exc.response.get("Error", {})
         code = str(error.get("Code", ""))
+        if code == "NoSuchBucket":
+            return False
         status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
         return code in _MISSING_CODES or status == 404
     return False
@@ -59,6 +67,7 @@ class ReconciliationReport:
     unavailable_objects: list[str] = field(default_factory=list)
     orphan_objects: list[str] = field(default_factory=list)
     repaired_assets: list[str] = field(default_factory=list)
+    compensation_failures: list[str] = field(default_factory=list)
 
 
 class AssetReconciler:
@@ -67,6 +76,9 @@ class AssetReconciler:
         self.store = store
         self.settings = settings
         self.retention = AssetRetentionService(factory, store, settings)
+        self.claim_timeout_seconds = int(
+            getattr(settings, "asset_operation_claim_timeout_seconds", 900)
+        )
 
     async def _mark_ready_failed(self, asset_id: str) -> None:
         async with self.factory() as session, session.begin():
@@ -115,6 +127,67 @@ class AssetReconciler:
                 for row in rows
             ]
 
+    async def _release_repair_claim(self, asset_id: str, claim_id: str) -> None:
+        async with self.factory() as session, session.begin():
+            asset = await session.get(Asset, asset_id, with_for_update=True)
+            if asset and owns_claim(asset, claim_id, REPAIR_CLAIM):
+                clear_claim(asset)
+
+    async def _compensate_promoted(
+        self,
+        asset_id: str,
+        claim_id: str,
+        object_key: str,
+        report: ReconciliationReport,
+    ) -> None:
+        """Delete a promoted object only while this worker still owns the claim."""
+        can_delete = False
+        async with self.factory() as session, session.begin():
+            asset = await session.get(Asset, asset_id, with_for_update=True)
+            can_delete = bool(
+                asset
+                and (
+                    (
+                        owns_claim(asset, claim_id, REPAIR_CLAIM)
+                        and asset.status
+                        in {"PENDING", "PENDING_UPLOAD", "VALIDATING", "DELETING", "DELETED"}
+                    )
+                    or (
+                        asset.operation_claim_id is None and asset.status in {"DELETING", "DELETED"}
+                    )
+                )
+            )
+        if not can_delete:
+            logger.warning(
+                "asset_reconciliation_compensation_skipped",
+                extra={
+                    "asset_id": asset_id,
+                    "object_key": object_key,
+                    "claim_id": claim_id,
+                    "claim_type": REPAIR_CLAIM,
+                    "error_type": "CLAIM_LOST",
+                    "operation": "compensate_delete",
+                },
+            )
+            return
+        try:
+            await self.store.delete(object_key)
+        except (AssetStoreError, OSError, TimeoutError, ConnectionError) as exc:
+            report.compensation_failures.append(object_key)
+            logger.warning(
+                "asset_reconciliation_compensation_failed",
+                extra={
+                    "asset_id": asset_id,
+                    "object_key": object_key,
+                    "claim_id": claim_id,
+                    "claim_type": REPAIR_CLAIM,
+                    "error_type": type(exc).__name__,
+                    "operation": "compensate_delete",
+                },
+            )
+            return
+        await self._release_repair_claim(asset_id, claim_id)
+
     async def _repair_pending(self, snapshot: dict, report: ReconciliationReport) -> None:
         source_key = snapshot["object_key"]
         try:
@@ -124,6 +197,19 @@ class AssetReconciler:
             try:
                 data = await self.store.get_bytes(source_key)
             except (AssetObjectMissingError, KeyError, FileNotFoundError) as exc:
+                now = utcnow()
+                created_at = snapshot.get("created_at")
+                if created_at and created_at.tzinfo is None:
+                    created_at = created_at.replace(tzinfo=now.tzinfo)
+                grace_period = timedelta(
+                    seconds=getattr(self.settings, "upload_intent_grace_seconds", 900)
+                )
+                if (
+                    snapshot["status"] in {"PENDING", "PENDING_UPLOAD"}
+                    and created_at
+                    and (created_at + grace_period) > now
+                ):
+                    return
                 report.missing_objects.append(snapshot["object_key"])
                 await self._mark_pending_failed(snapshot["id"])
                 logger.warning(
@@ -171,31 +257,55 @@ class AssetReconciler:
         except MediaInspectionError as exc:
             self._unavailable(report, snapshot, "inspect_media", exc)
             return
+
+        async with self.factory() as session, session.begin():
+            claim_id = await acquire_claim(
+                session,
+                snapshot["id"],
+                REPAIR_CLAIM,
+                timeout_seconds=self.claim_timeout_seconds,
+                allowed_statuses={"PENDING", "PENDING_UPLOAD", "VALIDATING"},
+            )
+        if claim_id is None:
+            return
+
+        promoted_key: str | None = None
         if source_key != snapshot["object_key"]:
             try:
-                await self.store.put_bytes(
-                    snapshot["object_key"], data, snapshot["content_type"]
-                )
+                await self.store.put_bytes(snapshot["object_key"], data, snapshot["content_type"])
+                promoted_key = snapshot["object_key"]
             except (
                 AssetStoreUnavailableError,
                 AssetStoreError,
                 TimeoutError,
                 ConnectionError,
             ) as exc:
+                await self._release_repair_claim(snapshot["id"], claim_id)
                 self._unavailable(report, snapshot, "promote", exc)
                 return
+
+        should_compensate = False
         async with self.factory() as session, session.begin():
             asset = await session.get(Asset, snapshot["id"], with_for_update=True)
-            if asset is None or asset.status not in {"PENDING", "PENDING_UPLOAD", "VALIDATING"}:
-                return
-            asset.checksum = checksum
-            asset.size_bytes = len(data)
-            asset.width = metadata.get("width")
-            asset.height = metadata.get("height")
-            asset.duration_seconds = metadata.get("duration_seconds")
-            asset.status = "READY"
-            asset.failed_at = None
-            report.repaired_assets.append(asset.id)
+            if not (
+                asset
+                and owns_claim(asset, claim_id, REPAIR_CLAIM)
+                and asset.status in {"PENDING", "PENDING_UPLOAD", "VALIDATING"}
+            ):
+                should_compensate = promoted_key is not None
+            else:
+                asset.checksum = checksum
+                asset.size_bytes = len(data)
+                asset.width = metadata.get("width")
+                asset.height = metadata.get("height")
+                asset.duration_seconds = metadata.get("duration_seconds")
+                asset.status = "READY"
+                asset.failed_at = None
+                clear_claim(asset)
+                report.repaired_assets.append(asset.id)
+
+        if should_compensate and promoted_key:
+            await self._compensate_promoted(snapshot["id"], claim_id, promoted_key, report)
 
     async def run(self, *, inspect_orphans: bool = True) -> ReconciliationReport:
         report = ReconciliationReport()
@@ -284,6 +394,7 @@ class AssetReconciler:
         if dry_run:
             return [item["object_key"] for item in result.candidates]
         return list(result.deleted_keys)
+
     async def run_once(self) -> bool:
         report = await self.run()
         await self.cleanup_staging()
@@ -294,6 +405,7 @@ class AssetReconciler:
             or report.unavailable_objects
             or report.orphan_objects
             or report.repaired_assets
+            or report.compensation_failures
         ):
             logger.warning(
                 "asset_reconciliation_drift",
@@ -303,6 +415,7 @@ class AssetReconciler:
                     "unavailable_objects": report.unavailable_objects,
                     "orphan_objects": report.orphan_objects,
                     "repaired_assets": report.repaired_assets,
+                    "compensation_failures": report.compensation_failures,
                 },
             )
         return False

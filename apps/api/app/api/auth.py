@@ -48,7 +48,11 @@ async def login(
     if not user.is_active:
         login_throttle.record_failure_many(throttle_keys)
         raise AppError("ACCOUNT_DISABLED", "Account is disabled", 403)
-    login_throttle.record_success_many(throttle_keys)
+    login_throttle.record_login_success(
+        ip_key=f"ip:{client_host}",
+        identity_key=f"identity:{email}",
+        attempt_key=f"attempt:{client_host}:{email}",
+    )
     token, csrf = new_token(), new_token()
     session.add(
         AuthSession(

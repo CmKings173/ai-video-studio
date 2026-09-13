@@ -43,3 +43,43 @@ def test_login_throttle_multi_dimension_helpers_use_any_bucket_and_clear():
     assert limiter.retry_after_any(("ip:1.2.3.3", "identity:user@example.test")) == 0
     limiter.clear()
     assert limiter.size == 0
+
+
+def test_login_throttle_record_login_success_preserves_ip_history():
+    now = [100.0]
+    limiter = LoginThrottle(
+        max_entries=100, max_failures=5, base_delay_seconds=60, clock=lambda: now[0]
+    )
+    ip_key = "ip:192.168.1.50"
+    valid_email = "valid@example.test"
+    valid_identity_key = f"identity:{valid_email}"
+    valid_attempt_key = f"attempt:192.168.1.50:{valid_email}"
+
+    # 4 failed attempts from same IP across different accounts
+    for i in range(4):
+        now[0] += 1
+        limiter.record_failure_many(
+            (ip_key, f"identity:wrong{i}@test", f"attempt:192.168.1.50:wrong{i}@test")
+        )
+
+    # IP is not blocked yet (threshold is 5)
+    assert limiter.retry_after(ip_key) == 0
+
+    # Successful login for valid user
+    now[0] += 1
+    limiter.record_login_success(
+        ip_key=ip_key,
+        identity_key=valid_identity_key,
+        attempt_key=valid_attempt_key,
+    )
+
+    # Identity and attempt keys are cleared
+    assert limiter.retry_after(valid_identity_key) == 0
+    assert limiter.retry_after(valid_attempt_key) == 0
+
+    # IP-wide failure history is NOT cleared, next failure triggers IP block
+    now[0] += 1
+    limiter.record_failure_many(
+        (ip_key, "identity:another@test", "attempt:192.168.1.50:another@test")
+    )
+    assert limiter.retry_after(ip_key) > 0

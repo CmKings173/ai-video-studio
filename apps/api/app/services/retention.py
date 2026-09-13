@@ -26,10 +26,14 @@ class RetentionPolicy:
     def eligible(self, asset: Any, now: datetime) -> bool:
         status = asset.status
         if status == "DELETED":
+            if getattr(asset, "purged_at", None) is not None:
+                return False
             timestamp = getattr(asset, "deleted_at", None)
             age = self.deleted_hours
         elif status == "DELETING":
-            timestamp = getattr(asset, "updated_at", None)
+            timestamp = getattr(asset, "delete_claimed_at", None) or getattr(
+                asset, "updated_at", None
+            )
             age = self.deleting_retry_hours
         elif status in {"PENDING", "PENDING_UPLOAD", "VALIDATING"}:
             timestamp = getattr(asset, "created_at", None)

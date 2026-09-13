@@ -33,6 +33,14 @@ class Assembler:
         self.owner = worker_id("assembler")
 
     async def claim(self) -> str | None:
+        """Claim a single queued final assembly.
+
+        Concurrency invariant:
+        Advisory lock 971032 serializes claim transactions to prevent race conditions.
+        Concurrent workers may claim different queued finals for distinct videos in
+        parallel, but must never claim the same final video. The partial unique index
+        uq_final_videos_active_video enforces that each video has at most one active assembly.
+        """
         async with self.factory() as session, session.begin():
             await lock_scheduler(session, 971032)
             now = utcnow()
@@ -268,6 +276,9 @@ class Assembler:
                 created_by=final.created_by,
                 data=data,
                 metadata=metadata,
+                claim_timeout_seconds=getattr(
+                    self.settings, "asset_operation_claim_timeout_seconds", 900
+                ),
             )
             await self._finish(final_id, "READY", asset_id=asset_id)
 

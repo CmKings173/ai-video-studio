@@ -91,7 +91,7 @@ async def upload_url(
                 object_key=asset.object_key,
                 upload={"completed": True},
             )
-        if asset.status == "DELETED":
+        if asset.status in {"DELETING", "DELETED"}:
             raise AppError("ASSET_STATE_CONFLICT", "Deleted assets cannot be uploaded", 409)
         staging_key = upload_staging_key(asset)
         upload = await asset_store.presign_upload(staging_key, asset.content_type)
@@ -161,6 +161,8 @@ async def delete_asset(
     asset = await session.get(Asset, asset_id, with_for_update=True)
     if asset is None:
         raise AppError("ASSET_NOT_FOUND", "Asset not found", 404)
+    if asset.status in {"DELETING", "DELETED"}:
+        return
     if await asset_is_referenced(session, asset_id):
         raise AppError("ASSET_IN_USE", "Referenced assets cannot be deleted", 409)
     asset.status = "DELETED"
