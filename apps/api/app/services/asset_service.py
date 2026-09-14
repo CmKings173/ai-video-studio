@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
 from sqlalchemy import exists, or_, select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from apps.api.app.core.config import Settings
 from apps.api.app.core.errors import AppError
@@ -18,6 +20,7 @@ from apps.api.app.db.models import (
     Product,
     Project,
     SceneGeneration,
+    utcnow,
 )
 from apps.api.app.integrations.media import (
     MediaInspectionError,
@@ -32,6 +35,30 @@ from apps.api.app.integrations.minio import (
     AssetStoreUnavailableError,
 )
 from apps.api.app.schemas.api import AssetComplete, UploadRequest
+from apps.api.app.services.asset_claims import (
+    OUTPUT_WRITE_CLAIM,
+    acquire_claim,
+    claim_heartbeat,
+    claim_is_active,
+    clear_claim,
+    deletion_lifecycle_owns_object,
+    owns_claim,
+    release_claim,
+    requeue_deletion_retry,
+)
+
+logger = logging.getLogger(__name__)
+
+
+_COMPLETE_STATUSES = frozenset({"PENDING", "PENDING_UPLOAD", "VALIDATING", "FAILED"})
+
+
+class _CompleteClaimLost(Exception):
+    pass
+
+
+class _PromotionFailed(Exception):
+    pass
 
 
 def immutable_asset_key(payload: UploadRequest, asset_id: str) -> str:
@@ -109,118 +136,320 @@ async def complete_asset(
     settings: Settings,
     asset: Asset,
     payload: AssetComplete,
+    *,
+    factory=None,
 ) -> Asset:
-    if asset.status == "READY":
-        if (
-            payload.checksum_sha256
-            and asset.checksum
-            and payload.checksum_sha256.lower() != asset.checksum.lower()
-        ):
+    asset_id = asset.id
+    claim_timeout_seconds = int(
+        getattr(settings, "asset_operation_claim_timeout_seconds", 900)
+    )
+    session_factory = factory or async_sessionmaker(
+        session.bind, expire_on_commit=False, autoflush=False
+    )
+
+    ready_asset: Asset | None = None
+    ready_busy = False
+    ready_checksum_conflict = False
+    claim_id: str | None = None
+    source_snapshot: dict | None = None
+    async with session_factory() as phase, phase.begin():
+        row = await phase.get(Asset, asset_id, with_for_update=True)
+        if row is None:
+            raise AppError("ASSET_NOT_FOUND", "Asset not found", 404)
+        if row.status == "READY":
+            if row.operation_claim_id:
+                if claim_is_active(row, now=utcnow(), timeout_seconds=claim_timeout_seconds):
+                    ready_busy = True
+                else:
+                    clear_claim(row)
+            if (
+                not ready_busy
+                and payload.checksum_sha256
+                and row.checksum
+                and payload.checksum_sha256.lower() != row.checksum.lower()
+            ):
+                ready_checksum_conflict = True
+            if not ready_busy and not ready_checksum_conflict:
+                ready_asset = row
+        elif row.status not in _COMPLETE_STATUSES:
             raise AppError(
-                "ASSET_CHECKSUM_CONFLICT",
-                "Completed asset checksum does not match this request",
-                409,
+                "ASSET_STATE_CONFLICT", "Asset cannot be completed in its current state", 409
             )
-        return asset
-    if asset.status not in {"PENDING", "PENDING_UPLOAD", "VALIDATING", "FAILED"}:
+        else:
+            claim_id = await acquire_claim(
+                phase,
+                asset_id,
+                OUTPUT_WRITE_CLAIM,
+                timeout_seconds=claim_timeout_seconds,
+                allowed_statuses=_COMPLETE_STATUSES,
+            )
+            if claim_id is None:
+                raise AppError(
+                    "ASSET_OPERATION_BUSY",
+                    "Asset is currently owned by another operation",
+                    409,
+                )
+            row.status = "VALIDATING"
+            row.failed_at = None
+            source_snapshot = {
+                "object_key": row.object_key,
+                "content_type": row.content_type,
+                "filename": row.filename,
+                "size_bytes": row.size_bytes,
+            }
+
+    if ready_busy:
         raise AppError(
-            "ASSET_STATE_CONFLICT", "Asset cannot be completed in its current state", 409
+            "ASSET_OPERATION_BUSY",
+            "Asset is currently owned by another operation",
+            409,
         )
-    asset.status = "VALIDATING"
-    asset.failed_at = None
-    await session.flush()
-    staging_key = upload_staging_key(asset)
-    try:
-        try:
-            head = await store.head(staging_key)
-            source_key = staging_key
-        except (AssetObjectMissingError, KeyError, FileNotFoundError):
-            # A reconciler may have promoted the object before this request
-            # committed. The immutable key is a valid recovery source.
+    if ready_checksum_conflict:
+        raise AppError(
+            "ASSET_CHECKSUM_CONFLICT",
+            "Completed asset checksum does not match this request",
+            409,
+        )
+    if ready_asset is not None:
+        return ready_asset
+    assert claim_id is not None and source_snapshot is not None
+
+    async def release_complete_claim() -> None:
+        async with session_factory() as phase, phase.begin():
+            await release_claim(phase, asset_id, claim_id, OUTPUT_WRITE_CLAIM)
+
+    async def fail_complete_claim() -> Asset | None:
+        async with session_factory() as phase, phase.begin():
+            failed = await phase.get(Asset, asset_id, with_for_update=True)
+            if not failed or not owns_claim(failed, claim_id, OUTPUT_WRITE_CLAIM):
+                return None
+            failed.status = "FAILED"
+            failed.failed_at = datetime.now(UTC)
+            clear_claim(failed)
+            return failed
+
+    async def compensate_promoted_object(object_key: str, checksum: str, size: int) -> None:
+        current_status = "MISSING"
+        safe_delete = False
+        retry_queued = False
+        needs_retry_before_delete = False
+        async with session_factory() as phase:
+            current = await phase.get(Asset, asset_id)
+            if current:
+                current_status = current.status
+                safe_delete = deletion_lifecycle_owns_object(current, object_key)
+                needs_retry_before_delete = (
+                    current.status == "DELETED" and current.purged_at is not None
+                )
+        if safe_delete and needs_retry_before_delete:
             try:
-                head = await store.head(asset.object_key)
-            except (AssetObjectMissingError, KeyError, FileNotFoundError) as exc:
-                raise MediaValidationError("uploaded object is missing") from exc
+                retry_queued = await requeue_deletion_retry(
+                    session_factory, asset_id, object_key
+                )
+            except SQLAlchemyError as exc:
+                safe_delete = False
+                error_type = type(exc).__name__
+            else:
+                if not retry_queued:
+                    safe_delete = False
+                    error_type = "RETRY_REQUEUE_FAILED"
+        if not safe_delete:
+            logger.warning(
+                "asset_complete_compensation_unresolved",
+                extra={
+                    "asset_id": asset_id,
+                    "object_key": object_key,
+                    "claim_id": claim_id,
+                    "claim_type": OUTPUT_WRITE_CLAIM,
+                    "current_status": current_status,
+                    "error_type": locals().get("error_type", "UNSAFE_TO_DELETE"),
+                    "operation": "complete_promote",
+                    "retry_queued": retry_queued,
+                    "checksum": checksum,
+                    "size_bytes": size,
+                },
+            )
+            return
+        try:
+            await store.delete(object_key)
+        except (AssetStoreError, OSError, TimeoutError, ConnectionError) as exc:
+            try:
+                retry_queued = retry_queued or await requeue_deletion_retry(
+                    session_factory, asset_id, object_key
+                )
+            except SQLAlchemyError as retry_exc:
+                retry_error = type(retry_exc).__name__
+            else:
+                retry_error = None
+            logger.warning(
+                "asset_complete_compensation_failed",
+                extra={
+                    "asset_id": asset_id,
+                    "object_key": object_key,
+                    "claim_id": claim_id,
+                    "claim_type": OUTPUT_WRITE_CLAIM,
+                    "error_type": type(exc).__name__,
+                    "retry_error_type": retry_error,
+                    "operation": "complete_promote",
+                    "retry_queued": retry_queued,
+                },
+            )
+
+    staging_key = upload_staging_key(asset_id=asset_id)
+    canonical_key = source_snapshot["object_key"]
+    content_type = source_snapshot["content_type"]
+    filename = source_snapshot["filename"]
+    expected_size = source_snapshot["size_bytes"]
+    promoted_key: str | None = None
+    try:
+        async with claim_heartbeat(
+            session_factory,
+            asset_id,
+            claim_id,
+            OUTPUT_WRITE_CLAIM,
+            timeout_seconds=claim_timeout_seconds,
+            allowed_statuses={"VALIDATING"},
+        ) as lost:
+            try:
+                head = await store.head(staging_key)
+                source_key = staging_key
+            except (AssetObjectMissingError, KeyError, FileNotFoundError):
+                # A reconciler may have promoted the object before this request
+                # committed. The immutable key is a valid recovery source.
+                try:
+                    head = await store.head(canonical_key)
+                except (AssetObjectMissingError, KeyError, FileNotFoundError) as exc:
+                    raise MediaValidationError("uploaded object is missing") from exc
+                except (AssetStoreUnavailableError, TimeoutError, ConnectionError) as exc:
+                    raise AppError(
+                        "ASSET_STORE_UNAVAILABLE",
+                        "Object storage is temporarily unavailable",
+                        503,
+                    ) from exc
+                source_key = canonical_key
             except (AssetStoreUnavailableError, TimeoutError, ConnectionError) as exc:
                 raise AppError(
                     "ASSET_STORE_UNAVAILABLE",
                     "Object storage is temporarily unavailable",
                     503,
                 ) from exc
-            source_key = asset.object_key
-        except (AssetStoreUnavailableError, TimeoutError, ConnectionError) as exc:
-            raise AppError(
-                "ASSET_STORE_UNAVAILABLE",
-                "Object storage is temporarily unavailable",
-                503,
-            ) from exc
-        except AssetStoreError as exc:
-            raise MediaValidationError(str(exc)) from exc
-        if head["size"] <= 0 or head["size"] > settings.max_upload_bytes:
-            raise MediaValidationError("uploaded object size is invalid")
-        if head["size"] != asset.size_bytes:
-            raise MediaValidationError("uploaded object size does not match request")
-        if head["content_type"].split(";", 1)[0] != asset.content_type:
-            raise MediaValidationError("uploaded content type does not match request")
-        try:
-            data = await store.read(source_key, settings.max_upload_bytes)
-        except (AssetStoreUnavailableError, TimeoutError, ConnectionError) as exc:
-            raise AppError(
-                "ASSET_STORE_UNAVAILABLE",
-                "Object storage is temporarily unavailable",
-                503,
-            ) from exc
-        except (AssetObjectMissingError, KeyError, FileNotFoundError) as exc:
-            raise MediaValidationError("uploaded object is missing") from exc
-        except AssetStoreError as exc:
-            raise MediaValidationError(str(exc)) from exc
-        checksum = hashlib.sha256(data).hexdigest()
-        if payload.checksum_sha256 and checksum.lower() != payload.checksum_sha256.lower():
-            raise MediaValidationError("uploaded checksum does not match")
-        try:
-            metadata = await inspect_media(
-                data, asset.content_type, asset.filename, settings.ffprobe_binary
-            )
-        except MediaInspectionError as exc:
-            raise AppError(
-                "MEDIA_INSPECTION_UNAVAILABLE",
-                "Media inspection is temporarily unavailable",
-                503,
-            ) from exc
-        duration = metadata.get("duration_seconds")
-        if duration is not None and duration > settings.max_media_seconds:
-            raise MediaValidationError("media duration exceeds configured limit")
+            except AssetStoreError as exc:
+                raise MediaValidationError(str(exc)) from exc
+            if head["size"] <= 0 or head["size"] > settings.max_upload_bytes:
+                raise MediaValidationError("uploaded object size is invalid")
+            if head["size"] != expected_size:
+                raise MediaValidationError("uploaded object size does not match request")
+            if head["content_type"].split(";", 1)[0] != content_type:
+                raise MediaValidationError("uploaded content type does not match request")
+            try:
+                data = await store.read(source_key, settings.max_upload_bytes)
+            except (AssetStoreUnavailableError, TimeoutError, ConnectionError) as exc:
+                raise AppError(
+                    "ASSET_STORE_UNAVAILABLE",
+                    "Object storage is temporarily unavailable",
+                    503,
+                ) from exc
+            except (AssetObjectMissingError, KeyError, FileNotFoundError) as exc:
+                raise MediaValidationError("uploaded object is missing") from exc
+            except AssetStoreError as exc:
+                raise MediaValidationError(str(exc)) from exc
+            checksum = hashlib.sha256(data).hexdigest()
+            if payload.checksum_sha256 and checksum.lower() != payload.checksum_sha256.lower():
+                raise MediaValidationError("uploaded checksum does not match")
+            try:
+                metadata = await inspect_media(
+                    data, content_type, filename, settings.ffprobe_binary
+                )
+            except MediaInspectionError as exc:
+                raise AppError(
+                    "MEDIA_INSPECTION_UNAVAILABLE",
+                    "Media inspection is temporarily unavailable",
+                    503,
+                ) from exc
+            duration = metadata.get("duration_seconds")
+            if duration is not None and duration > settings.max_media_seconds:
+                raise MediaValidationError("media duration exceeds configured limit")
+            if source_key != canonical_key:
+                try:
+                    await store.put_bytes(canonical_key, data, content_type)
+                    promoted_key = canonical_key
+                except (AssetStoreUnavailableError, TimeoutError, ConnectionError) as exc:
+                    raise AppError(
+                        "ASSET_STORE_UNAVAILABLE",
+                        "Object storage is temporarily unavailable",
+                        503,
+                    ) from exc
+                except (AssetStoreError, RuntimeError) as exc:
+                    raise _PromotionFailed from exc
+            if lost.is_set():
+                raise _CompleteClaimLost
+    except _CompleteClaimLost:
+        if promoted_key:
+            await compensate_promoted_object(promoted_key, checksum, len(data))
+        raise AppError(
+            "ASSET_OPERATION_BUSY",
+            "Asset is currently owned by another operation",
+            409,
+        ) from None
     except AppError:
+        await release_complete_claim()
         raise
     except MediaValidationError as exc:
-        asset.status = "FAILED"
-        asset.failed_at = datetime.now(UTC)
+        if await fail_complete_claim() is None:
+            raise AppError(
+                "ASSET_OPERATION_BUSY",
+                "Asset is currently owned by another operation",
+                409,
+            ) from exc
         raise AppError("ASSET_VALIDATION_FAILED", str(exc), 422) from exc
-    if source_key != asset.object_key:
-        try:
-            await store.put_bytes(asset.object_key, data, asset.content_type)
-        except (AssetStoreUnavailableError, TimeoutError, ConnectionError) as exc:
+    except _PromotionFailed as exc:
+        if await fail_complete_claim() is None:
             raise AppError(
-                "ASSET_STORE_UNAVAILABLE",
-                "Object storage is temporarily unavailable",
-                503,
+                "ASSET_OPERATION_BUSY",
+                "Asset is currently owned by another operation",
+                409,
             ) from exc
-        except (AssetStoreError, RuntimeError) as exc:
-            asset.status = "FAILED"
-            asset.failed_at = datetime.now(UTC)
-            raise AppError(
-                "ASSET_PROMOTION_FAILED",
-                "Validated upload could not be committed to its immutable object",
-                503,
-            ) from exc
-    asset.size_bytes = len(data)
-    asset.checksum = checksum
-    asset.width = metadata.get("width")
-    asset.height = metadata.get("height")
-    asset.duration_seconds = duration
-    asset.status = "READY"
-    asset.failed_at = None
-    return asset
+        raise AppError(
+            "ASSET_PROMOTION_FAILED",
+            "Validated upload could not be committed to its immutable object",
+            503,
+        ) from exc
+
+    lost_ownership = False
+    state_conflict = False
+    completed: Asset | None = None
+    async with session_factory() as phase, phase.begin():
+        completed = await phase.get(Asset, asset_id, with_for_update=True)
+        if not completed or not owns_claim(completed, claim_id, OUTPUT_WRITE_CLAIM):
+            lost_ownership = True
+        elif completed.status != "VALIDATING":
+            clear_claim(completed)
+            state_conflict = True
+        else:
+            completed.size_bytes = len(data)
+            completed.checksum = checksum
+            completed.width = metadata.get("width")
+            completed.height = metadata.get("height")
+            completed.duration_seconds = duration
+            completed.status = "READY"
+            completed.failed_at = None
+            clear_claim(completed)
+
+    if lost_ownership:
+        if promoted_key:
+            await compensate_promoted_object(promoted_key, checksum, len(data))
+        raise AppError(
+            "ASSET_OPERATION_BUSY",
+            "Asset is currently owned by another operation",
+            409,
+        )
+    if state_conflict:
+        if promoted_key:
+            await compensate_promoted_object(promoted_key, checksum, len(data))
+        raise AppError(
+            "ASSET_STATE_CONFLICT", "Asset cannot be completed in its current state", 409
+        )
+    return completed
 
 
 def asset_reference_exists(asset_id):

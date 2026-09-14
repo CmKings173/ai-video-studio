@@ -13,6 +13,7 @@ from tempfile import TemporaryDirectory
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from sqlalchemy import select, text
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from apps.api.app.db.models import Asset, Scene, SceneGeneration, Video, utcnow
 from apps.api.app.integrations.media import MediaValidationError, inspect_media
@@ -24,8 +25,12 @@ from apps.api.app.integrations.minio import (
 from apps.api.app.services.asset_claims import (
     OUTPUT_WRITE_CLAIM,
     acquire_claim,
+    claim_heartbeat,
     clear_claim,
+    deletion_lifecycle_owns_object,
     owns_claim,
+    release_claim,
+    requeue_deletion_retry,
 )
 
 logger = logging.getLogger(__name__)
@@ -119,9 +124,92 @@ async def validate_generated_video(
 
 async def _release_output_claim(factory, asset_id: str, claim_id: str) -> None:
     async with factory() as session, session.begin():
-        asset = await session.get(Asset, asset_id, with_for_update=True)
-        if asset and owns_claim(asset, claim_id, OUTPUT_WRITE_CLAIM):
-            clear_claim(asset)
+        await release_claim(session, asset_id, claim_id, OUTPUT_WRITE_CLAIM)
+
+
+def _validate_output_identity(
+    asset: Asset,
+    *,
+    checksum: str,
+    object_key: str,
+    role: str,
+    project_id: str | None,
+    created_by: str,
+    size: int,
+) -> None:
+    if (
+        asset.checksum != checksum
+        or asset.object_key != object_key
+        or asset.role != role
+        or asset.kind != "VIDEO"
+        or asset.content_type != "video/mp4"
+        or asset.project_id != project_id
+        or asset.created_by != created_by
+        or asset.size_bytes != size
+    ):
+        raise ValueError("IMMUTABLE_OUTPUT_CONFLICT")
+
+
+async def _compensate_lost_output(
+    factory,
+    store,
+    *,
+    asset_id: str,
+    object_key: str,
+    checksum: str,
+    size: int,
+    claim_id: str,
+) -> None:
+    """Remove our bytes when retention owns deletion of the canonical key."""
+    current_status = "MISSING"
+    safe_delete = False
+    retry_queued = False
+    needs_retry_before_delete = False
+    async with factory() as session:
+        asset = await session.get(Asset, asset_id)
+        if asset:
+            current_status = asset.status
+            safe_delete = deletion_lifecycle_owns_object(asset, object_key)
+            needs_retry_before_delete = asset.status == "DELETED" and asset.purged_at is not None
+    if safe_delete and needs_retry_before_delete:
+        try:
+            retry_queued = await requeue_deletion_retry(factory, asset_id, object_key)
+        except SQLAlchemyError as exc:
+            safe_delete = False
+            error_type = type(exc).__name__
+        else:
+            if not retry_queued:
+                safe_delete = False
+                error_type = "RETRY_REQUEUE_FAILED"
+    if safe_delete:
+        try:
+            await store.delete(object_key)
+            return
+        except (AssetStoreError, OSError, TimeoutError, ConnectionError) as exc:
+            error_type = type(exc).__name__
+            try:
+                retry_queued = retry_queued or await requeue_deletion_retry(
+                    factory, asset_id, object_key
+                )
+            except SQLAlchemyError as retry_exc:
+                error_type = f"{error_type};{type(retry_exc).__name__}"
+    else:
+        error_type = locals().get("error_type", "UNSAFE_TO_DELETE")
+    logger.error(
+        "asset_output_compensation_unresolved",
+        extra={
+            "asset_id": asset_id,
+            "object_key": object_key,
+            "claim_id": claim_id,
+            "claim_type": OUTPUT_WRITE_CLAIM,
+            "operation": "put_compensation",
+            "current_status": current_status,
+            "error_type": error_type,
+            "retry_queued": retry_queued,
+            "checksum": checksum,
+            "size_bytes": size,
+        },
+    )
 
 
 async def save_output(
@@ -148,11 +236,17 @@ async def save_output(
     async with factory() as session, session.begin():
         asset = await session.get(Asset, asset_id, with_for_update=True)
         if asset is not None:
-            if asset.checksum and asset.checksum != checksum:
-                raise ValueError("IMMUTABLE_OUTPUT_CONFLICT") from None
+            _validate_output_identity(
+                asset,
+                checksum=checksum,
+                object_key=object_key,
+                role=role,
+                project_id=project_id,
+                created_by=created_by,
+                size=len(data),
+            )
             if asset.status not in {"PENDING_UPLOAD", "READY"}:
                 raise ValueError("ASSET_STATE_CONFLICT")
-            recorded_ready = asset.status == "READY"
         else:
             asset = Asset(
                 id=asset_id,
@@ -167,8 +261,24 @@ async def save_output(
                 size_bytes=len(data),
                 created_by=created_by,
             )
-            session.add(asset)
-            await session.flush()
+            try:
+                async with session.begin_nested():
+                    session.add(asset)
+                    await session.flush()
+            except IntegrityError:
+                asset = await session.get(Asset, asset_id, with_for_update=True)
+                if asset is None:
+                    raise
+            _validate_output_identity(
+                asset,
+                checksum=checksum,
+                object_key=object_key,
+                role=role,
+                project_id=project_id,
+                created_by=created_by,
+                size=len(data),
+            )
+        recorded_ready = asset.status == "READY"
         claim_id = await acquire_claim(
             session,
             asset_id,
@@ -183,16 +293,19 @@ async def save_output(
         try:
             check_checksum(await store.get_bytes(object_key), checksum)
         except (AssetObjectMissingError, KeyError, FileNotFoundError):
+            immutable_conflict = False
             async with factory() as session, session.begin():
                 asset = await session.get(Asset, asset_id, with_for_update=True)
                 if not asset or not owns_claim(asset, claim_id, OUTPUT_WRITE_CLAIM):
                     raise ValueError("ASSET_OPERATION_BUSY") from None
                 if asset.checksum and asset.checksum != checksum:
                     clear_claim(asset)
-                    raise ValueError("IMMUTABLE_OUTPUT_CONFLICT") from None
-                if asset.status == "READY":
+                    immutable_conflict = True
+                elif asset.status == "READY":
                     asset.status = "PENDING_UPLOAD"
                     asset.failed_at = None
+            if immutable_conflict:
+                raise ValueError("IMMUTABLE_OUTPUT_CONFLICT") from None
         except (
             AssetStoreUnavailableError,
             AssetStoreError,
@@ -203,20 +316,36 @@ async def save_output(
             await _release_output_claim(factory, asset_id, claim_id)
             raise
         else:
+            state_conflict = False
             async with factory() as session, session.begin():
                 asset = await session.get(Asset, asset_id, with_for_update=True)
                 if not asset or not owns_claim(asset, claim_id, OUTPUT_WRITE_CLAIM):
                     raise ValueError("ASSET_OPERATION_BUSY")
                 if asset.status != "READY":
                     clear_claim(asset)
-                    raise ValueError("ASSET_STATE_CONFLICT")
-                clear_claim(asset)
+                    state_conflict = True
+                else:
+                    clear_claim(asset)
+            if state_conflict:
+                raise ValueError("ASSET_STATE_CONFLICT")
             return asset_id
 
+    wrote_object = False
     try:
-        await store.put_bytes(object_key, data, "video/mp4")
-        # A read-after-write verifies bytes, not an S3 multipart ETag.
-        check_checksum(await store.get_bytes(object_key), checksum)
+        async with claim_heartbeat(
+            factory,
+            asset_id,
+            claim_id,
+            OUTPUT_WRITE_CLAIM,
+            timeout_seconds=claim_timeout_seconds,
+            allowed_statuses={"PENDING_UPLOAD", "READY"},
+        ) as lost:
+            await store.put_bytes(object_key, data, "video/mp4")
+            wrote_object = True
+            # A read-after-write verifies bytes, not an S3 multipart ETag.
+            check_checksum(await store.get_bytes(object_key), checksum)
+            if lost.is_set():
+                raise ValueError("ASSET_OPERATION_BUSY")
     except (
         AssetStoreUnavailableError,
         AssetStoreError,
@@ -226,23 +355,58 @@ async def save_output(
         ValueError,
     ):
         await _release_output_claim(factory, asset_id, claim_id)
+        if wrote_object:
+            await _compensate_lost_output(
+                factory,
+                store,
+                asset_id=asset_id,
+                object_key=object_key,
+                checksum=checksum,
+                size=len(data),
+                claim_id=claim_id,
+            )
         raise
 
+    lost_ownership = False
+    state_conflict = False
     async with factory() as session, session.begin():
         asset = await session.get(Asset, asset_id, with_for_update=True)
         if not asset:
             raise ValueError("ASSET_NOT_FOUND")
         if not owns_claim(asset, claim_id, OUTPUT_WRITE_CLAIM):
-            raise ValueError("ASSET_OPERATION_BUSY")
-        if asset.status != "PENDING_UPLOAD":
+            lost_ownership = True
+        elif asset.status != "PENDING_UPLOAD":
             clear_claim(asset)
-            raise ValueError("ASSET_STATE_CONFLICT")
-        asset.status = "READY"
-        asset.failed_at = None
-        asset.width = metadata.get("width")
-        asset.height = metadata.get("height")
-        asset.duration_seconds = metadata.get("duration_seconds", metadata.get("duration"))
-        clear_claim(asset)
+            state_conflict = True
+        else:
+            asset.status = "READY"
+            asset.failed_at = None
+            asset.width = metadata.get("width")
+            asset.height = metadata.get("height")
+            asset.duration_seconds = metadata.get("duration_seconds", metadata.get("duration"))
+            clear_claim(asset)
+    if lost_ownership:
+        await _compensate_lost_output(
+            factory,
+            store,
+            asset_id=asset_id,
+            object_key=object_key,
+            checksum=checksum,
+            size=len(data),
+            claim_id=claim_id,
+        )
+        raise ValueError("ASSET_OPERATION_BUSY")
+    if state_conflict:
+        await _compensate_lost_output(
+            factory,
+            store,
+            asset_id=asset_id,
+            object_key=object_key,
+            checksum=checksum,
+            size=len(data),
+            claim_id=claim_id,
+        )
+        raise ValueError("ASSET_STATE_CONFLICT")
     return asset_id
 
 

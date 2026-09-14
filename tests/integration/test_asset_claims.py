@@ -1,18 +1,22 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from datetime import timedelta
 from io import BytesIO
 from types import SimpleNamespace
+from uuid import NAMESPACE_URL, uuid5
 
 import pytest
 from PIL import Image
+from sqlalchemy.exc import OperationalError
 
 from apps.api.app.db.models import Asset, Project, User, utcnow
 from apps.api.app.services.asset_claims import (
     OUTPUT_WRITE_CLAIM,
     REPAIR_CLAIM,
     acquire_claim,
+    claim_heartbeat,
     owns_claim,
 )
 from apps.api.app.services.asset_retention import AssetRetentionService
@@ -107,6 +111,37 @@ async def test_operation_claim_is_exclusive_and_stale_takeover_is_safe(session_f
 
 
 @pytest.mark.asyncio
+async def test_claim_heartbeat_db_failure_sets_lost_without_reraising():
+    failure_seen = asyncio.Event()
+
+    class FailingSession:
+        async def __aenter__(self):
+            failure_seen.set()
+            raise OperationalError("renew asset claim", {}, RuntimeError("connection reset"))
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+    def failing_factory():
+        return FailingSession()
+
+    async with claim_heartbeat(
+        failing_factory,
+        "asset-heartbeat-failure",
+        "claim-heartbeat-failure",
+        OUTPUT_WRITE_CLAIM,
+        timeout_seconds=0.03,
+        allowed_statuses={"PENDING_UPLOAD"},
+    ) as lost:
+        await asyncio.wait_for(failure_seen.wait(), timeout=0.5)
+        await asyncio.wait_for(lost.wait(), timeout=0.5)
+
+    assert lost.is_set()
+    assert lost.reason == "HEARTBEAT_DB_FAILURE"
+    assert isinstance(lost.error, OperationalError)
+
+
+@pytest.mark.asyncio
 async def test_retention_excludes_active_operation_claim(session_factory, tmp_path):
     asset_id = await seed_asset(session_factory)
     async with session_factory() as session, session.begin():
@@ -134,13 +169,13 @@ async def test_retention_excludes_active_operation_claim(session_factory, tmp_pa
 async def test_compensation_failure_is_reported(session_factory, tmp_path):
     asset_id = await seed_asset(session_factory)
     async with session_factory() as session, session.begin():
-        claim_id = await acquire_claim(
-            session,
-            asset_id,
-            REPAIR_CLAIM,
-            timeout_seconds=60,
-            allowed_statuses={"PENDING_UPLOAD"},
-        )
+        asset = await session.get(Asset, asset_id, with_for_update=True)
+        asset.status = "DELETED"
+        asset.deleted_at = utcnow() - timedelta(hours=2)
+        asset.purged_at = utcnow()
+        asset.object_key = "assets/promoted.mp4"
+        asset.checksum = "c" * 64
+        asset.size_bytes = 10
 
     class FailingStore:
         async def delete(self, key):
@@ -148,8 +183,44 @@ async def test_compensation_failure_is_reported(session_factory, tmp_path):
 
     report = SimpleNamespace(compensation_failures=[])
     reconciler = AssetReconciler(session_factory, FailingStore(), retention_settings(tmp_path))
-    await reconciler._compensate_promoted(asset_id, claim_id, "assets/promoted.mp4", report)
+    await reconciler._compensate_promoted(
+        asset_id, "claim-1", "assets/promoted.mp4", "c" * 64, 10, report
+    )
     assert report.compensation_failures == ["assets/promoted.mp4"]
+    async with session_factory() as session:
+        row = await session.get(Asset, asset_id)
+        assert row.status == "DELETING"
+        assert row.purged_at is None
+        assert row.delete_claimed_at is not None
+
+
+@pytest.mark.asyncio
+async def test_compensation_deletes_only_terminal_purged_asset(session_factory, tmp_path):
+    asset_id = await seed_asset(session_factory)
+    async with session_factory() as session, session.begin():
+        asset = await session.get(Asset, asset_id, with_for_update=True)
+        asset.status = "DELETED"
+        asset.deleted_at = utcnow() - timedelta(hours=2)
+        asset.purged_at = utcnow()
+        asset.object_key = "assets/promoted-safe.mp4"
+        asset.checksum = "d" * 64
+        asset.size_bytes = 10
+
+    class Store:
+        def __init__(self):
+            self.deleted = []
+
+        async def delete(self, key):
+            self.deleted.append(key)
+
+    store = Store()
+    report = SimpleNamespace(compensation_failures=[])
+    reconciler = AssetReconciler(session_factory, store, retention_settings(tmp_path))
+    await reconciler._compensate_promoted(
+        asset_id, "claim-2", "assets/promoted-safe.mp4", "d" * 64, 10, report
+    )
+    assert store.deleted == ["assets/promoted-safe.mp4"]
+    assert report.compensation_failures == []
 
 
 def png_bytes() -> bytes:
@@ -234,6 +305,130 @@ async def test_repeated_output_collection_is_idempotent(session_factory, tmp_pat
     )
     assert first == second
     assert store.put_count == 1
+
+
+@pytest.mark.asyncio
+async def test_save_output_heartbeat_db_failure_does_not_finalize_ready(
+    session_factory, tmp_path
+):
+    class FailingHeartbeatSession:
+        def __init__(self, failure_seen):
+            self.failure_seen = failure_seen
+
+        async def __aenter__(self):
+            self.failure_seen.set()
+            raise OperationalError("renew asset claim", {}, RuntimeError("connection reset"))
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+    class FailingHeartbeatFactory:
+        def __init__(self, real_factory):
+            self.real_factory = real_factory
+            self.calls = 0
+            self.failure_seen = asyncio.Event()
+
+        def __call__(self):
+            self.calls += 1
+            if self.calls == 2:
+                return FailingHeartbeatSession(self.failure_seen)
+            return self.real_factory()
+
+    class WaitingStore(MemoryStore):
+        def __init__(self, failure_seen):
+            super().__init__()
+            self.failure_seen = failure_seen
+
+        async def put_bytes(self, key, data, content_type):
+            await asyncio.wait_for(self.failure_seen.wait(), timeout=1)
+            await super().put_bytes(key, data, content_type)
+
+    user_id, project_id = await seed_asset_owner(session_factory)
+    factory = FailingHeartbeatFactory(session_factory)
+    store = WaitingStore(factory.failure_seen)
+    role = "GENERATED_VIDEO"
+    owner_id = "heartbeat-db-failure"
+    data = b"heartbeat-failure-output"
+    checksum = hashlib.sha256(data).hexdigest()
+    asset_id = str(uuid5(NAMESPACE_URL, f"ai-video-studio:{role}:{owner_id}"))
+    canonical_key = f"outputs/{role.lower()}/{owner_id}/{checksum}.mp4"
+
+    with pytest.raises(ValueError, match="ASSET_OPERATION_BUSY"):
+        await save_output(
+            factory,
+            store,
+            owner_id=owner_id,
+            role=role,
+            project_id=project_id,
+            created_by=user_id,
+            data=data,
+            metadata={"kind": "VIDEO", "has_video": True},
+            claim_timeout_seconds=0.03,
+        )
+
+    async with session_factory() as session, session.begin():
+        row = await session.get(Asset, asset_id, with_for_update=True)
+        assert row.status == "PENDING_UPLOAD"
+        assert row.operation_claim_id is None
+        row.created_at = utcnow() - timedelta(hours=2)
+        row.updated_at = utcnow() - timedelta(hours=2)
+    assert canonical_key in store.objects
+
+    result = await AssetRetentionService(
+        session_factory, store, retention_settings(tmp_path)
+    ).cleanup(now=utcnow())
+
+    assert result.deleted_objects == 1
+    async with session_factory() as session:
+        row = await session.get(Asset, asset_id)
+        assert row.status == "DELETED"
+        assert row.purged_at is not None
+    assert canonical_key not in store.objects
+
+
+@pytest.mark.asyncio
+async def test_output_collection_rejects_existing_asset_identity_conflict(
+    session_factory, tmp_path
+):
+    user_id, project_id = await seed_asset_owner(session_factory)
+    store = MemoryStore()
+    data = b"deterministic-output"
+    checksum = hashlib.sha256(data).hexdigest()
+    role = "GENERATED_VIDEO"
+    owner_id = "identity-conflict"
+    asset_id = str(uuid5(NAMESPACE_URL, f"ai-video-studio:{role}:{owner_id}"))
+    async with session_factory() as session, session.begin():
+        session.add(
+            Asset(
+                id=asset_id,
+                project_id=project_id,
+                kind="VIDEO",
+                role=role,
+                filename=f"{owner_id}.mp4",
+                content_type="video/mp4",
+                object_key="outputs/generated_video/identity-conflict/other.mp4",
+                status="PENDING_UPLOAD",
+                checksum=checksum,
+                size_bytes=len(data),
+                created_by=user_id,
+            )
+        )
+
+    with pytest.raises(ValueError, match="IMMUTABLE_OUTPUT_CONFLICT"):
+        await save_output(
+            session_factory,
+            store,
+            owner_id=owner_id,
+            role=role,
+            project_id=project_id,
+            created_by=user_id,
+            data=data,
+            metadata={"kind": "VIDEO", "has_video": True},
+        )
+    assert store.put_count == 0
+    async with session_factory() as session:
+        row = await session.get(Asset, asset_id)
+        assert row.operation_claim_id is None
 
 
 async def seed_asset_owner(session_factory):

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from datetime import timedelta
 from io import BytesIO
@@ -25,6 +26,13 @@ from apps.api.app.db.models import (
 )
 from apps.api.app.integrations.minio import AssetStoreUnavailableError
 from apps.api.app.schemas.api import AssetComplete, UploadRequest
+from apps.api.app.services.asset_claims import (
+    OUTPUT_WRITE_CLAIM,
+    REPAIR_CLAIM,
+    acquire_claim,
+    clear_claim,
+    owns_claim,
+)
 from apps.api.app.services.asset_retention import AssetRetentionService
 from apps.api.app.services.asset_service import (
     asset_is_referenced,
@@ -34,7 +42,7 @@ from apps.api.app.services.asset_service import (
 )
 from apps.api.app.services.idempotency import claim
 from workers.common import save_output
-from workers.reconciliation import AssetReconciler
+from workers.reconciliation import AssetReconciler, ReconciliationReport
 
 
 class FakeStore:
@@ -141,6 +149,7 @@ def settings(tmp_path):
         deleted_asset_retention_hours=168,
         retention_deleting_retry_hours=1,
         retention_batch_size=100,
+        asset_operation_claim_timeout_seconds=60,
     )
 
 
@@ -219,12 +228,13 @@ async def test_complete_upload_keeps_validating_when_storage_is_unavailable(
     async with session_factory() as session, session.begin():
         asset, _ = await create_pending_asset(session, store, settings(tmp_path), request, user_id)
         asset_id = asset.id
+    async with session_factory() as session:
+        asset = await session.get(Asset, asset_id)
         with pytest.raises(AppError) as error:
             await complete_asset(
                 session, store, settings(tmp_path), asset, AssetComplete()
             )
         assert getattr(error.value, "status_code", None) == 503
-        assert asset.status == "VALIDATING"
     async with session_factory() as session:
         assert (await session.get(Asset, asset_id)).status == "VALIDATING"
 
@@ -248,14 +258,119 @@ async def test_complete_upload_promotion_unavailable_remains_retryable(
         asset_id = asset.id
         staging = upload_staging_key(asset)
     store.objects[staging] = (data, "image/png")
-    async with session_factory() as session, session.begin():
-        asset = await session.get(Asset, asset_id, with_for_update=True)
+    async with session_factory() as session:
+        asset = await session.get(Asset, asset_id)
         with pytest.raises(AppError) as error:
             await complete_asset(session, store, settings(tmp_path), asset, AssetComplete())
         assert getattr(error.value, "status_code", None) == 503
-        assert asset.status == "VALIDATING"
     async with session_factory() as session:
         assert (await session.get(Asset, asset_id)).status == "VALIDATING"
+
+
+@pytest.mark.asyncio
+async def test_complete_upload_rejects_active_operation_claim(session_factory, tmp_path):
+    user_id, project_id = await seed_owner(session_factory)
+    store = FakeStore()
+    async with session_factory() as session, session.begin():
+        asset = Asset(
+            project_id=project_id,
+            kind="IMAGE",
+            role="PRODUCT_IMAGE",
+            filename="busy.png",
+            content_type="image/png",
+            object_key="assets/busy.png",
+            status="PENDING_UPLOAD",
+            size_bytes=10,
+            created_by=user_id,
+        )
+        session.add(asset)
+        await session.flush()
+        asset_id = asset.id
+        claim_id = await acquire_claim(
+            session,
+            asset_id,
+            REPAIR_CLAIM,
+            timeout_seconds=60,
+            allowed_statuses={"PENDING_UPLOAD"},
+        )
+
+    async with session_factory() as session:
+        asset = await session.get(Asset, asset_id)
+        with pytest.raises(AppError) as error:
+            await complete_asset(session, store, settings(tmp_path), asset, AssetComplete())
+
+    assert error.value.code == "ASSET_OPERATION_BUSY"
+    assert error.value.status_code == 409
+    async with session_factory() as session:
+        row = await session.get(Asset, asset_id)
+        assert row.status == "PENDING_UPLOAD"
+        assert owns_claim(row, claim_id, REPAIR_CLAIM)
+
+
+@pytest.mark.asyncio
+async def test_complete_upload_lost_claim_after_promotion_deletes_before_purge(
+    session_factory, tmp_path
+):
+    user_id, project_id = await seed_owner(session_factory)
+    data = png_bytes()
+    request = UploadRequest(
+        project_id=project_id,
+        filename="race.png",
+        content_type="image/png",
+        size_bytes=len(data),
+        role="PRODUCT_IMAGE",
+    )
+    store = FakeStore()
+    async with session_factory() as session, session.begin():
+        asset, _ = await create_pending_asset(session, store, settings(tmp_path), request, user_id)
+        asset_id = asset.id
+        staging_key = upload_staging_key(asset)
+        canonical_key = asset.object_key
+        assert asset.checksum is None
+    store.objects[staging_key] = (data, "image/png")
+
+    put_started = asyncio.Event()
+    row_stolen = asyncio.Event()
+    original_put = store.put_bytes
+
+    async def coordinated_put(key, bytes_data, content_type):
+        result = await original_put(key, bytes_data, content_type)
+        if key == canonical_key:
+            put_started.set()
+            await row_stolen.wait()
+        return result
+
+    store.put_bytes = coordinated_put
+
+    async def run_complete():
+        async with session_factory() as session:
+            asset = await session.get(Asset, asset_id)
+            with pytest.raises(AppError) as error:
+                await complete_asset(session, store, settings(tmp_path), asset, AssetComplete())
+            return error.value
+
+    async def steal_row():
+        await put_started.wait()
+        async with session_factory() as session, session.begin():
+            row = await session.get(Asset, asset_id, with_for_update=True)
+            row.status = "DELETING"
+            row.delete_claimed_at = utcnow()
+            clear_claim(row)
+        row_stolen.set()
+
+    error, _ = await asyncio.gather(run_complete(), steal_row())
+
+    assert error.code == "ASSET_OPERATION_BUSY"
+    assert error.status_code == 409
+    retention = AssetRetentionService(session_factory, store, settings(tmp_path))
+    assert await retention.finalize(asset_id, now=utcnow())
+    async with session_factory() as session:
+        row = await session.get(Asset, asset_id)
+        assert row.status == "DELETED"
+        assert row.purged_at is not None
+        assert row.checksum is None
+        assert row.operation_claim_id is None
+    assert canonical_key not in store.objects
 
 
 @pytest.mark.asyncio
@@ -683,6 +798,8 @@ async def test_retention_claims_before_object_delete_and_finalizes_only_claimed_
         finalized = await session.get(Asset, asset_id)
         assert finalized.status == "DELETED"
         assert finalized.deleted_at is not None
+        assert finalized.purged_at is not None
+    assert "assets/old.png" not in store.objects
 
 
 @pytest.mark.asyncio
@@ -789,6 +906,82 @@ async def test_save_output_repairs_ready_database_row_when_object_is_missing(
         assert repaired.status == "READY"
         assert repaired.checksum == hashlib.sha256(data).hexdigest()
 
+@pytest.mark.asyncio
+async def test_save_output_stale_writer_compensates_during_deleting_before_purge(
+    session_factory, tmp_path
+):
+    from uuid import NAMESPACE_URL, uuid5
+
+    user_id, project_id = await seed_owner(session_factory)
+    data = b"retention-race-output"
+    checksum = hashlib.sha256(data).hexdigest()
+    role = "GENERATED_VIDEO"
+    owner_id = "generation-retention-race"
+    asset_id = str(uuid5(NAMESPACE_URL, f"ai-video-studio:{role}:{owner_id}"))
+    canonical_key = f"outputs/{role.lower()}/{owner_id}/{checksum}.mp4"
+
+    put_started = asyncio.Event()
+    allow_put_complete = asyncio.Event()
+
+    class CoordinatedStore(FakeStore):
+        async def put_bytes(self, key, bytes_data, content_type):
+            if key == canonical_key:
+                put_started.set()
+                await allow_put_complete.wait()
+            return await super().put_bytes(key, bytes_data, content_type)
+
+    store = CoordinatedStore()
+    app_settings = settings(tmp_path)
+    retention = AssetRetentionService(session_factory, store, app_settings)
+
+    async def run_writer():
+        with pytest.raises(ValueError) as error:
+            await save_output(
+                session_factory,
+                store,
+                owner_id=owner_id,
+                role=role,
+                project_id=project_id,
+                created_by=user_id,
+                data=data,
+                metadata={"kind": "VIDEO", "has_video": True},
+                claim_timeout_seconds=60,
+            )
+        return str(error.value)
+
+    writer = asyncio.create_task(run_writer())
+    await asyncio.wait_for(put_started.wait(), timeout=1)
+
+    now = utcnow()
+    async with session_factory() as session, session.begin():
+        row = await session.get(Asset, asset_id, with_for_update=True)
+        assert row.status == "PENDING_UPLOAD"
+        assert row.operation_claim_id is not None
+        row.created_at = now - timedelta(hours=25)
+        row.updated_at = now - timedelta(hours=25)
+        row.operation_claimed_at = now - timedelta(seconds=61)
+
+    claimed = await retention.claim_batch(now=now)
+    assert [item.asset_id for item in claimed] == [asset_id]
+
+    await store.delete(canonical_key)
+    assert canonical_key not in store.objects
+
+    allow_put_complete.set()
+    assert await writer == "ASSET_OPERATION_BUSY"
+
+    async with session_factory() as session:
+        row = await session.get(Asset, asset_id)
+        assert row.status == "DELETING"
+        assert row.operation_claim_id is None
+    assert canonical_key not in store.objects
+
+    assert await retention.finalize(asset_id, now=now + timedelta(seconds=1))
+    async with session_factory() as session:
+        row = await session.get(Asset, asset_id)
+        assert row.status == "DELETED"
+        assert row.purged_at is not None
+    assert canonical_key not in store.objects
 
 
 @pytest.mark.asyncio
@@ -817,6 +1010,47 @@ async def test_reconciler_reports_pending_storage_unavailable_without_marking_fa
     assert report.corrupt_objects == []
     async with session_factory() as session:
         assert (await session.get(Asset, asset.id)).status == "PENDING_UPLOAD"
+
+
+@pytest.mark.asyncio
+async def test_reconciler_skips_missing_pending_asset_with_active_claim(
+    session_factory, tmp_path
+):
+    user_id, project_id = await seed_owner(session_factory)
+    async with session_factory() as session, session.begin():
+        asset = Asset(
+            project_id=project_id,
+            kind="VIDEO",
+            role="REFERENCE_VIDEO",
+            filename="claimed.mp4",
+            content_type="video/mp4",
+            object_key="assets/claimed.mp4",
+            status="PENDING_UPLOAD",
+            size_bytes=10,
+            created_by=user_id,
+            created_at=utcnow() - timedelta(hours=2),
+        )
+        session.add(asset)
+        await session.flush()
+        claim_id = await acquire_claim(
+            session,
+            asset.id,
+            OUTPUT_WRITE_CLAIM,
+            timeout_seconds=60,
+            allowed_statuses={"PENDING_UPLOAD"},
+        )
+        asset_id = asset.id
+
+    report = await AssetReconciler(
+        session_factory, FakeStore(), settings(tmp_path)
+    ).run(inspect_orphans=False)
+
+    assert report.missing_objects == []
+    assert report.skipped_claimed_assets == [asset_id]
+    async with session_factory() as session:
+        row = await session.get(Asset, asset_id)
+        assert row.status == "PENDING_UPLOAD"
+        assert owns_claim(row, claim_id, OUTPUT_WRITE_CLAIM)
 
 
 @pytest.mark.asyncio
@@ -919,6 +1153,69 @@ async def test_retention_physical_purge_terminal_semantics_and_idempotent_retry(
         final_row = await session.get(Asset, asset2_id)
         assert final_row.status == "DELETED"
         assert final_row.purged_at is not None
+    assert asset2.object_key not in flaky_store.objects
+
+
+@pytest.mark.asyncio
+async def test_compensation_delete_failure_is_durably_retried_by_retention(
+    session_factory, tmp_path
+):
+    user_id, project_id = await seed_owner(session_factory)
+    data = b"orphan-after-terminal-purge"
+    checksum = hashlib.sha256(data).hexdigest()
+    store = FlakyDeleteStore()
+    object_key = "outputs/retry-compensation.mp4"
+    async with session_factory() as session, session.begin():
+        asset = Asset(
+            project_id=project_id,
+            kind="VIDEO",
+            role="GENERATED_VIDEO",
+            filename="retry-compensation.mp4",
+            content_type="video/mp4",
+            object_key=object_key,
+            status="DELETED",
+            deleted_at=utcnow() - timedelta(hours=200),
+            purged_at=utcnow(),
+            checksum=checksum,
+            size_bytes=len(data),
+            created_by=user_id,
+        )
+        session.add(asset)
+        await session.flush()
+        asset_id = asset.id
+    store.objects[object_key] = (data, "video/mp4")
+
+    report = ReconciliationReport()
+    reconciler = AssetReconciler(session_factory, store, settings(tmp_path))
+    await reconciler._compensate_promoted(
+        asset_id,
+        "stale-repair-claim",
+        object_key,
+        checksum,
+        len(data),
+        report,
+    )
+
+    assert report.compensation_failures == [object_key]
+    assert object_key in store.objects
+    async with session_factory() as session:
+        row = await session.get(Asset, asset_id)
+        assert row.status == "DELETING"
+        assert row.purged_at is None
+        assert row.delete_claimed_at is not None
+
+    retry_settings = settings(tmp_path)
+    retry_settings.retention_deleting_retry_hours = 0
+    result = await AssetRetentionService(
+        session_factory, store, retry_settings
+    ).cleanup(now=utcnow() + timedelta(seconds=1))
+
+    assert result.deleted_objects == 1
+    async with session_factory() as session:
+        final_row = await session.get(Asset, asset_id)
+        assert final_row.status == "DELETED"
+        assert final_row.purged_at is not None
+    assert object_key not in store.objects
 
 
 @pytest.mark.asyncio
@@ -1064,6 +1361,53 @@ async def test_delete_asset_endpoint_is_idempotent_on_deleting_asset(session_fac
 
 
 @pytest.mark.asyncio
+async def test_delete_asset_endpoint_rejects_active_operation_claim(
+    session_factory, tmp_path
+):
+    user_id, project_id = await seed_owner(session_factory)
+    async with session_factory() as session, session.begin():
+        user = await session.get(User, user_id)
+        asset = Asset(
+            project_id=project_id,
+            kind="VIDEO",
+            role="REFERENCE_VIDEO",
+            filename="busy-delete.mp4",
+            content_type="video/mp4",
+            object_key="assets/busy-delete.mp4",
+            status="PENDING_UPLOAD",
+            size_bytes=100,
+            created_by=user_id,
+        )
+        session.add(asset)
+        await session.flush()
+        asset_id = asset.id
+        claim_id = await acquire_claim(
+            session,
+            asset_id,
+            REPAIR_CLAIM,
+            timeout_seconds=60,
+            allowed_statuses={"PENDING_UPLOAD"},
+        )
+
+    async with session_factory() as session, session.begin():
+        user = await session.get(User, user_id)
+        with pytest.raises(AppError) as exc_info:
+            await delete_asset(
+                asset_id,
+                user=user,
+                session=session,
+                settings=settings(tmp_path),
+            )
+    assert exc_info.value.code == "ASSET_OPERATION_BUSY"
+    assert exc_info.value.status_code == 409
+
+    async with session_factory() as session:
+        row = await session.get(Asset, asset_id)
+        assert row.status == "PENDING_UPLOAD"
+        assert owns_claim(row, claim_id, REPAIR_CLAIM)
+
+
+@pytest.mark.asyncio
 async def test_upload_replay_rejects_deleting_asset(session_factory, tmp_path):
     """Mandatory test: idempotency replay with asset status DELETING
     returns 409 ASSET_STATE_CONFLICT."""
@@ -1176,6 +1520,15 @@ async def test_save_output_guards_against_concurrent_deleting_and_storage_unavai
         row = await session.get(Asset, asset_id)
         assert row.status == "DELETING"  # Must NOT be READY
 
+    assert await AssetRetentionService(
+        session_factory, mutating_store, settings(tmp_path)
+    ).finalize(asset_id, now=utcnow())
+    async with session_factory() as session:
+        row = await session.get(Asset, asset_id)
+        assert row.status == "DELETED"
+        assert row.purged_at is not None
+    assert row.object_key not in mutating_store.objects
+
     # 2. READY asset + transient storage unavailable does NOT downgrade to PENDING_UPLOAD
     class UnavailableStore(FakeStore):
         async def get_bytes(self, key, max_bytes=None):
@@ -1280,7 +1633,7 @@ async def test_reconciler_fresh_upload_grace_and_stale_upload_policy(session_fac
 @pytest.mark.asyncio
 async def test_reconciler_promotion_vs_retention_race(session_factory, tmp_path):
     """Mandatory test: reconciler reads staging, retention claims asset,
-    reconciler aborts and cleans orphan."""
+    reconciler aborts without deleting another operation's object."""
     import asyncio
     user_id, project_id = await seed_owner(session_factory)
     store = FakeStore()
@@ -1332,10 +1685,9 @@ async def test_reconciler_promotion_vs_retention_race(session_factory, tmp_path)
             "filename": "race.png",
             "created_at": now - timedelta(hours=30),
         }
-        report = SimpleNamespace(
-            missing_objects=[], corrupt_objects=[], unavailable_objects=[], repaired_assets=[]
-        )
+        report = ReconciliationReport()
         await reconciler._repair_pending(snapshot, report)
+        return report
 
     async def run_retention():
         await put_started.wait()
@@ -1346,14 +1698,19 @@ async def test_reconciler_promotion_vs_retention_race(session_factory, tmp_path)
             row.delete_claimed_at = utcnow()
         retention_done.set()
 
-    await asyncio.gather(run_reconciler(), run_retention())
+    report, _ = await asyncio.gather(run_reconciler(), run_retention())
 
-    # Asset must NOT be resurrected to READY
+    assert report.compensation_failures == []
+    assert await AssetRetentionService(
+        session_factory, store, settings(tmp_path)
+    ).finalize(asset_id, now=utcnow())
+
     async with session_factory() as session:
         row = await session.get(Asset, asset_id)
-        assert row.status == "DELETING"
+        assert row.status == "DELETED"
+        assert row.purged_at is not None
+        assert row.operation_claim_id is None
 
-    # Canonical object must NOT remain an orphan in store
     assert "assets/race.png" not in store.objects
 
 

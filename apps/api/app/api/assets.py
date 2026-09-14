@@ -17,6 +17,7 @@ from apps.api.app.schemas.api import (
     UploadDTO,
     UploadRequest,
 )
+from apps.api.app.services.asset_claims import claim_is_active, clear_claim
 from apps.api.app.services.asset_service import (
     asset_is_referenced,
     complete_asset,
@@ -117,15 +118,10 @@ async def complete(
     settings: Settings = Depends(get_settings),
     asset_store: AssetStore = Depends(store),
 ) -> AssetDTO:
-    asset = await session.get(Asset, asset_id, with_for_update=True)
+    asset = await session.get(Asset, asset_id)
     if asset is None:
         raise AppError("ASSET_NOT_FOUND", "Asset not found", 404)
-    try:
-        asset = await complete_asset(session, asset_store, settings, asset, payload)
-    except AppError:
-        # FAILED is durable evidence for reconciliation/operator diagnosis.
-        await session.commit()
-        raise
+    asset = await complete_asset(session, asset_store, settings, asset, payload)
     return AssetDTO.model_validate(asset)
 
 
@@ -156,13 +152,27 @@ async def download(
 
 @router.delete("/{asset_id}", status_code=204)
 async def delete_asset(
-    asset_id: str, user: User = Depends(require_csrf), session: AsyncSession = Depends(get_session)
+    asset_id: str,
+    user: User = Depends(require_csrf),
+    session: AsyncSession = Depends(get_session),
+    settings: Settings = Depends(get_settings),
 ) -> None:
     asset = await session.get(Asset, asset_id, with_for_update=True)
     if asset is None:
         raise AppError("ASSET_NOT_FOUND", "Asset not found", 404)
     if asset.status in {"DELETING", "DELETED"}:
         return
+    claim_timeout_seconds = int(
+        getattr(settings, "asset_operation_claim_timeout_seconds", 900)
+    )
+    if claim_is_active(asset, now=utcnow(), timeout_seconds=claim_timeout_seconds):
+        raise AppError(
+            "ASSET_OPERATION_BUSY",
+            "Asset is currently owned by another operation",
+            409,
+        )
+    if asset.operation_claim_id:
+        clear_claim(asset)
     if await asset_is_referenced(session, asset_id):
         raise AppError("ASSET_IN_USE", "Referenced assets cannot be deleted", 409)
     asset.status = "DELETED"

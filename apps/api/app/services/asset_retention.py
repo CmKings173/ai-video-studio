@@ -11,7 +11,7 @@ from sqlalchemy import and_, case, func, or_, select
 
 from apps.api.app.db.models import Asset, utcnow
 from apps.api.app.integrations.minio import AssetStoreError
-from apps.api.app.services.asset_claims import clear_claim
+from apps.api.app.services.asset_claims import claim_available_expression, clear_claim
 from apps.api.app.services.asset_service import asset_reference_exists
 from apps.api.app.services.retention import RetentionPolicy
 
@@ -51,7 +51,6 @@ class AssetRetentionService:
         failed_cutoff = now - timedelta(hours=self.policy.failed_hours)
         deleted_cutoff = now - timedelta(hours=self.policy.deleted_hours)
         deleting_cutoff = now - timedelta(hours=self.policy.deleting_retry_hours)
-        active_claim_cutoff = now - timedelta(seconds=self.claim_timeout_seconds)
         eligible = or_(
             and_(
                 Asset.status.in_({"PENDING", "PENDING_UPLOAD", "VALIDATING"}),
@@ -73,10 +72,8 @@ class AssetRetentionService:
                 func.coalesce(Asset.delete_claimed_at, Asset.updated_at) < deleting_cutoff,
             ),
         )
-        claim_available = or_(
-            Asset.operation_claim_id.is_(None),
-            Asset.operation_claimed_at.is_(None),
-            Asset.operation_claimed_at < active_claim_cutoff,
+        claim_available = claim_available_expression(
+            Asset, now=now, timeout_seconds=self.claim_timeout_seconds
         )
         return and_(eligible, claim_available)
 
@@ -154,11 +151,29 @@ class AssetRetentionService:
             return claims
 
     async def finalize(self, asset_id: str, *, now: datetime | None = None) -> bool:
-        """Finalize only the claim that this service owns; never resurrect/delete READY."""
+        """Finalize only after this service has run the deletion protocol."""
         now = now or utcnow()
+        async with self.factory() as session:
+            asset = await session.get(Asset, asset_id)
+            if asset is None or asset.status != "DELETING":
+                return False
+            object_key = asset.object_key
+        try:
+            await self.store.delete(object_key)
+        except (AssetStoreError, OSError, TimeoutError, ConnectionError) as exc:
+            logger.warning(
+                "asset_retention_finalize_delete_unavailable",
+                extra={
+                    "asset_id": asset_id,
+                    "object_key": object_key,
+                    "error_type": type(exc).__name__,
+                    "operation": "finalize_delete",
+                },
+            )
+            return False
         async with self.factory() as session, session.begin():
             asset = await session.get(Asset, asset_id, with_for_update=True)
-            if asset is None or asset.status != "DELETING":
+            if asset is None or asset.status != "DELETING" or asset.object_key != object_key:
                 return False
             asset.status = "DELETED"
             asset.deleted_at = asset.deleted_at or now
@@ -204,6 +219,8 @@ class AssetRetentionService:
             if await self.finalize(item.asset_id, now=now):
                 deleted_objects += 1
                 deleted_keys.append(item.object_key)
+            else:
+                failed += 1
         has_more = False
         if len(claims) == self.batch_size:
             async with self.factory() as session:
