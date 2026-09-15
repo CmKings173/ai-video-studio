@@ -3,10 +3,11 @@ param(
     [Parameter(Mandatory = $true)]
     [ValidateNotNullOrEmpty()]
     [string] $Destination,
-    [string] $ComposeFile = "compose.yaml"
+    [string] $ComposeFile = (Join-Path $PSScriptRoot "..\compose.yaml")
 )
 
 $ErrorActionPreference = "Stop"
+$scriptRoot = [IO.Path]::GetFullPath($PSScriptRoot)
 $destinationRoot = [IO.Path]::GetFullPath($Destination)
 New-Item -ItemType Directory -Force -Path $destinationRoot | Out-Null
 $stamp = (Get-Date).ToUniversalTime().ToString("yyyyMMddTHHmmssZ")
@@ -17,7 +18,8 @@ docker compose -f $ComposeFile exec -T postgres pg_dump -U studio -d studio -Fc 
 docker compose -f $ComposeFile cp postgres:/tmp/studio.dump (Join-Path $target "studio.dump")
 New-Item -ItemType Directory -Force -Path (Join-Path $target "minio") | Out-Null
 docker compose -f $ComposeFile run --rm --no-deps -T -v "${target}:/backup" api `
-    python /app/infra/scripts/minio_snapshot.py backup --bucket ai-video `
+    -v "${scriptRoot}:/infra-scripts:ro" `
+    python /infra-scripts/minio_snapshot.py backup --bucket ai-video `
     --destination /backup/minio --report /backup/minio-report.json
 
 $files = Get-ChildItem -LiteralPath $target -File -Recurse | Sort-Object FullName

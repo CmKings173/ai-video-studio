@@ -1,9 +1,17 @@
 .env
 .venv/
+backend/.venv/
+frontend/.next/
+frontend/node_modules/
+frontend/out/
+frontend/.env.local
+*.tsbuildinfo
 __pycache__/
 *.py[cod]
 .pytest_cache/
 .ruff_cache/
+backend/.pytest_cache/
+backend/.ruff_cache/
 .coverage
 htmlcov/
 dist/
