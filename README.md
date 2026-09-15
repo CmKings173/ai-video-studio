@@ -70,3 +70,19 @@ frontend  http://localhost:3000
 backend   http://localhost:8000
 minio     http://localhost:9000
 ```
+
+For a local-only PostgreSQL container without a password, use:
+
+```bash
+docker compose -f infra/compose.local-postgres.yaml up -d
+```
+
+Local PostgreSQL connection:
+
+```text
+host      localhost
+port      5432
+user      studio
+password  <blank>
+database  studio
+```
