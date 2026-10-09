@@ -5,6 +5,32 @@ from __future__ import annotations
 import threading
 from collections import defaultdict
 from collections.abc import Mapping
+from typing import Any
+
+_HTTP_METHOD_LABELS = frozenset({"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"})
+_UNMATCHED_ROUTE_LABEL = "__unmatched__"
+
+
+def http_request_labels(request: Any) -> dict[str, str]:
+    """Return bounded method and route-template labels for HTTP metrics."""
+    raw_method = getattr(request, "method", "")
+    method = raw_method.upper() if isinstance(raw_method, str) and len(raw_method) <= 16 else ""
+    if method not in _HTTP_METHOD_LABELS:
+        method = "OTHER"
+
+    scope = getattr(request, "scope", None)
+    route = scope.get("route") if isinstance(scope, Mapping) else None
+    route_path = getattr(route, "path", None)
+    if not isinstance(route_path, str) or not route_path or len(route_path) > 200:
+        path = _UNMATCHED_ROUTE_LABEL
+    else:
+        path = "".join(
+            char if char.isascii() and (char.isalnum() or char in "_./{}:-") else "_"
+            for char in route_path
+        )
+        path = path or _UNMATCHED_ROUTE_LABEL
+
+    return {"method": method, "path": path}
 
 
 class MetricsRegistry:

@@ -21,7 +21,12 @@ from apps.api.app.db.models import (
     Video,
 )
 from apps.api.app.schemas.api import AssemblyRequest
+from apps.api.app.services.delivery_presets import resolve_delivery
 from apps.api.app.services.domain_guards import require_active_brand
+from apps.api.app.services.generation_freshness import (
+    is_generation_fresh,
+    is_selected_execution_group_fresh,
+)
 
 
 def manifest_hash(value: dict[str, Any]) -> str:
@@ -110,6 +115,15 @@ class AssemblyService:
                     409,
                     {"scene_id": scene.id},
                 )
+            if not await is_generation_fresh(
+                session, scene, video, generation
+            ) or not await is_selected_execution_group_fresh(session, scene, video, generation):
+                raise AppError(
+                    "SCENE_SELECTION_STALE",
+                    "A selected generation no longer matches current scene inputs",
+                    409,
+                    {"scene_id": scene.id, "generation_id": generation.id},
+                )
             asset = await session.get(Asset, generation.output_asset_id, with_for_update=True)
             if (
                 asset is None
@@ -163,6 +177,15 @@ class AssemblyService:
                     "Background audio asset is unavailable",
                     409,
                 )
+            if not (
+                asset.project_id == video.project_id
+                or (video.product_id is not None and asset.product_id == video.product_id)
+            ):
+                raise AppError(
+                    "BACKGROUND_AUDIO_SCOPE_INVALID",
+                    "Background audio must belong to this video's project or linked product",
+                    422,
+                )
             background = {
                 "asset_id": asset.id,
                 "asset_object_key": asset.object_key,
@@ -177,6 +200,19 @@ class AssemblyService:
             or 0
         ) + 1
         assembly_config = request.model_dump(mode="json")
+        delivery = resolve_delivery(
+            preset=request.delivery_preset,
+            width=request.width,
+            height=request.height,
+            fps=request.fps,
+            fit_mode=request.fit_mode,
+        )
+        assembly_config.update(
+            width=delivery.width,
+            height=delivery.height,
+            fps=delivery.fps,
+            fit_mode=delivery.fit_mode,
+        )
         manifest = {
             "schema_version": 1,
             "video_id": video.id,

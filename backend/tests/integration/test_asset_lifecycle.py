@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 from botocore.exceptions import ClientError
 from PIL import Image
+from sqlalchemy import event
 
 from apps.api.app.api.assets import delete_asset, upload_url
 from apps.api.app.core.errors import AppError
@@ -24,7 +25,12 @@ from apps.api.app.db.models import (
     WorkflowRecord,
     utcnow,
 )
-from apps.api.app.integrations.minio import AssetStoreUnavailableError
+from apps.api.app.integrations.minio import (
+    AssetObjectMissingError,
+    AssetObjectTooLargeError,
+    AssetStoreError,
+    AssetStoreUnavailableError,
+)
 from apps.api.app.schemas.api import AssetComplete, UploadRequest
 from apps.api.app.services.asset_claims import (
     OUTPUT_WRITE_CLAIM,
@@ -103,6 +109,16 @@ class FlakyDeleteStore(FakeStore):
             self.fail_once = False
             raise TimeoutError("MinIO request timed out")
         await super().delete(key)
+
+
+class MissingRaisesDeleteStore(FakeStore):
+    """Mirror stores that report a confirmed missing object on repeated DELETE."""
+
+    async def delete(self, key: str) -> None:
+        self.deleted_calls.append(key)
+        if key not in self.objects:
+            raise AssetObjectMissingError("Object is missing")
+        self.objects.pop(key)
 
 
 class UploadUnavailableStore(FakeStore):
@@ -443,6 +459,46 @@ async def test_reconciler_marks_corrupt_ready_object_failed(session_factory, tmp
     store.objects["assets/corrupt.png"] = (b"corrupt", "image/png")
     report = await AssetReconciler(session_factory, store, settings(tmp_path)).run()
     assert report.corrupt_objects == ["assets/corrupt.png"]
+    async with session_factory() as session:
+        assert (await session.get(Asset, asset.id)).status == "FAILED"
+
+
+@pytest.mark.asyncio
+async def test_reconciler_hashes_body_when_object_metadata_still_matches(session_factory, tmp_path):
+    user_id, project_id = await seed_owner(session_factory)
+    expected = png_bytes()
+    corrupted = b"x" * len(expected)
+    checksum = hashlib.sha256(expected).hexdigest()
+
+    class StaleMetadataStore(FakeStore):
+        async def head(self, key):
+            result = await super().head(key)
+            result["checksum"] = checksum
+            return result
+
+    store = StaleMetadataStore()
+    store.objects["assets/stale-metadata.png"] = (corrupted, "image/png")
+    async with session_factory() as session, session.begin():
+        asset = Asset(
+            project_id=project_id,
+            kind="IMAGE",
+            role="PRODUCT_IMAGE",
+            filename="stale-metadata.png",
+            content_type="image/png",
+            object_key="assets/stale-metadata.png",
+            status="READY",
+            size_bytes=len(expected),
+            checksum=checksum,
+            created_by=user_id,
+        )
+        session.add(asset)
+        await session.flush()
+
+    report = await AssetReconciler(session_factory, store, settings(tmp_path)).run(
+        inspect_orphans=False
+    )
+
+    assert report.corrupt_objects == [asset.object_key]
     async with session_factory() as session:
         assert (await session.get(Asset, asset.id)).status == "FAILED"
 
@@ -1013,6 +1069,184 @@ async def test_reconciler_reports_pending_storage_unavailable_without_marking_fa
 
 
 @pytest.mark.asyncio
+async def test_pending_recovery_uses_persisted_asset_role_for_size_limits(
+    session_factory, tmp_path, monkeypatch
+):
+    user_id, project_id = await seed_owner(session_factory)
+    payload = b"12345678"
+    checksum = hashlib.sha256(payload).hexdigest()
+    async with session_factory() as session, session.begin():
+        generated = Asset(
+            project_id=project_id,
+            kind="VIDEO",
+            role="GENERATED_VIDEO",
+            filename="generated.mp4",
+            content_type="video/mp4",
+            object_key="assets/generated.mp4",
+            status="PENDING_UPLOAD",
+            size_bytes=len(payload),
+            checksum=checksum,
+            created_by=user_id,
+        )
+        upload = Asset(
+            project_id=project_id,
+            kind="VIDEO",
+            role="REFERENCE_VIDEO",
+            filename="upload.mp4",
+            content_type="video/mp4",
+            object_key="outputs/user-upload.mp4",
+            status="PENDING_UPLOAD",
+            size_bytes=len(payload),
+            checksum=checksum,
+            created_by=user_id,
+        )
+        oversized_generated = Asset(
+            project_id=project_id,
+            kind="VIDEO",
+            role="FINAL_VIDEO",
+            filename="oversized.mp4",
+            content_type="video/mp4",
+            object_key="assets/oversized-generated.mp4",
+            status="PENDING_UPLOAD",
+            size_bytes=13,
+            checksum="d" * 64,
+            created_by=user_id,
+        )
+        oversized_actual = Asset(
+            project_id=project_id,
+            kind="VIDEO",
+            role="GENERATED_VIDEO",
+            filename="misreported-size.mp4",
+            content_type="video/mp4",
+            object_key="assets/misreported-size.mp4",
+            status="PENDING_UPLOAD",
+            size_bytes=len(payload),
+            checksum=checksum,
+            created_by=user_id,
+        )
+        session.add_all([generated, upload, oversized_generated, oversized_actual])
+        await session.flush()
+        assets = [generated, upload, oversized_generated, oversized_actual]
+        snapshots = [
+            {
+                "id": asset.id,
+                "status": asset.status,
+                "object_key": asset.object_key,
+                "checksum": asset.checksum,
+                "size_bytes": asset.size_bytes,
+                "content_type": asset.content_type,
+                "filename": asset.filename,
+                "created_at": utcnow() - timedelta(hours=2),
+            }
+            for asset in assets
+        ]
+
+    async def inspect_media(_path, _content_type, _ffprobe):
+        return {"width": 16, "height": 9, "duration_seconds": 1.0}
+
+    monkeypatch.setattr("workers.reconciliation.inspect_media_path", inspect_media)
+    class BoundedDownloadStore(FakeStore):
+        async def download_to_path(self, key, path, max_bytes):
+            data, _content_type = self.objects[key]
+            if len(data) > max_bytes:
+                raise AssetObjectTooLargeError("Object exceeds permitted size")
+            path.write_bytes(data)
+            return {"size": len(data), "checksum": hashlib.sha256(data).hexdigest()}
+
+    store = BoundedDownloadStore()
+    store.objects[generated.object_key] = (payload, "video/mp4")
+    store.objects[upload.object_key] = (payload, "video/mp4")
+    store.objects[oversized_actual.object_key] = (b"1234567890123", "video/mp4")
+    config = settings(tmp_path)
+    config.max_upload_bytes = 4
+    config.max_generated_output_bytes = 12
+    reconciler = AssetReconciler(session_factory, store, config)
+    reports = [ReconciliationReport() for _ in assets]
+
+    for snapshot, report in zip(snapshots, reports, strict=True):
+        await reconciler._repair_pending(snapshot, report)
+
+    async with session_factory() as session:
+        rows = [await session.get(Asset, asset.id) for asset in assets]
+    assert rows[0].status == "READY"
+    assert reports[0].repaired_assets == [assets[0].id]
+    assert rows[1].status == "FAILED"
+    assert reports[1].corrupt_objects == [assets[1].object_key]
+    assert rows[2].status == "FAILED"
+    assert reports[2].corrupt_objects == [assets[2].object_key]
+    assert rows[3].status == "FAILED"
+    assert reports[3].corrupt_objects == [assets[3].object_key]
+    assert reports[3].unavailable_objects == []
+
+
+@pytest.mark.asyncio
+async def test_ready_reconciliation_uses_role_not_object_key_prefix(session_factory, tmp_path):
+    user_id, project_id = await seed_owner(session_factory)
+    generated_bytes = b"12345678"
+    upload_bytes = b"1234"
+    generated_checksum = hashlib.sha256(generated_bytes).hexdigest()
+    upload_checksum = hashlib.sha256(upload_bytes).hexdigest()
+    async with session_factory() as session, session.begin():
+        generated = Asset(
+            project_id=project_id,
+            kind="VIDEO",
+            role="GENERATED_VIDEO",
+            filename="generated.mp4",
+            content_type="video/mp4",
+            object_key="assets/ready-generated.mp4",
+            status="READY",
+            size_bytes=len(generated_bytes),
+            checksum=generated_checksum,
+            created_by=user_id,
+        )
+        upload = Asset(
+            project_id=project_id,
+            kind="VIDEO",
+            role="REFERENCE_VIDEO",
+            filename="upload.mp4",
+            content_type="video/mp4",
+            object_key="outputs/ready-upload.mp4",
+            status="READY",
+            size_bytes=len(upload_bytes),
+            checksum=upload_checksum,
+            created_by=user_id,
+        )
+        session.add_all([generated, upload])
+        await session.flush()
+        generated_id, upload_id = generated.id, upload.id
+
+    class LimitCheckingStore(FakeStore):
+        def __init__(self):
+            super().__init__()
+            self.limits = {}
+
+        async def checksum_object(self, key, max_bytes):
+            self.limits[key] = max_bytes
+            data = self.objects[key][0]
+            if len(data) > max_bytes:
+                raise AssetStoreError("object exceeds configured size limit")
+            return {"size": len(data), "checksum": hashlib.sha256(data).hexdigest()}
+
+    store = LimitCheckingStore()
+    store.objects["assets/ready-generated.mp4"] = (generated_bytes, "video/mp4")
+    store.objects["outputs/ready-upload.mp4"] = (upload_bytes, "video/mp4")
+    config = settings(tmp_path)
+    config.max_upload_bytes = 4
+    config.max_generated_output_bytes = 12
+    report = await AssetReconciler(session_factory, store, config).run(inspect_orphans=False)
+
+    assert store.limits == {
+        "assets/ready-generated.mp4": 12,
+        "outputs/ready-upload.mp4": 4,
+    }
+    assert report.corrupt_objects == []
+    assert report.unavailable_objects == []
+    async with session_factory() as session:
+        assert (await session.get(Asset, generated_id)).status == "READY"
+        assert (await session.get(Asset, upload_id)).status == "READY"
+
+
+@pytest.mark.asyncio
 async def test_reconciler_skips_missing_pending_asset_with_active_claim(
     session_factory, tmp_path
 ):
@@ -1091,6 +1325,7 @@ async def test_retention_physical_purge_terminal_semantics_and_idempotent_retry(
     assert result1.deleted_objects == 1
     assert asset1.object_key not in store.objects
     assert asset1.object_key in store.deleted_calls
+    assert store.deleted_calls.count(asset1.object_key) == 1
 
     async with session_factory() as session:
         refreshed = await session.get(Asset, asset1_id)
@@ -1154,6 +1389,116 @@ async def test_retention_physical_purge_terminal_semantics_and_idempotent_retry(
         assert final_row.status == "DELETED"
         assert final_row.purged_at is not None
     assert asset2.object_key not in flaky_store.objects
+
+
+@pytest.mark.asyncio
+async def test_retention_recovers_after_delete_succeeds_but_database_commit_fails(
+    session_factory, tmp_path
+):
+    user_id, project_id = await seed_owner(session_factory)
+    now = utcnow()
+    object_key = "outputs/delete-before-commit.mp4"
+    store = MissingRaisesDeleteStore()
+    store.objects[object_key] = (b"video-bytes", "video/mp4")
+    async with session_factory() as session, session.begin():
+        asset = Asset(
+            project_id=project_id,
+            kind="VIDEO",
+            role="GENERATED_VIDEO",
+            filename="delete-before-commit.mp4",
+            content_type="video/mp4",
+            object_key=object_key,
+            status="DELETED",
+            deleted_at=now - timedelta(hours=200),
+            size_bytes=11,
+            created_by=user_id,
+        )
+        session.add(asset)
+        await session.flush()
+        asset_id = asset.id
+
+    def fail_finalize_commit(sync_session):
+        if store.deleted_calls and any(
+            isinstance(row, Asset) and row.status == "DELETED"
+            for row in sync_session.dirty
+        ):
+            raise RuntimeError("simulated database commit failure")
+
+    sync_session_class = session_factory.class_.sync_session_class
+    event.listen(sync_session_class, "before_commit", fail_finalize_commit)
+    try:
+        with pytest.raises(RuntimeError, match="simulated database commit failure"):
+            await AssetRetentionService(session_factory, store, settings(tmp_path)).cleanup(now=now)
+    finally:
+        event.remove(sync_session_class, "before_commit", fail_finalize_commit)
+
+    assert store.deleted_calls == [object_key]
+    assert object_key not in store.objects
+    async with session_factory() as session:
+        interrupted = await session.get(Asset, asset_id)
+        assert interrupted.status == "DELETING"
+        assert interrupted.purged_at is None
+
+    # A new service instance represents process restart. S3 may confirm that the
+    # object is already absent; that is a successful, idempotent delete outcome.
+    restarted = AssetRetentionService(session_factory, store, settings(tmp_path))
+    result = await restarted.cleanup(now=now + timedelta(hours=2))
+    assert result.deleted_objects == 1
+    assert store.deleted_calls == [object_key, object_key]
+    async with session_factory() as session:
+        recovered = await session.get(Asset, asset_id)
+        assert recovered.status == "DELETED"
+        assert recovered.purged_at is not None
+
+
+@pytest.mark.asyncio
+async def test_retention_stale_claim_cannot_delete_after_a_valid_takeover(
+    session_factory, tmp_path
+):
+    user_id, project_id = await seed_owner(session_factory)
+    now = utcnow()
+    object_key = "outputs/taken-over.mp4"
+    store = FakeStore()
+    store.objects[object_key] = (b"video-bytes", "video/mp4")
+    async with session_factory() as session, session.begin():
+        asset = Asset(
+            project_id=project_id,
+            kind="VIDEO",
+            role="GENERATED_VIDEO",
+            filename="taken-over.mp4",
+            content_type="video/mp4",
+            object_key=object_key,
+            status="DELETED",
+            deleted_at=now - timedelta(hours=200),
+            size_bytes=11,
+            created_by=user_id,
+        )
+        session.add(asset)
+        await session.flush()
+        asset_id = asset.id
+
+    service = AssetRetentionService(session_factory, store, settings(tmp_path))
+    old_claim = (await service.claim_batch(now=now))[0]
+    async with session_factory() as session, session.begin():
+        row = await session.get(Asset, asset_id, with_for_update=True)
+        row.delete_claimed_at = now - timedelta(hours=2)
+    takeover_now = now + timedelta(hours=2)
+    current_claim = (await service.claim_batch(now=takeover_now))[0]
+
+    assert await service.finalize(
+        asset_id,
+        expected_object_key=old_claim.object_key,
+        expected_claimed_at=old_claim.delete_claimed_at,
+        now=takeover_now,
+    ) is False
+    assert store.deleted_calls == []
+    assert await service.finalize(
+        asset_id,
+        expected_object_key=current_claim.object_key,
+        expected_claimed_at=current_claim.delete_claimed_at,
+        now=takeover_now,
+    ) is True
+    assert store.deleted_calls == [object_key]
 
 
 @pytest.mark.asyncio

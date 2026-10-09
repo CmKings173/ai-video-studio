@@ -133,6 +133,7 @@ class Asset(Identity, Base):
     width: Mapped[int | None] = mapped_column(Integer)
     height: Mapped[int | None] = mapped_column(Integer)
     duration_seconds: Mapped[float | None] = mapped_column(Float)
+    media_metadata: Mapped[dict[str, Any]] = mapped_column(JSONType, default=dict)
     created_by: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"))
     failed_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
     deleted_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
@@ -210,6 +211,7 @@ class Scene(Identity, Base):
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     revision: Mapped[int] = mapped_column(Integer, default=1)
     selected_generation_id: Mapped[str | None] = mapped_column(String(36))
+    generation_config: Mapped[dict[str, Any]] = mapped_column(JSONType, default=dict)
 
 
 class SceneGeneration(Identity, Base):
@@ -226,7 +228,10 @@ class SceneGeneration(Identity, Base):
             name="fk_generations_parent_same_scene",
             ondelete="RESTRICT",
         ),
-        CheckConstraint("mode IN ('t2v','i2v','i2v_first_last','r2v')", name="mode"),
+        CheckConstraint(
+            "mode IN ('t2v','i2v','fl2v','i2v_last','i2v_first_last','r2v','v2v','rv2v')",
+            name="mode",
+        ),
         CheckConstraint(
             "status IN ('CREATED','DISPATCHING','QUEUED','RUNNING','COLLECTING',"
             "'COMPLETED','FAILED','CANCEL_REQUESTED','CANCELLED')",
@@ -245,6 +250,13 @@ class SceneGeneration(Identity, Base):
         ),
         Index("ix_scene_generations_dispatch", "status", "lease_expires_at", "created_at"),
         Index("ix_scene_generations_video_created", "video_id", "created_at", "id"),
+        Index(
+            "ix_scene_generations_video_active",
+            "video_id",
+            "status",
+            "created_at",
+            "id",
+        ),
         Index("ix_scene_generations_workflow_id", "workflow_id"),
         Index("ix_scene_generations_parent_generation_id", "parent_generation_id"),
         Index("ix_scene_generations_output_asset_id", "output_asset_id"),
@@ -265,6 +277,7 @@ class SceneGeneration(Identity, Base):
     progress_total: Mapped[int] = mapped_column(Integer, default=0)
     revision: Mapped[int] = mapped_column(Integer, default=1)
     input_snapshot: Mapped[dict[str, Any]] = mapped_column(JSONType, default=dict)
+    output_metadata: Mapped[dict[str, Any]] = mapped_column(JSONType, default=dict)
     request_id: Mapped[str | None] = mapped_column(String(64), index=True)
     comfy_prompt_id: Mapped[str | None] = mapped_column(String(128), unique=True)
     output_asset_id: Mapped[str | None] = mapped_column(
@@ -320,23 +333,135 @@ class GenerationAsset(Identity, Base):
     order_index: Mapped[int] = mapped_column(Integer, default=0)
 
 
+class DirectorRun(Identity, Base):
+    __tablename__ = "director_runs"
+    __table_args__ = (
+        CheckConstraint("task IN ('t2v','i2v','fl2v','r2v','v2v','rv2v','mixed')", name="task"),
+        CheckConstraint(
+            "status IN ('CREATED','DISPATCHING','QUEUED','RUNNING','COLLECTING',"
+            "'COMPLETED','FAILED','CANCEL_REQUESTED','CANCELLED')",
+            name="status",
+        ),
+        CheckConstraint("revision >= 1 AND attempt_count >= 0", name="counters"),
+        Index("ix_director_runs_dispatch", "status", "lease_expires_at", "created_at"),
+        Index("ix_director_runs_video_created", "video_id", "created_at", "id"),
+        Index("ix_director_runs_workflow_id", "workflow_id"),
+        Index("ix_director_runs_created_by", "created_by"),
+    )
+    video_id: Mapped[str] = mapped_column(ForeignKey("videos.id", ondelete="RESTRICT"))
+    workflow_id: Mapped[str] = mapped_column(
+        ForeignKey("workflow_registry.id", ondelete="RESTRICT")
+    )
+    provider: Mapped[str] = mapped_column(String(64), default="minimax_h3_director")
+    task: Mapped[str] = mapped_column(String(32))
+    status: Mapped[str] = mapped_column(String(24), default="CREATED")
+    phase: Mapped[str] = mapped_column(String(64), default="PENDING")
+    revision: Mapped[int] = mapped_column(Integer, default=1)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    input_snapshot: Mapped[dict[str, Any]] = mapped_column(JSONType, default=dict)
+    output_manifest: Mapped[dict[str, Any]] = mapped_column(JSONType, default=dict)
+    comfy_prompt_id: Mapped[str | None] = mapped_column(String(128), unique=True)
+    claimed_by: Mapped[str | None] = mapped_column(String(128))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    request_id: Mapped[str | None] = mapped_column(String(64), index=True)
+    error_code: Mapped[str | None] = mapped_column(String(100))
+    error_message: Mapped[str | None] = mapped_column(Text)
+    created_by: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"))
+    queued_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    started_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    progress_updated_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    finished_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+
+
+class DirectorRunAttempt(Identity, Base):
+    __tablename__ = "director_run_attempts"
+    __table_args__ = (
+        UniqueConstraint("director_run_id", "attempt_no", name="uq_director_run_attempts_number"),
+        CheckConstraint("attempt_no >= 1", name="attempt_positive"),
+        CheckConstraint(
+            "status IN ('CREATED','DISPATCHING','QUEUED','RUNNING','COLLECTING',"
+            "'COMPLETED','FAILED','CANCELLED','UNKNOWN')",
+            name="status",
+        ),
+        Index("ix_director_run_attempts_created", "created_at", "id"),
+    )
+    director_run_id: Mapped[str] = mapped_column(
+        ForeignKey("director_runs.id", ondelete="RESTRICT")
+    )
+    attempt_no: Mapped[int] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String(24), default="CREATED")
+    client_id: Mapped[str] = mapped_column(String(128), unique=True)
+    comfy_prompt_id: Mapped[str | None] = mapped_column(String(128), unique=True)
+    error_code: Mapped[str | None] = mapped_column(String(100))
+    error_message: Mapped[str | None] = mapped_column(Text)
+    finished_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+
+
+class DirectorRunMember(Identity, Base):
+    __tablename__ = "director_run_members"
+    __table_args__ = (
+        UniqueConstraint("director_run_id", "member_index", name="uq_director_run_members_order"),
+        UniqueConstraint("director_run_id", "scene_id", name="uq_director_run_members_scene"),
+        UniqueConstraint("scene_generation_id", name="uq_director_run_members_generation"),
+        CheckConstraint("member_index >= 0", name="order_nonnegative"),
+        CheckConstraint("continuity IN ('CUT','CONTINUOUS')", name="continuity"),
+        CheckConstraint(
+            "status IN ('CREATED','RUNNING','COMPLETED','FAILED','CANCELLED')", name="status"
+        ),
+        ForeignKeyConstraint(
+            ["scene_generation_id", "scene_id"],
+            ["scene_generations.id", "scene_generations.scene_id"],
+            name="fk_director_member_generation_same_scene",
+            ondelete="RESTRICT",
+        ),
+        Index("ix_director_run_members_scene_id", "scene_id"),
+        Index("ix_director_run_members_output_asset_id", "output_asset_id"),
+    )
+    director_run_id: Mapped[str] = mapped_column(
+        ForeignKey("director_runs.id", ondelete="RESTRICT")
+    )
+    scene_id: Mapped[str] = mapped_column(String(36))
+    scene_generation_id: Mapped[str] = mapped_column(String(36))
+    member_index: Mapped[int] = mapped_column(Integer)
+    continuity: Mapped[str] = mapped_column(String(16), default="CUT")
+    status: Mapped[str] = mapped_column(String(16), default="CREATED")
+    output_asset_id: Mapped[str | None] = mapped_column(
+        ForeignKey("assets.id", ondelete="RESTRICT")
+    )
+    output_metadata: Mapped[dict[str, Any]] = mapped_column(JSONType, default=dict)
+
+
 class WorkflowRecord(Identity, Base):
     __tablename__ = "workflow_registry"
     __table_args__ = (
         UniqueConstraint("code", "version", name="uq_workflow_registry_code_version"),
-        CheckConstraint("mode IN ('t2v','i2v','i2v_first_last','r2v')", name="mode"),
+        CheckConstraint(
+            "mode IN ('t2v','i2v','fl2v','i2v_last','i2v_first_last','r2v','v2v','rv2v')",
+            name="mode",
+        ),
+        CheckConstraint(
+            "quality_profile IN ('DRAFT','STANDARD','HIGH','BASE','HD','FULL_HD_REFINED','CUSTOM')",
+            name="quality_profile",
+        ),
+        CheckConstraint("execution_scope IN ('single_scene','aggregate')", name="execution_scope"),
         Index("ix_workflow_registry_created_by", "created_by"),
         Index(
-            "uq_workflow_registry_enabled_mode",
+            "uq_workflow_registry_enabled_mode_profile_scope",
             "mode",
+            "quality_profile",
+            "execution_scope",
             unique=True,
             postgresql_where=text("enabled"),
             sqlite_where=text("enabled = 1"),
         ),
     )
     code: Mapped[str] = mapped_column(String(100))
+    quality_profile: Mapped[str] = mapped_column(String(16), default="STANDARD")
+    execution_scope: Mapped[str] = mapped_column(
+        String(16), default="single_scene", server_default="single_scene", nullable=False
+    )
     mode: Mapped[str] = mapped_column(String(32))
-    version: Mapped[str] = mapped_column(String(64))
+    version: Mapped[str] = mapped_column(String(128))
     workflow: Mapped[dict[str, Any]] = mapped_column(JSONType)
     slots: Mapped[dict[str, Any]] = mapped_column(JSONType)
     required_slots: Mapped[list[str]] = mapped_column(JSONType, default=list)
@@ -365,6 +490,7 @@ class FinalVideo(Identity, Base):
             name="progress",
         ),
         Index("ix_final_videos_dispatch", "status", "lease_expires_at", "created_at"),
+        Index("ix_final_videos_video_created", "video_id", "created_at", "id"),
         Index("ix_final_videos_output_asset_id", "output_asset_id"),
         Index("ix_final_videos_background_audio_asset_id", "background_audio_asset_id"),
         Index("ix_final_videos_created_by", "created_by"),
@@ -372,12 +498,8 @@ class FinalVideo(Identity, Base):
             "uq_final_videos_active_video",
             "video_id",
             unique=True,
-            postgresql_where=text(
-                "status IN ('QUEUED','ASSEMBLING','CANCEL_REQUESTED')"
-            ),
-            sqlite_where=text(
-                "status IN ('QUEUED','ASSEMBLING','CANCEL_REQUESTED')"
-            ),
+            postgresql_where=text("status IN ('QUEUED','ASSEMBLING','CANCEL_REQUESTED')"),
+            sqlite_where=text("status IN ('QUEUED','ASSEMBLING','CANCEL_REQUESTED')"),
         ),
     )
     video_id: Mapped[str] = mapped_column(ForeignKey("videos.id", ondelete="RESTRICT"))

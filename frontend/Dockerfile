@@ -1,7 +1,7 @@
 FROM node:22-bookworm-slim AS deps
 WORKDIR /app
-COPY package.json yarn.lock* ./
-RUN if [ -f yarn.lock ]; then yarn install --frozen-lockfile; else yarn install; fi
+COPY package.json yarn.lock ./
+RUN yarn install --frozen-lockfile
 
 FROM node:22-bookworm-slim AS builder
 WORKDIR /app

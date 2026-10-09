@@ -52,11 +52,16 @@ textarea {
 
 .studio-shell {
   display: grid;
-  min-height: 100vh;
+  min-height: 100dvh;
   grid-template-columns: 248px minmax(0, 1fr);
 }
 
 .sidebar {
+  position: sticky;
+  top: 0;
+  height: 100dvh;
+  min-width: 0;
+  overflow-y: auto;
   border-right: 1px solid var(--border);
   background: var(--surface);
   padding: 18px;
@@ -73,6 +78,7 @@ textarea {
 }
 
 .brand-mark {
+  flex-shrink: 0;
   display: grid;
   width: 36px;
   height: 36px;
@@ -131,7 +137,38 @@ textarea {
   flex-direction: column;
 }
 
+.sidebar-profile {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.sidebar-avatar {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  flex-shrink: 0;
+  border-radius: 50%;
+  background: var(--surface-active);
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.sidebar-logout { flex-shrink: 0; }
+
+.sidebar a:focus-visible,
+.sidebar button:focus-visible,
+.topbar a:focus-visible,
+.table-scroll:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
 .topbar {
+  flex-wrap: wrap;
+  gap: 8px;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -184,16 +221,57 @@ textarea {
 }
 
 main {
+  min-width: 0;
+  container: studio-main / inline-size;
   padding: 24px;
   flex: 1;
 }
 
 .page-header {
+  flex-wrap: wrap;
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
   gap: 24px;
   margin-bottom: 28px;
+}
+
+.page-header > *,
+.grid > *,
+.field,
+.row > * {
+  min-width: 0;
+}
+
+.page-header > .flex {
+  flex-wrap: wrap;
+  max-width: 100%;
+}
+
+.page-header,
+.card,
+.preview-panel,
+.table-panel,
+.form-card,
+.row {
+  overflow-wrap: anywhere;
+}
+
+.table-scroll {
+  min-width: 0;
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.table-scroll table { min-width: 560px; }
+
+/* Form fields respond to their actual panel/dialog width, including the rail. */
+.responsive-field-grid {
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr));
+}
+
+.responsive-summary-grid {
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 180px), 1fr));
 }
 
 .page-header h1 {
@@ -238,7 +316,13 @@ main {
 }
 
 .content-grid {
-  grid-template-columns: minmax(0, 1.4fr) minmax(340px, 0.6fr);
+  grid-template-columns: minmax(0, 1fr);
+}
+
+@container studio-main (min-width: 960px) {
+  .content-grid {
+    grid-template-columns: minmax(0, 1.4fr) minmax(340px, 0.6fr);
+  }
 }
 
 .cards-grid {
@@ -613,43 +697,68 @@ textarea.stitch-textarea {
 
 @media (max-width: 1024px) {
   .studio-shell {
-    grid-template-columns: 1fr;
+    grid-template-columns: 64px minmax(0, 1fr);
   }
 
   .sidebar {
-    position: static;
-    border-right: 0;
-    border-bottom: 1px solid var(--border);
+    padding: 16px 8px;
   }
 
-  .sidebar nav {
-    grid-template-columns: repeat(3, minmax(0, 1fr));
+  .sidebar-label {
+    display: none;
+  }
+
+  .brand,
+  .sidebar nav a {
+    justify-content: center;
+  }
+
+  .sidebar nav a { padding: 10px; }
+
+  .sidebar-profile {
+    flex-direction: column;
+    gap: 12px;
   }
 
   .metric-grid,
-  .cards-grid,
-  .content-grid {
+  .cards-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
 
 @media (max-width: 720px) {
   main {
-    padding: 20px;
+    padding: 16px;
   }
 
-  .topbar,
+  .topbar { padding: 8px 16px; }
+
   .page-header,
   .row {
     align-items: stretch;
     flex-direction: column;
   }
 
-  .sidebar nav,
   .metric-grid,
   .cards-grid,
-  .content-grid,
   .field-grid {
     grid-template-columns: 1fr;
   }
 }
+
+/* Upload layout follows the main content width after the sidebar and padding. */
+.upload-layout { grid-template-columns: minmax(0, 1fr); }
+@container studio-main (min-width: 960px) {
+  .upload-layout { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+.asset-upload-page,
+.studio-logout-alert { overflow-wrap: anywhere; min-width: 0; }
+.asset-upload-page fieldset { min-width: 0; }
+.asset-upload-page select { min-width: 0; max-width: 100%; }
+.asset-upload-page .upload-zone { min-width: 0; padding: clamp(16px, 4vw, 32px); }
+.asset-upload-page .upload-zone > div { min-width: 0; max-width: 100%; }
+.asset-upload-page [role="alert"] > div { min-width: 0; }
+.asset-upload-page button { white-space: normal; max-width: 100%; overflow-wrap: anywhere; }
+.upload-scope-buttons button { min-width: 100px; padding-inline: 8px; }
+.upload-asset-row { flex-wrap: wrap; }
+.upload-asset-info { flex: 1 1 220px; }

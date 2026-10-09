@@ -12,12 +12,14 @@ from uuid import uuid4
 
 import pytest
 from PIL import Image
-from sqlalchemy import text
+from sqlalchemy import text, update
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.pool import NullPool
 
 from apps.api.app.db.models import (
     Asset,
+    DirectorRun,
     FinalVideo,
     Project,
     Scene,
@@ -35,6 +37,7 @@ from apps.api.app.services.asset_claims import (
 from apps.api.app.services.asset_service import upload_staging_key
 from workers.assembler import Assembler
 from workers.common import lock_scheduler, save_output
+from workers.director_dispatcher import DirectorDispatcher
 from workers.dispatcher import Dispatcher
 from workers.reconciliation import AssetReconciler, ReconciliationReport
 
@@ -57,14 +60,14 @@ async def pg_engine():
     env["DATABASE_URL"] = DATABASE_URL
     env["APP_ENV"] = "test"
     await asyncio.to_thread(
-        subprocess.run(  # noqa: ASYNC221
-            [sys.executable, "-m", "alembic", "upgrade", "head"],
-            cwd=ROOT,
-            env=env,
-            check=True,
-        )
+        subprocess.run,
+        [sys.executable, "-m", "alembic", "upgrade", "head"],
+        cwd=ROOT,
+        env=env,
+        check=True,
     )
-    engine = create_async_engine(DATABASE_URL, pool_pre_ping=True)
+    # Tests have separate event loops; do not reuse asyncpg connections across them.
+    engine = create_async_engine(DATABASE_URL, poolclass=NullPool)
     yield engine
     await engine.dispose()
 
@@ -80,16 +83,23 @@ async def test_postgres_migrations_create_partial_indexes_and_lock_primitives(pg
                         "SELECT indexname, indexdef FROM pg_indexes "
                         "WHERE schemaname = current_schema() "
                         "AND indexname IN ("
-                        "'uq_workflow_registry_enabled_mode', "
+                        "'uq_workflow_registry_enabled_mode_profile_scope', "
                         "'uq_final_videos_active_video')"
                     )
                 )
             ).all()
         }
-        assert "WHERE enabled" in indexes["uq_workflow_registry_enabled_mode"]
+        assert "WHERE enabled" in indexes["uq_workflow_registry_enabled_mode_profile_scope"]
         assert (
-            "status IN ('QUEUED', 'ASSEMBLING', 'CANCEL_REQUESTED')"
-            in indexes["uq_final_videos_active_video"]
+            "mode, quality_profile, execution_scope"
+            in indexes["uq_workflow_registry_enabled_mode_profile_scope"]
+        )
+        # PostgreSQL deparses IN as = ANY(ARRAY[...]); inspect semantics rather
+        # than requiring the SQL spelling supplied by the migration.
+        final_index = indexes["uq_final_videos_active_video"]
+        assert "CREATE UNIQUE INDEX" in final_index and "WHERE" in final_index
+        assert all(
+            f"'{status}'" in final_index for status in ("QUEUED", "ASSEMBLING", "CANCEL_REQUESTED")
         )
         await connection.execute(text("SELECT pg_advisory_xact_lock(874321)"))
         await connection.execute(text("SELECT id FROM scene_generations FOR UPDATE SKIP LOCKED"))
@@ -135,6 +145,10 @@ async def test_postgres_immutable_final_manifest_trigger_rejects_mutation(pg_eng
             row = await session.get(FinalVideo, final_id)
             row.manifest = {"schema_version": 2}
             await session.flush()
+
+    # This fixture must not leave work for later scheduler tests to claim.
+    async with factory() as session, session.begin():
+        (await session.get(FinalVideo, final_id)).status = "FAILED"
 
 
 async def _seed_pg_asset(
@@ -237,6 +251,7 @@ async def test_postgres_save_output_concurrent_same_identity_stays_single_row(pg
     store = PgMemoryStore()
     start = asyncio.Event()
     data = b"postgres-output-bytes"
+    owner_id = f"same-postgres-owner-{uuid4().hex}"
 
     async def collect():
         await start.wait()
@@ -244,7 +259,7 @@ async def test_postgres_save_output_concurrent_same_identity_stays_single_row(pg
             return "ok", await save_output(
                 factory,
                 store,
-                owner_id="same-postgres-owner",
+                owner_id=owner_id,
                 role="GENERATED_VIDEO",
                 project_id=project_id,
                 created_by=user_id,
@@ -270,10 +285,9 @@ async def test_postgres_save_output_concurrent_same_identity_stays_single_row(pg
         rows = (
             await session.scalars(
                 text(
-                    "SELECT id FROM assets "
-                    "WHERE role = 'GENERATED_VIDEO' "
-                    "AND filename = 'same-postgres-owner.mp4'"
-                )
+                    "SELECT id FROM assets WHERE role = 'GENERATED_VIDEO' AND filename = :filename"
+                ),
+                {"filename": f"{owner_id}.mp4"},
             )
         ).all()
         asset = await session.get(Asset, successes[0])
@@ -332,12 +346,13 @@ async def test_postgres_save_output_loser_reuses_ready_after_insert_conflict(pg_
     user_id, project_id, _asset_id, _object_key = await _seed_pg_asset(factory)
     store = PgMemoryStore()
     data = b"postgres-ready-reread"
+    owner_id = f"same-ready-reread-owner-{uuid4().hex}"
 
     async def collect_winner():
         result = await save_output(
             factory,
             store,
-            owner_id="same-ready-reread-owner",
+            owner_id=owner_id,
             role="GENERATED_VIDEO",
             project_id=project_id,
             created_by=user_id,
@@ -352,7 +367,7 @@ async def test_postgres_save_output_loser_reuses_ready_after_insert_conflict(pg_
         return await save_output(
             factory,
             store,
-            owner_id="same-ready-reread-owner",
+            owner_id=owner_id,
             role="GENERATED_VIDEO",
             project_id=project_id,
             created_by=user_id,
@@ -363,9 +378,7 @@ async def test_postgres_save_output_loser_reuses_ready_after_insert_conflict(pg_
 
     winner = asyncio.create_task(collect_winner(), name="save-output-winner")
     loser = asyncio.create_task(collect_loser(), name="save-output-loser")
-    first_id, second_id = await asyncio.wait_for(
-        asyncio.gather(winner, loser), timeout=10
-    )
+    first_id, second_id = await asyncio.wait_for(asyncio.gather(winner, loser), timeout=10)
 
     assert loser_conflicted.is_set()
     assert first_id == second_id
@@ -383,7 +396,7 @@ async def test_postgres_save_output_loser_reuses_ready_after_insert_conflict(pg_
 
 
 @pytest.mark.asyncio
-async def test_postgres_reconciler_concurrent_repair_only_one_finalizes(pg_engine):
+async def test_postgres_reconciler_concurrent_repair_only_one_finalizes(pg_engine, tmp_path):
     factory = async_sessionmaker(pg_engine, expire_on_commit=False)
     data = _png_bytes()
     checksum = hashlib.sha256(data).hexdigest()
@@ -399,6 +412,7 @@ async def test_postgres_reconciler_concurrent_repair_only_one_finalizes(pg_engin
     store = PgMemoryStore()
     store.objects[upload_staging_key(asset_id=asset_id)] = (data, "image/png")
     settings = SimpleNamespace(
+        workspace_root=tmp_path,
         asset_operation_claim_timeout_seconds=60,
         ffprobe_binary="ffprobe",
         max_upload_bytes=1024 * 1024,
@@ -457,7 +471,7 @@ async def _seed_dispatch_queue(factory):
             profile={},
             workflow_hash="c" * 64,
             slot_map_hash="d" * 64,
-            enabled=True,
+            enabled=False,
             created_by=user.id,
         )
         session.add_all([project, workflow])
@@ -528,6 +542,23 @@ async def test_postgres_advisory_scheduler_lock_blocks_second_transaction(pg_eng
 @pytest.mark.asyncio
 async def test_postgres_dispatcher_concurrent_claims_are_unique(pg_engine):
     factory = async_sessionmaker(pg_engine, expire_on_commit=False)
+    # Queue assertions are scoped to these fixtures, even when the shared
+    # disposable database already contains jobs from other PostgreSQL tests.
+    async with factory() as session, session.begin():
+        await session.execute(
+            update(DirectorRun)
+            .where(DirectorRun.status.in_(
+                {"CREATED", "DISPATCHING", "QUEUED", "RUNNING", "COLLECTING", "CANCEL_REQUESTED"}
+            ))
+            .values(status="CANCELLED", phase="CANCELLED", claimed_by=None, lease_expires_at=None)
+        )
+        await session.execute(
+            update(SceneGeneration)
+            .where(SceneGeneration.status.in_(
+                {"CREATED", "DISPATCHING", "QUEUED", "RUNNING", "COLLECTING", "CANCEL_REQUESTED"}
+            ))
+            .values(status="CANCELLED", phase="CANCELLED", claimed_by=None, lease_expires_at=None)
+        )
     generation_ids = await _seed_dispatch_queue(factory)
     settings = SimpleNamespace(lease_seconds=30, max_generation_attempts=2)
     first = Dispatcher(factory, None, None, None, settings)
@@ -546,6 +577,8 @@ async def test_postgres_dispatcher_concurrent_claims_are_unique(pg_engine):
 
     next_claim = await second.claim()
     assert next_claim in set(generation_ids) - {winners[0]}
+    async with factory() as session, session.begin():
+        (await session.get(SceneGeneration, next_claim)).status = "FAILED"
 
 
 async def _seed_assembly_queue(factory):
@@ -600,6 +633,9 @@ async def test_postgres_assembler_concurrent_claims_are_unique(pg_engine):
     assert len(winners) == 2
     assert len(set(winners)) == 2
     assert set(winners) == set(final_ids)
+    async with factory() as session, session.begin():
+        for final_id in final_ids:
+            (await session.get(FinalVideo, final_id)).status = "FAILED"
 
 
 @pytest.mark.asyncio
@@ -647,3 +683,78 @@ async def test_postgres_assembler_cannot_double_claim_same_final(pg_engine):
     assert len(winners) == 1
     assert winners[0] == final_id
     assert None in claimed
+    async with factory() as session, session.begin():
+        (await session.get(FinalVideo, final_id)).status = "FAILED"
+
+
+@pytest.mark.asyncio
+async def test_postgres_director_and_standalone_share_admission_lock(pg_engine):
+    factory = async_sessionmaker(pg_engine, expire_on_commit=False)
+    # Keep earlier disposable-database queue fixtures from consuming admission.
+    async with factory() as session, session.begin():
+        await session.execute(
+            update(DirectorRun)
+            .where(DirectorRun.status.in_(
+                {"CREATED", "DISPATCHING", "QUEUED", "RUNNING", "COLLECTING", "CANCEL_REQUESTED"}
+            ))
+            .values(status="CANCELLED", phase="CANCELLED", claimed_by=None, lease_expires_at=None)
+        )
+        await session.execute(
+            update(SceneGeneration)
+            .where(SceneGeneration.status.in_(
+                {"CREATED", "DISPATCHING", "QUEUED", "RUNNING", "COLLECTING", "CANCEL_REQUESTED"}
+            ))
+            .values(status="CANCELLED", phase="CANCELLED", claimed_by=None, lease_expires_at=None)
+        )
+    async with factory() as session, session.begin():
+        suffix = uuid4().hex
+        user = User(email=f"admission-{suffix}@example.test", name="PG", password_hash="hash")
+        session.add(user)
+        await session.flush()
+        project = Project(name=f"Admission {suffix}", description="", created_by=user.id)
+        session.add(project)
+        await session.flush()
+        video = Video(
+            project_id=project.id,
+            title="Admission race",
+            kind="QUICK_CLIP",
+            target_duration=5,
+            aspect_ratio="16:9",
+            brief="",
+            created_by=user.id,
+        )
+        workflow = WorkflowRecord(
+            code=f"ADMISSION_{suffix}",
+            mode="t2v",
+            version="1",
+            workflow={},
+            slots={},
+            workflow_hash="a" * 64,
+            slot_map_hash="b" * 64,
+            enabled=False,
+            created_by=user.id,
+        )
+        session.add_all([video, workflow])
+        await session.flush()
+        run = DirectorRun(
+            video_id=video.id,
+            workflow_id=workflow.id,
+            task="t2v",
+            created_by=user.id,
+            input_snapshot={"members": []},
+        )
+        session.add(run)
+        await session.flush()
+        run_id = run.id
+    standalone_ids = await _seed_dispatch_queue(factory)
+    settings = SimpleNamespace(lease_seconds=30, max_generation_attempts=2)
+    director = DirectorDispatcher(factory, None, None, None, settings)
+    standalone = Dispatcher(factory, None, None, None, settings)
+    claimed = await asyncio.gather(director.claim(), standalone.claim())
+    winners = [value for value in claimed if value is not None]
+    assert len(winners) == 1
+    assert winners[0] in {run_id, *standalone_ids}
+    async with factory() as session, session.begin():
+        (await session.get(DirectorRun, run_id)).status = "FAILED"
+        for generation_id in standalone_ids:
+            (await session.get(SceneGeneration, generation_id)).status = "FAILED"

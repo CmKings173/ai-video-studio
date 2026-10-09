@@ -10,11 +10,16 @@ from sqlalchemy import or_, select
 
 from apps.api.app.db.models import Asset, FinalVideo, Video, utcnow
 from apps.api.app.services.assembly_service import manifest_hash
+from apps.api.app.services.generation_freshness import (
+    is_assembly_source_current,
+    restore_video_after_assembly,
+)
 from workers.common import (
     check_checksum,
     lease_deadline,
     lock_scheduler,
-    save_output,
+    require_staging_space,
+    save_output_file,
     service_loop,
     staging_directory,
     worker_id,
@@ -118,12 +123,22 @@ class Assembler:
         message: str | None = None,
     ) -> None:
         async with self.factory() as session, session.begin():
-            final_ref = await session.get(FinalVideo, final_id)
-            if final_ref is None:
+            video_id = await session.scalar(
+                select(FinalVideo.video_id).where(FinalVideo.id == final_id)
+            )
+            if video_id is None:
                 return
-            video = await session.get(Video, final_ref.video_id, with_for_update=True)
+            video = await session.scalar(
+                select(Video)
+                .where(Video.id == video_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
             final = await session.scalar(
-                select(FinalVideo).where(FinalVideo.id == final_id).with_for_update()
+                select(FinalVideo)
+                .where(FinalVideo.id == final_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
             )
             if (
                 final is None
@@ -154,28 +169,42 @@ class Assembler:
             final.lease_expires_at = None
             final.revision += 1
 
-            if status == "READY" and video.revision == final.manifest.get("video_revision"):
-                video.current_final_video_id = final.id
-                video.status = "READY"
-            elif video.current_final_video_id:
-                video.status = (
-                    "DIRTY" if video.revision != final.manifest.get("video_revision") else "READY"
-                )
-            elif status == "FAILED":
-                video.status = "FAILED"
-            elif status == "CANCELLED":
-                video.status = "SCENES_READY"
+            if status == "READY":
+                if await is_assembly_source_current(session, video, final.manifest):
+                    video.current_final_video_id = final.id
+                    video.status = "READY"
+                else:
+                    video.status = "DIRTY"
             else:
-                video.status = "DIRTY"
+                await restore_video_after_assembly(
+                    session,
+                    video,
+                    final.manifest,
+                    "FAILED"
+                    if status == "FAILED"
+                    else "SCENES_READY"
+                    if status == "CANCELLED"
+                    else "DIRTY",
+                )
 
     async def _retry_or_finish(self, final_id: str, code: str, message: str) -> None:
         async with self.factory() as session, session.begin():
-            final_ref = await session.get(FinalVideo, final_id)
-            if final_ref is None:
+            video_id = await session.scalar(
+                select(FinalVideo.video_id).where(FinalVideo.id == final_id)
+            )
+            if video_id is None:
                 return
-            video = await session.get(Video, final_ref.video_id, with_for_update=True)
+            video = await session.scalar(
+                select(Video)
+                .where(Video.id == video_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
             final = await session.scalar(
-                select(FinalVideo).where(FinalVideo.id == final_id).with_for_update()
+                select(FinalVideo)
+                .where(FinalVideo.id == final_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
             )
             if (
                 final is None
@@ -203,9 +232,9 @@ class Assembler:
             final.lease_expires_at = None
             final.revision += 1
             if final.status == "FAILED":
-                video.status = "READY" if video.current_final_video_id else "FAILED"
+                await restore_video_after_assembly(session, video, final.manifest, "FAILED")
             elif final.status == "CANCELLED":
-                video.status = "READY" if video.current_final_video_id else "SCENES_READY"
+                await restore_video_after_assembly(session, video, final.manifest, "SCENES_READY")
 
     async def process(self, final_id: str) -> None:
         final = await self._read(final_id)
@@ -232,50 +261,119 @@ class Assembler:
             )
             return
 
+        output_limit = getattr(self.settings, "max_generated_output_bytes", 500 * 1024**2)
+        reserve_bytes = getattr(self.settings, "min_free_disk_bytes", 0)
+        scene_size_bounds: list[int] = []
+        for entry in scene_entries:
+            limit = getattr(self.settings, "max_generated_output_bytes", 500 * 1024**2)
+            expected_size = entry.get("asset_size_bytes")
+            if expected_size is not None and (
+                isinstance(expected_size, bool)
+                or not isinstance(expected_size, int)
+                or expected_size <= 0
+                or expected_size > limit
+            ):
+                raise ValueError("ASSEMBLY_ASSET_SIZE_INVALID")
+            scene_size_bounds.append(expected_size if expected_size is not None else limit)
+        background = final.manifest.get("background_audio")
+        background_limit = getattr(self.settings, "max_upload_bytes", 500 * 1024**2)
+        background_size = background.get("asset_size_bytes") if background else None
+        if background_size is not None and (
+            isinstance(background_size, bool)
+            or not isinstance(background_size, int)
+            or background_size <= 0
+            or background_size > background_limit
+        ):
+            raise ValueError("ASSEMBLY_AUDIO_SIZE_INVALID")
+        background_size_bound = (
+            (background_size if background_size is not None else background_limit)
+            if background
+            else 0
+        )
+        remaining_staging_bytes = sum(scene_size_bounds) + background_size_bound + output_limit
+
         async with staging_directory(self.settings, f"assembly-{final_id}-") as directory:
             inputs: list[Path] = []
             for index, entry in enumerate(scene_entries):
+                size_bound = scene_size_bounds[index]
+                expected_size = entry.get("asset_size_bytes")
+                await require_staging_space(directory, remaining_staging_bytes, reserve_bytes)
                 current = await self._read(final_id)
                 if current is None or current.status == "CANCEL_REQUESTED":
                     await self._finish(final_id, "CANCELLED")
                     return
-                data = await self.store.get_bytes(entry["asset_object_key"])
-                check_checksum(data, entry["asset_checksum"])
                 path = directory / f"scene-{index:03d}.mp4"
-                await asyncio.to_thread(path.write_bytes, data)
+                if hasattr(self.store, "download_to_path"):
+                    actual = await self.store.download_to_path(
+                        entry["asset_object_key"],
+                        path,
+                        size_bound,
+                    )
+                    if actual["checksum"] != entry["asset_checksum"]:
+                        raise ValueError("ASSET_CHECKSUM_MISMATCH")
+                    if expected_size is not None and actual["size"] != expected_size:
+                        raise ValueError("ASSET_SIZE_MISMATCH")
+                else:
+                    data = await self.store.get_bytes(entry["asset_object_key"])
+                    if len(data) > size_bound or (
+                        expected_size is not None and len(data) != expected_size
+                    ):
+                        raise ValueError("ASSET_SIZE_MISMATCH")
+                    check_checksum(data, entry["asset_checksum"])
+                    await asyncio.to_thread(path.write_bytes, data)
+                remaining_staging_bytes -= size_bound
                 inputs.append(path)
                 if not await self._phase(final_id, "MATERIALIZING", index + 1):
                     await self._finish(final_id, "CANCELLED")
                     return
 
             config = dict(final.manifest.get("assembly_config") or {})
-            background = final.manifest.get("background_audio")
             if background:
-                data = await self.store.get_bytes(background["asset_object_key"])
-                check_checksum(data, background["asset_checksum"])
                 background_path = directory / "background-audio"
-                await asyncio.to_thread(background_path.write_bytes, data)
+                await require_staging_space(directory, remaining_staging_bytes, reserve_bytes)
+                if hasattr(self.store, "download_to_path"):
+                    actual = await self.store.download_to_path(
+                        background["asset_object_key"],
+                        background_path,
+                        background_size_bound,
+                    )
+                    if actual["checksum"] != background["asset_checksum"]:
+                        raise ValueError("ASSET_CHECKSUM_MISMATCH")
+                    if background_size is not None and actual["size"] != background_size:
+                        raise ValueError("ASSET_SIZE_MISMATCH")
+                else:
+                    data = await self.store.get_bytes(background["asset_object_key"])
+                    if len(data) > background_size_bound or (
+                        background_size is not None and len(data) != background_size
+                    ):
+                        raise ValueError("ASSET_SIZE_MISMATCH")
+                    check_checksum(data, background["asset_checksum"])
+                    await asyncio.to_thread(background_path.write_bytes, data)
                 config["background_audio_path"] = str(background_path)
+                remaining_staging_bytes -= background_size_bound
             if not await self._phase(final_id, "COMBINING", len(inputs) + 1):
                 await self._finish(final_id, "CANCELLED")
                 return
+            await require_staging_space(directory, output_limit, reserve_bytes)
             output = directory / "final.mp4"
             metadata = await self.ffmpeg.assemble(inputs, output, config)
             if not await self._phase(final_id, "VALIDATING", len(inputs) + 2):
                 await self._finish(final_id, "CANCELLED")
                 return
-            data = await asyncio.to_thread(output.read_bytes)
+            if (await asyncio.to_thread(output.stat)).st_size > output_limit:
+                raise ValueError("OUTPUT_TOO_LARGE")
             async with self.factory() as session:
                 video = await session.get(Video, final.video_id)
-            asset_id = await save_output(
+            asset_id = await save_output_file(
                 self.factory,
                 self.store,
                 owner_id=final.id,
                 role="FINAL_VIDEO",
                 project_id=video.project_id,
                 created_by=final.created_by,
-                data=data,
+                path=output,
                 metadata=metadata,
+                max_bytes=output_limit,
                 claim_timeout_seconds=getattr(
                     self.settings, "asset_operation_claim_timeout_seconds", 900
                 ),

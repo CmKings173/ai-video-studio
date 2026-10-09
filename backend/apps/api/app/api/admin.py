@@ -44,7 +44,13 @@ from apps.api.app.schemas.api import (
 )
 from apps.api.app.services.asset_retention import AssetRetentionService
 from apps.api.app.services.h3_validator import H3Profile
-from apps.api.app.services.workflow_registry import ApprovedWorkflow, WorkflowSlotError
+from apps.api.app.services.workflow_contracts import require_contract
+from apps.api.app.services.workflow_qualification import require_qualified
+from apps.api.app.services.workflow_registry import (
+    ApprovedWorkflow,
+    WorkflowSlotError,
+    require_execution_scope,
+)
 from workers.reconciliation import AssetReconciler
 
 router = APIRouter(prefix="/admin", tags=["admin"])
@@ -122,10 +128,7 @@ async def patch_user(
     # only the target row lets two admins concurrently demote/disable the last
     # two accounts after both observe the same count.
     await session.scalars(
-        select(User.id)
-        .where(User.role == "ADMIN")
-        .order_by(User.id)
-        .with_for_update()
+        select(User.id).where(User.role == "ADMIN").order_by(User.id).with_for_update()
     )
     user = await session.scalar(select(User).where(User.id == user_id).with_for_update())
     if user is None:
@@ -184,12 +187,14 @@ async def list_workflows(
 
 
 def _approved(payload: WorkflowCreate) -> ApprovedWorkflow:
+    require_execution_scope(payload)
     workflow = ApprovedWorkflow(
         mode=payload.mode,
         version=payload.version,
         workflow=payload.workflow,
         slots=payload.slots,
         required_slots=frozenset(payload.required_slots),
+        execution_scope=payload.execution_scope,
     )
     try:
         workflow.validate()
@@ -240,12 +245,17 @@ async def approve_workflow(
     record = await session.get(WorkflowRecord, workflow_id, with_for_update=True)
     if record is None:
         raise AppError("WORKFLOW_NOT_FOUND", "Workflow was not found", 404)
+    if payload.enabled:
+        from apps.api.app.services.workflow_router import require_director_execution
+
+        require_director_execution(record)
     approved = ApprovedWorkflow(
         mode=record.mode,
         version=record.version,
         workflow=record.workflow,
         slots={key: tuple(value) for key, value in record.slots.items()},
         required_slots=frozenset(record.required_slots),
+        execution_scope=record.execution_scope,
     )
     try:
         approved.validate()
@@ -257,9 +267,17 @@ async def approve_workflow(
     ):
         raise AppError("WORKFLOW_INTEGRITY_FAILED", "Workflow hash mismatch", 409)
     if payload.enabled:
+        require_execution_scope(record)
+        require_qualified(record.profile, record.workflow_hash, record.slot_map_hash)
+        require_contract(record, approved)
         await session.execute(
             update(WorkflowRecord)
-            .where(WorkflowRecord.mode == record.mode, WorkflowRecord.id != record.id)
+            .where(
+                WorkflowRecord.mode == record.mode,
+                WorkflowRecord.quality_profile == record.quality_profile,
+                WorkflowRecord.execution_scope == record.execution_scope,
+                WorkflowRecord.id != record.id,
+            )
             .values(enabled=False)
         )
         record.approved_at = utcnow()

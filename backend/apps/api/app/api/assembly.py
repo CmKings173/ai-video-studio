@@ -13,11 +13,13 @@ from apps.api.app.api.deps import (
 )
 from apps.api.app.core.config import Settings, get_settings
 from apps.api.app.core.errors import AppError
+from apps.api.app.db.locking import lock_revisioned_row
 from apps.api.app.db.models import Asset, FinalVideo, User, Video, utcnow
 from apps.api.app.db.session import get_session
 from apps.api.app.integrations.minio import AssetStore
 from apps.api.app.schemas.api import AssemblyRequest, DownloadDTO, FinalDTO
 from apps.api.app.services.assembly_service import AssemblyService
+from apps.api.app.services.generation_freshness import restore_video_after_assembly
 from apps.api.app.services.idempotency import claim, complete
 
 router = APIRouter(tags=["assembly"])
@@ -111,13 +113,15 @@ async def cancel_final_version(
     user: User = Depends(require_csrf),
     session: AsyncSession = Depends(get_session),
 ) -> FinalDTO:
-    final_ref = await session.get(FinalVideo, final_id)
-    if final_ref is None:
-        raise AppError("FINAL_VIDEO_NOT_FOUND", "Final video was not found", 404)
-    video = await session.get(Video, final_ref.video_id, with_for_update=True)
-    final = await session.scalar(
-        select(FinalVideo).where(FinalVideo.id == final_id).with_for_update()
+    video_id = await session.scalar(
+        select(FinalVideo.video_id)
+        .where(FinalVideo.id == final_id)
+        .execution_options(autoflush=False)
     )
+    if video_id is None:
+        raise AppError("FINAL_VIDEO_NOT_FOUND", "Final video was not found", 404)
+    video = await lock_revisioned_row(session, Video, video_id)
+    final = await lock_revisioned_row(session, FinalVideo, final_id)
     if final is None or video is None:
         raise AppError("FINAL_VIDEO_NOT_FOUND", "Final video was not found", 404)
     if final.status in {"READY", "FAILED", "CANCELLED"}:
@@ -130,7 +134,7 @@ async def cancel_final_version(
         final.finished_at = utcnow()
         final.claimed_by = None
         final.lease_expires_at = None
-        video.status = "READY" if video.current_final_video_id else "SCENES_READY"
+        await restore_video_after_assembly(session, video, final.manifest, "SCENES_READY")
     else:
         final.status = "CANCEL_REQUESTED"
         final.phase = "CANCELLING"

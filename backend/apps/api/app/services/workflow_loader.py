@@ -1,32 +1,26 @@
 from __future__ import annotations
 
-import copy
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 from sqlalchemy import select
 
+from apps.api.app.core.errors import AppError
 from apps.api.app.db.models import User, WorkflowRecord, utcnow
-from apps.api.app.services.workflow_registry import ApprovedWorkflow
+from apps.api.app.services.workflow_contracts import require_contract
+from apps.api.app.services.workflow_qualification import qualification_status
+from apps.api.app.services.workflow_registry import (
+    ApprovedWorkflow,
+    ingest_execution_scope,
+    require_execution_scope,
+)
+from apps.api.app.services.workflow_router import require_director_execution
 
 
 def _read_workflow(directory: Path, entry: dict) -> dict:
     path = directory / entry["file"]
-    if not path.exists() and entry.get("source"):
-        path = Path(entry["source"])
-    workflow = json.loads(path.read_text(encoding="utf-8"))
-    derive = entry.get("derive") or {}
-    if derive.get("type") == "first_last":
-        workflow = copy.deepcopy(workflow)
-        loader_node = str(derive["loader_node"])
-        target_node = str(derive["target_node"])
-        workflow[loader_node] = {
-            "class_type": "LoadImage",
-            "inputs": {"image": "last-frame.png"},
-            "_meta": {"title": "Last Frame"},
-        }
-        workflow[target_node]["inputs"]["last_frame"] = [loader_node, 0]
-    return workflow
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def load_manifests(directory: Path) -> list[dict]:
@@ -40,7 +34,11 @@ def load_manifests(directory: Path) -> list[dict]:
     result = []
     for entry in entries:
         current = dict(entry)
+        current["execution_scope"] = ingest_execution_scope(current)
         current["workflow"] = _read_workflow(directory, current)
+        require_director_execution(
+            SimpleNamespace(workflow=current["workflow"], profile=current.get("profile", {}))
+        )
         result.append(current)
     return result
 
@@ -69,12 +67,38 @@ async def seed_workflows(factory, directory: Path, admin: User | None) -> int:
                 workflow=item["workflow"],
                 slots=slots,
                 required_slots=frozenset(item.get("required_slots", [])),
+                execution_scope=item["execution_scope"],
             )
             approved.validate()
-            enabled = bool(item.get("auto_approve", False))
+            enabled = (
+                bool(item.get("auto_approve", False))
+                and qualification_status(
+                    item.get("profile", {}), approved.workflow_hash, approved.slot_map_hash
+                ).qualified
+            )
+            if enabled:
+                try:
+                    require_execution_scope(
+                        SimpleNamespace(
+                            execution_scope=item["execution_scope"], profile=item.get("profile", {})
+                        )
+                    )
+                    require_contract(
+                        SimpleNamespace(
+                            profile=item.get("profile", {}),
+                            mode=item["mode"],
+                            quality_profile=item.get("quality_profile", "STANDARD"),
+                            execution_scope=item["execution_scope"],
+                        ),
+                        approved,
+                    )
+                except AppError:
+                    enabled = False
             session.add(
                 WorkflowRecord(
                     code=item["code"],
+                    quality_profile=item.get("quality_profile", "STANDARD"),
+                    execution_scope=item["execution_scope"],
                     mode=item["mode"],
                     version=item["version"],
                     workflow=item["workflow"],

@@ -23,6 +23,8 @@ from apps.api.app.schemas.api import (
     VideoPatch,
 )
 from apps.api.app.services.domain_guards import require_active_brand
+from apps.api.app.services.generation_dependency_invalidation import lock_dependency_graph
+from apps.api.app.services.generation_freshness import is_selected_generation_fresh
 from apps.api.app.services.idempotency import claim, complete
 from apps.api.app.services.storyboard_service import StoryboardService
 
@@ -68,8 +70,7 @@ async def list_videos(
     rows = list(
         (
             await session.scalars(
-                query
-                .order_by(Video.created_at.desc(), Video.id.desc())
+                query.order_by(Video.created_at.desc(), Video.id.desc())
                 .offset((page - 1) * size)
                 .limit(size)
             )
@@ -86,9 +87,11 @@ async def create_video(
     user: User = Depends(require_csrf),
     session: AsyncSession = Depends(get_session),
 ) -> VideoDetail:
+    await lock_dependency_graph(session)
     project = await session.get(Project, str(payload.project_id))
     if project is None or project.archived:
         raise AppError("PROJECT_NOT_ACTIVE", "Project is missing or archived", 409)
+    product = None
     if payload.product_id:
         product = await session.get(Product, str(payload.product_id))
         if product is None or product.archived:
@@ -99,7 +102,10 @@ async def create_video(
                 "Selected product belongs to a different brand",
                 422,
             )
-    await require_active_brand(session, str(payload.brand_id) if payload.brand_id else None)
+    await require_active_brand(
+        session,
+        str(payload.brand_id) if payload.brand_id else (product.brand_id if product else None),
+    )
     video = Video(**payload.model_dump(mode="json"), created_by=user.id)
     session.add(video)
     await session.flush()
@@ -117,7 +123,16 @@ async def create_video(
         scenes.append(scene)
     return VideoDetail(
         **VideoDTO.model_validate(video).model_dump(),
-        scenes=[SceneDTO.model_validate(scene) for scene in scenes],
+        scenes=[
+            SceneDTO.model_validate(scene).model_copy(
+                update={
+                    "selected_generation_fresh": await is_selected_generation_fresh(
+                        session, scene, video
+                    ),
+                }
+            )
+            for scene in scenes
+        ],
     )
 
 
@@ -139,7 +154,16 @@ async def get_video(
     )
     return VideoDetail(
         **VideoDTO.model_validate(video).model_dump(),
-        scenes=[SceneDTO.model_validate(scene) for scene in scenes],
+        scenes=[
+            SceneDTO.model_validate(scene).model_copy(
+                update={
+                    "selected_generation_fresh": await is_selected_generation_fresh(
+                        session, scene, video
+                    ),
+                }
+            )
+            for scene in scenes
+        ],
     )
 
 
@@ -280,9 +304,6 @@ async def storyboard_publish(
                 412,
                 {"expected": expected_scenes, "actual": actual_scenes},
             )
-        for scene in existing:
-            await session.delete(scene)
-        await session.flush()
     total = sum(scene.duration_seconds for scene in payload.scenes)
     if abs(total - video.target_duration) > 0.001:
         raise AppError(
@@ -291,7 +312,6 @@ async def storyboard_publish(
             422,
             {"expected": video.target_duration, "actual": total},
         )
-    scenes = []
     for index, value in enumerate(payload.scenes):
         if value.scene_order is not None and value.scene_order != index:
             raise AppError(
@@ -299,6 +319,13 @@ async def storyboard_publish(
                 "Scene order must be contiguous from zero",
                 422,
             )
+    # Validate the complete replacement before deleting or staging any scenes.
+    if existing:
+        for scene in existing:
+            await session.delete(scene)
+        await session.flush()
+    scenes = []
+    for index, value in enumerate(payload.scenes):
         scene = Scene(
             video_id=video.id,
             scene_order=index,
@@ -311,7 +338,16 @@ async def storyboard_publish(
     await session.flush()
     response = VideoDetail(
         **VideoDTO.model_validate(video).model_dump(),
-        scenes=[SceneDTO.model_validate(scene) for scene in scenes],
+        scenes=[
+            SceneDTO.model_validate(scene).model_copy(
+                update={
+                    "selected_generation_fresh": await is_selected_generation_fresh(
+                        session, scene, video
+                    ),
+                }
+            )
+            for scene in scenes
+        ],
     )
     complete(idempotency, response.model_dump(mode="json"), 200)
     return response

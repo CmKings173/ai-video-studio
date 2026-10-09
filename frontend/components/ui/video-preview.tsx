@@ -5,6 +5,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Film, AlertCircle, Loader2 } from "lucide-react";
 import { downloadAsset } from "@/lib/api/assets";
 import { queryKeys } from "@/lib/query/query-keys";
+import { useI18n } from "@/lib/i18n";
 
 export interface VideoPreviewProps {
   assetId?: string | null;
@@ -23,8 +24,9 @@ export function VideoPreview({
   controls = true,
   loop = false,
   muted = false,
-  fallbackMessage = "Không thể tải video",
+  fallbackMessage,
 }: VideoPreviewProps) {
+  const { t } = useI18n();
   const queryClient = useQueryClient();
   const retryCountRef = useRef(0);
   const [retryKey, setRetryKey] = useState(0);
@@ -57,7 +59,7 @@ export function VideoPreview({
         className={`flex flex-col items-center justify-center p-6 rounded-md bg-[#0b101a] border border-[#2c3038] text-center text-[#9ea5b0] ${className}`}
       >
         <Film className="w-8 h-8 mb-2 opacity-50" />
-        <span className="text-xs">Chưa có output video</span>
+        <span className="text-xs">{t("Chưa có video đầu ra", "No video output yet")}</span>
       </div>
     );
   }
@@ -68,7 +70,7 @@ export function VideoPreview({
         className={`flex flex-col items-center justify-center p-8 rounded-md bg-[#0b101a] border border-[#2c3038] text-[#9ea5b0] animate-pulse ${className}`}
       >
         <Loader2 className="w-8 h-8 animate-spin text-blue-400 mb-2" />
-        <span className="text-xs">Đang lấy link video...</span>
+        <span className="text-xs">{t("Đang tải liên kết video...", "Loading video link...")}</span>
       </div>
     );
   }
@@ -79,9 +81,9 @@ export function VideoPreview({
         className={`flex flex-col items-center justify-center p-6 rounded-md bg-red-950/20 border border-red-800/30 text-red-400 text-center ${className}`}
       >
         <AlertCircle className="w-6 h-6 mb-2" />
-        <span className="text-xs font-semibold">{fallbackMessage}</span>
+        <span className="text-xs font-semibold">{fallbackMessage ?? t("Không thể tải video", "Unable to load video")}</span>
         <span className="text-[11px] text-red-400/70 mt-1">
-          {error instanceof Error ? error.message : "Presigned URL không khả dụng"}
+          {error instanceof Error ? error.message : t("Liên kết video tạm thời không khả dụng", "Temporary video URL is unavailable")}
         </span>
       </div>
     );
@@ -100,7 +102,7 @@ export function VideoPreview({
         onError={handleMediaError}
       >
         <source src={data.url} type="video/mp4" onError={handleMediaError} />
-        Trình duyệt không hỗ trợ phát thẻ video HTML5.
+        {t("Trình duyệt không hỗ trợ phát video HTML5.", "Your browser does not support HTML5 video.")}
       </video>
     </div>
   );

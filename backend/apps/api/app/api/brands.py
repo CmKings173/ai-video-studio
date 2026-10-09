@@ -8,6 +8,7 @@ from apps.api.app.core.errors import AppError
 from apps.api.app.db.models import Brand, User
 from apps.api.app.db.session import get_session
 from apps.api.app.schemas.api import BrandCreate, BrandDTO, BrandPatch, Page
+from apps.api.app.services.generation_dependency_invalidation import invalidate_brand_dependents
 
 router = APIRouter(prefix="/brands", tags=["brands"])
 
@@ -35,8 +36,7 @@ async def list_brands(
     rows = list(
         (
             await session.scalars(
-                query
-                .order_by(Brand.created_at.desc(), Brand.id.desc())
+                query.order_by(Brand.created_at.desc(), Brand.id.desc())
                 .offset((page - 1) * size)
                 .limit(size)
             )
@@ -79,8 +79,6 @@ async def patch_brand(
     user: User = Depends(require_csrf),
     session: AsyncSession = Depends(get_session),
 ) -> BrandDTO:
-    brand = await session.get(Brand, brand_id, with_for_update=True)
-    if brand is None:
-        raise AppError("BRAND_NOT_FOUND", "Brand not found", 404)
-    apply_patch(brand, payload, revision)
+    async with invalidate_brand_dependents(session, brand_id) as brand:
+        apply_patch(brand, payload, revision)
     return BrandDTO.model_validate(brand)

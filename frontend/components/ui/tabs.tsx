@@ -11,14 +11,16 @@ export interface TabsProps {
 
 export function Tabs({ tabs, activeTab, onChange, className = "" }: TabsProps) {
   return (
-    <div className={`flex items-center gap-1 border-b border-[#2c3038] ${className}`}>
+    <div className={`flex min-w-0 max-w-full flex-nowrap items-center gap-1 overflow-x-auto border-b border-[#2c3038] ${className}`}>
       {tabs.map((tab) => {
         const isActive = activeTab === tab.id;
         return (
           <button
+            type="button"
+            aria-pressed={isActive}
             key={tab.id}
             onClick={() => onChange(tab.id)}
-            className={`flex min-h-[36px] items-center gap-2 rounded-none border-b px-3 text-sm font-medium transition-colors ${
+            className={`flex shrink-0 whitespace-nowrap min-h-[36px] items-center gap-2 rounded-none border-b px-3 text-sm font-medium transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-blue-400 ${
               isActive
                 ? "border-[#2563eb] bg-[#22252b] text-[#f1f3f5] font-semibold"
                 : "border-transparent text-[#9ea5b0] hover:bg-[#22252b] hover:text-[#f1f3f5]"

@@ -37,7 +37,7 @@ from apps.api.app.api import (
 from apps.api.app.core.config import get_settings
 from apps.api.app.core.errors import AppError
 from apps.api.app.core.logging import configure_logging, request_id_context
-from apps.api.app.core.metrics import metrics
+from apps.api.app.core.metrics import http_request_labels, metrics
 from apps.api.app.core.request_limits import RequestBodyLimitMiddleware
 from apps.api.app.core.security import hash_password
 from apps.api.app.db.models import User
@@ -50,12 +50,6 @@ settings = get_settings()
 configure_logging()
 logger = logging.getLogger(__name__)
 REQUEST_ID = re.compile(r"^[A-Za-z0-9._:-]{1,64}$")
-
-
-def _metric_path(request: Request) -> str:
-    route = request.scope.get("route")
-    path = getattr(route, "path", request.url.path)
-    return re.sub(r"[^A-Za-z0-9_./{}:-]", "_", path)[:200]
 
 
 async def _bootstrap_admin() -> User | None:
@@ -153,31 +147,28 @@ async def request_context(request: Request, call_next):
     try:
         response = await call_next(request)
     except Exception:
+        labels = http_request_labels(request)
         metrics.inc(
             "studio_http_requests_total",
-            labels={"method": request.method, "path": _metric_path(request), "status_class": "5xx"},
+            labels={**labels, "status_class": "5xx"},
         )
         metrics.observe(
             "studio_http_request_duration_seconds",
             time.perf_counter() - started_at,
-            labels={"method": request.method, "path": _metric_path(request)},
+            labels=labels,
         )
         raise
     finally:
         request_id_context.reset(token)
-    path = _metric_path(request)
+    labels = http_request_labels(request)
     metrics.inc(
         "studio_http_requests_total",
-        labels={
-            "method": request.method,
-            "path": path,
-            "status_class": f"{response.status_code // 100}xx",
-        },
+        labels={**labels, "status_class": f"{response.status_code // 100}xx"},
     )
     metrics.observe(
         "studio_http_request_duration_seconds",
         time.perf_counter() - started_at,
-        labels={"method": request.method, "path": path},
+        labels=labels,
     )
     response.headers["X-Request-ID"] = request_id
     response.headers["X-Content-Type-Options"] = "nosniff"

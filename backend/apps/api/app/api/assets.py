@@ -8,6 +8,7 @@ from apps.api.app.core.config import Settings, get_settings
 from apps.api.app.core.errors import AppError
 from apps.api.app.db.models import Asset, User, utcnow
 from apps.api.app.db.session import get_session
+from apps.api.app.integrations.media import ALLOWED_TYPES
 from apps.api.app.integrations.minio import AssetStore
 from apps.api.app.schemas.api import (
     AssetComplete,
@@ -20,8 +21,8 @@ from apps.api.app.schemas.api import (
 from apps.api.app.services.asset_claims import claim_is_active, clear_claim
 from apps.api.app.services.asset_service import (
     asset_is_referenced,
-    complete_asset,
     create_pending_asset,
+    enqueue_asset_validation,
     upload_staging_key,
 )
 from apps.api.app.services.idempotency import claim
@@ -123,19 +124,31 @@ async def upload_url(
     return response
 
 
-@router.post("/{asset_id}/complete", response_model=AssetDTO)
+@router.get("/upload-policy")
+async def upload_policy(
+    user: User = Depends(require_editor),
+    settings: Settings = Depends(get_settings),
+) -> dict:
+    return {
+        "max_upload_bytes": settings.max_upload_bytes,
+        "allowed_content_types": sorted(ALLOWED_TYPES),
+    }
+
+
+@router.post("/{asset_id}/complete", response_model=AssetDTO, status_code=202)
 async def complete(
     asset_id: str,
     payload: AssetComplete,
     user: User = Depends(require_csrf),
     session: AsyncSession = Depends(get_session),
     settings: Settings = Depends(get_settings),
-    asset_store: AssetStore = Depends(store),
 ) -> AssetDTO:
     asset = await session.get(Asset, asset_id)
     if asset is None:
         raise AppError("ASSET_NOT_FOUND", "Asset not found", 404)
-    asset = await complete_asset(session, asset_store, settings, asset, payload)
+    asset = await enqueue_asset_validation(session, settings, asset, payload, user_id=user.id)
+    # Accepted means published: request dependency cleanup may run after send.
+    await session.commit()
     return AssetDTO.model_validate(asset)
 
 

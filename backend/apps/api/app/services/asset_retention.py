@@ -10,7 +10,7 @@ from typing import Any
 from sqlalchemy import and_, case, func, or_, select
 
 from apps.api.app.db.models import Asset, utcnow
-from apps.api.app.integrations.minio import AssetStoreError
+from apps.api.app.integrations.minio import AssetObjectMissingError, AssetStoreError
 from apps.api.app.services.asset_claims import claim_available_expression, clear_claim
 from apps.api.app.services.asset_service import asset_reference_exists
 from apps.api.app.services.retention import RetentionPolicy
@@ -23,6 +23,7 @@ class RetentionCandidate:
     asset_id: str
     object_key: str
     status: str
+    delete_claimed_at: datetime
 
 
 @dataclass(frozen=True)
@@ -55,6 +56,13 @@ class AssetRetentionService:
             and_(
                 Asset.status.in_({"PENDING", "PENDING_UPLOAD", "VALIDATING"}),
                 Asset.created_at < pending_cutoff,
+                # A durable validation job is not an abandoned upload intent.
+                ~func.coalesce(
+                    Asset.media_metadata["validation"]["phase"].as_string().in_(
+                        ["QUEUED", "RUNNING"]
+                    ),
+                    False,
+                ),
             ),
             and_(
                 Asset.status == "FAILED",
@@ -147,34 +155,70 @@ class AssetRetentionService:
                 clear_claim(asset)
                 asset.status = "DELETING"
                 asset.delete_claimed_at = now
-                claims.append(RetentionCandidate(asset.id, asset.object_key, asset.status))
+                claims.append(
+                    RetentionCandidate(
+                        asset.id, asset.object_key, asset.status, asset.delete_claimed_at
+                    )
+                )
             return claims
 
-    async def finalize(self, asset_id: str, *, now: datetime | None = None) -> bool:
-        """Finalize only after this service has run the deletion protocol."""
+    async def finalize(
+        self,
+        asset_id: str,
+        *,
+        expected_object_key: str | None = None,
+        expected_claimed_at: datetime | None = None,
+        now: datetime | None = None,
+    ) -> bool:
+        """Delete and finalize while fencing the persisted retention claim.
+
+        The row lock is held only for the bounded object-store DELETE. The
+        durable DELETING state was committed by claim_batch before this method
+        is called, so a crash leaves a retryable row and DELETE remains
+        idempotent when the object is already absent.
+        """
         now = now or utcnow()
-        async with self.factory() as session:
-            asset = await session.get(Asset, asset_id)
-            if asset is None or asset.status != "DELETING":
-                return False
-            object_key = asset.object_key
-        try:
-            await self.store.delete(object_key)
-        except (AssetStoreError, OSError, TimeoutError, ConnectionError) as exc:
-            logger.warning(
-                "asset_retention_finalize_delete_unavailable",
-                extra={
-                    "asset_id": asset_id,
-                    "object_key": object_key,
-                    "error_type": type(exc).__name__,
-                    "operation": "finalize_delete",
-                },
-            )
-            return False
         async with self.factory() as session, session.begin():
             asset = await session.get(Asset, asset_id, with_for_update=True)
-            if asset is None or asset.status != "DELETING" or asset.object_key != object_key:
+            if (
+                asset is None
+                or asset.status != "DELETING"
+                or asset.operation_claim_id is not None
+                or (expected_object_key is not None and asset.object_key != expected_object_key)
+                or (
+                    expected_claimed_at is not None
+                    and asset.delete_claimed_at != expected_claimed_at
+                )
+            ):
                 return False
+            object_key = asset.object_key
+            is_referenced = await session.scalar(
+                select(asset_reference_exists(Asset.id)).where(Asset.id == asset_id)
+            )
+            if is_referenced:
+                return False
+
+            # Keep the row locked while the external delete is in flight. This
+            # prevents an expired claim from being taken over mid-delete.
+            # The S3 client applies bounded connect/read timeouts.
+            try:
+                await self.store.delete(object_key)
+            except AssetObjectMissingError:
+                # A prior attempt may have deleted the bytes before its DB
+                # transaction failed; confirmed absence is an idempotent success.
+                pass
+            except (AssetStoreError, OSError, TimeoutError, ConnectionError) as exc:
+                logger.warning(
+                    "asset_retention_finalize_delete_unavailable",
+                    extra={
+                        "asset_id": asset_id,
+                        "object_key": object_key,
+                        "error_type": type(exc).__name__,
+                        "operation": "finalize_delete",
+                    },
+                )
+                return False
+
             asset.status = "DELETED"
             asset.deleted_at = asset.deleted_at or now
             asset.purged_at = now
@@ -202,21 +246,12 @@ class AssetRetentionService:
             for item in claims
         ]
         for item in claims:
-            try:
-                await self.store.delete(item.object_key)
-            except (AssetStoreError, OSError, TimeoutError, ConnectionError) as exc:
-                failed += 1
-                logger.warning(
-                    "asset_retention_delete_unavailable",
-                    extra={
-                        "asset_id": item.asset_id,
-                        "object_key": item.object_key,
-                        "error_type": type(exc).__name__,
-                        "operation": "delete",
-                    },
-                )
-                continue
-            if await self.finalize(item.asset_id, now=now):
+            if await self.finalize(
+                item.asset_id,
+                expected_object_key=item.object_key,
+                expected_claimed_at=item.delete_claimed_at,
+                now=now,
+            ):
                 deleted_objects += 1
                 deleted_keys.append(item.object_key)
             else:

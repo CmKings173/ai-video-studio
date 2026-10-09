@@ -142,13 +142,14 @@ async def test_claim_heartbeat_db_failure_sets_lost_without_reraising():
 
 
 @pytest.mark.asyncio
-async def test_retention_excludes_active_operation_claim(session_factory, tmp_path):
+@pytest.mark.parametrize("claim_type", [REPAIR_CLAIM, OUTPUT_WRITE_CLAIM])
+async def test_retention_excludes_active_operation_claim(session_factory, tmp_path, claim_type):
     asset_id = await seed_asset(session_factory)
     async with session_factory() as session, session.begin():
         claim_id = await acquire_claim(
             session,
             asset_id,
-            REPAIR_CLAIM,
+            claim_type,
             timeout_seconds=3600,
             allowed_statuses={"PENDING_UPLOAD"},
         )
@@ -327,25 +328,28 @@ async def test_save_output_heartbeat_db_failure_does_not_finalize_ready(
             self.real_factory = real_factory
             self.calls = 0
             self.failure_seen = asyncio.Event()
+            self.upload_started = False
 
         def __call__(self):
             self.calls += 1
-            if self.calls == 2:
+            # Fail renewal during the upload, independent of preflight timing.
+            if self.upload_started and not self.failure_seen.is_set():
                 return FailingHeartbeatSession(self.failure_seen)
             return self.real_factory()
 
     class WaitingStore(MemoryStore):
-        def __init__(self, failure_seen):
+        def __init__(self, heartbeat_factory):
             super().__init__()
-            self.failure_seen = failure_seen
+            self.heartbeat_factory = heartbeat_factory
 
         async def put_bytes(self, key, data, content_type):
-            await asyncio.wait_for(self.failure_seen.wait(), timeout=1)
+            self.heartbeat_factory.upload_started = True
+            await asyncio.wait_for(self.heartbeat_factory.failure_seen.wait(), timeout=1)
             await super().put_bytes(key, data, content_type)
 
     user_id, project_id = await seed_asset_owner(session_factory)
     factory = FailingHeartbeatFactory(session_factory)
-    store = WaitingStore(factory.failure_seen)
+    store = WaitingStore(factory)
     role = "GENERATED_VIDEO"
     owner_id = "heartbeat-db-failure"
     data = b"heartbeat-failure-output"

@@ -1,4 +1,5 @@
 import type { ErrorEnvelope } from "./types";
+import { translateText as t } from "@/lib/i18n";
 
 export class ApiClientError extends Error {
   public readonly code: string;
@@ -24,7 +25,7 @@ export class ApiClientError extends Error {
 export function isRevisionConflict(error: unknown): boolean {
   return (
     error instanceof ApiClientError &&
-    (error.status === 412 || error.code === "REVISION_CONFLICT")
+    error.code === "REVISION_CONFLICT"
   );
 }
 
@@ -54,16 +55,16 @@ export function isValidationError(error: unknown): boolean {
 export function getErrorMessage(error: unknown, fallback = "Đã xảy ra lỗi không xác định"): string {
   if (error instanceof ApiClientError) {
     if (error.code === "REVISION_CONFLICT") {
-      return "Dữ liệu đã bị thay đổi bởi người khác hoặc phiên làm việc khác. Vui lòng tải lại và thử lại.";
+      return t("Dữ liệu đã bị thay đổi bởi người khác hoặc phiên làm việc khác. Vui lòng tải lại và thử lại.", "Data was changed by another user or session. Reload and try again.");
     }
     if (error.code === "LOGIN_RATE_LIMITED") {
-      return "Quá nhiều lần đăng nhập không thành công. Vui lòng thử lại sau.";
+      return t("Quá nhiều lần đăng nhập không thành công. Vui lòng thử lại sau.", "Too many unsuccessful sign-in attempts. Try again later.");
     }
     if (error.code === "INVALID_CREDENTIALS") {
-      return "Email hoặc mật khẩu không chính xác.";
+      return t("Email hoặc mật khẩu không chính xác.", "Incorrect email or password.");
     }
     if (error.code === "ACCOUNT_DISABLED") {
-      return "Tài khoản của bạn hiện đã bị vô hiệu hoá.";
+      return t("Tài khoản của bạn hiện đã bị vô hiệu hoá.", "Your account has been disabled.");
     }
     if (error.message) {
       return error.message;
@@ -72,5 +73,5 @@ export function getErrorMessage(error: unknown, fallback = "Đã xảy ra lỗi 
   if (error instanceof Error) {
     return error.message;
   }
-  return fallback;
+  return fallback === "Đã xảy ra lỗi không xác định" ? t(fallback, "An unexpected error occurred") : fallback;
 }

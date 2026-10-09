@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import shutil
 from dataclasses import dataclass, field
 from datetime import timedelta
 
@@ -16,10 +17,11 @@ from apps.api.app.db.models import Asset, utcnow
 from apps.api.app.integrations.media import (
     MediaInspectionError,
     MediaValidationError,
-    inspect_media,
+    inspect_media_path,
 )
 from apps.api.app.integrations.minio import (
     AssetObjectMissingError,
+    AssetObjectTooLargeError,
     AssetStoreError,
     AssetStoreUnavailableError,
 )
@@ -34,12 +36,14 @@ from apps.api.app.services.asset_claims import (
     requeue_deletion_retry,
 )
 from apps.api.app.services.asset_retention import AssetRetentionService
-from apps.api.app.services.asset_service import upload_staging_key
+from apps.api.app.services.asset_service import has_durable_validation, upload_staging_key
+from workers.common import staging_directory
 
 logger = logging.getLogger(__name__)
 
 
 _MISSING_CODES = {"404", "NoSuchKey", "NoSuchObject", "NotFound"}
+_GENERATED_OUTPUT_ROLES = frozenset({"GENERATED_VIDEO", "FINAL_VIDEO"})
 _STORAGE_ERRORS = (
     AssetObjectMissingError,
     AssetStoreUnavailableError,
@@ -86,6 +90,11 @@ class AssetReconciler:
             getattr(settings, "asset_operation_claim_timeout_seconds", 900)
         )
 
+    def _max_bytes_for_role(self, role: str | None) -> int:
+        if role in _GENERATED_OUTPUT_ROLES:
+            return int(getattr(self.settings, "max_generated_output_bytes", 500 * 1024**2))
+        return int(getattr(self.settings, "max_upload_bytes", 500 * 1024**2))
+
     async def _mark_ready_failed(self, asset_id: str) -> bool:
         async with self.factory() as session, session.begin():
             claim_id = await acquire_claim(
@@ -107,6 +116,9 @@ class AssetReconciler:
 
     async def _mark_pending_failed(self, asset_id: str) -> bool:
         async with self.factory() as session, session.begin():
+            asset = await session.get(Asset, asset_id, with_for_update=True)
+            if asset is None or has_durable_validation(asset):
+                return False
             claim_id = await acquire_claim(
                 session,
                 asset_id,
@@ -147,12 +159,15 @@ class AssetReconciler:
                 {
                     "id": row.id,
                     "status": row.status,
+                    "kind": row.kind,
+                    "role": row.role,
                     "object_key": row.object_key,
                     "checksum": row.checksum,
                     "size_bytes": row.size_bytes,
                     "content_type": row.content_type,
                     "filename": row.filename,
                     "created_at": row.created_at,
+                    "durable_validation": has_durable_validation(row),
                 }
                 for row in rows
             ]
@@ -185,9 +200,7 @@ class AssetReconciler:
                 )
         if safe_delete and needs_retry_before_delete:
             try:
-                retry_queued = await requeue_deletion_retry(
-                    self.factory, asset_id, object_key
-                )
+                retry_queued = await requeue_deletion_retry(self.factory, asset_id, object_key)
             except SQLAlchemyError as exc:
                 safe_delete = False
                 error_type = type(exc).__name__
@@ -241,13 +254,77 @@ class AssetReconciler:
             return
 
     async def _repair_pending(self, snapshot: dict, report: ReconciliationReport) -> None:
+        if snapshot.get("durable_validation"):
+            return
+        # Avoid creating staging work when the queue snapshot is already stale.
+        async with self.factory() as session:
+            current = await session.get(Asset, snapshot["id"])
+            if current is None or has_durable_validation(current):
+                return
+            max_bytes = self._max_bytes_for_role(current.role)
+        expected_size = snapshot.get("size_bytes")
+        if type(expected_size) is not int or expected_size <= 0 or expected_size > max_bytes:
+            if await self._mark_pending_failed(snapshot["id"]):
+                report.corrupt_objects.append(snapshot["object_key"])
+            else:
+                report.skipped_claimed_assets.append(snapshot["id"])
+            return
+        async with staging_directory(self.settings, f"asset-repair-{snapshot['id']}-") as directory:
+            usage = await asyncio.to_thread(shutil.disk_usage, directory)
+            if usage.free - expected_size < getattr(self.settings, "min_free_disk_bytes", 0):
+                self._unavailable(
+                    report, snapshot, "staging", RuntimeError("INSUFFICIENT_DISK_SPACE")
+                )
+                return
+            await self._repair_pending_from_path(
+                snapshot, report, directory / "source", max_bytes
+            )
+
+    async def _download_pending_object(self, key: str, path, max_bytes: int):
+        if hasattr(self.store, "download_to_path"):
+            return await self.store.download_to_path(key, path, max_bytes=max_bytes)
+        # Injected compatibility stores used by integration tests predate the
+        # production file API. The real AssetStore always takes the branch above.
+        data = await self._get_compat_bytes(key, max_bytes)
+        await asyncio.to_thread(path.write_bytes, data)
+        return {
+            "size": len(data),
+            "checksum": hashlib.sha256(data).hexdigest(),
+        }
+
+    async def _get_compat_bytes(self, key: str, max_bytes: int) -> bytes:
+        """Read from legacy injected stores and enforce the bound before writing."""
+        data = await self.store.get_bytes(key)
+        if len(data) > max_bytes:
+            raise AssetObjectTooLargeError(
+                "Compatibility store object exceeds configured size limit"
+            )
+        return data
+
+    async def _record_corrupt_pending(
+        self, snapshot: dict, report: ReconciliationReport, object_key: str
+    ) -> None:
+        if await self._mark_pending_failed(snapshot["id"]):
+            report.corrupt_objects.append(object_key)
+        else:
+            report.skipped_claimed_assets.append(snapshot["id"])
+
+    async def _repair_pending_from_path(
+        self, snapshot: dict, report: ReconciliationReport, path, max_bytes: int
+    ) -> None:
+        # Snapshot can predate enqueue. Check again before reading a large object;
+        # mutation paths below also check under their exclusive row locks.
+        async with self.factory() as session:
+            current = await session.get(Asset, snapshot["id"])
+            if current is None or has_durable_validation(current):
+                return
         source_key = snapshot["object_key"]
         try:
-            data = await self.store.get_bytes(source_key)
+            actual = await self._download_pending_object(source_key, path, max_bytes)
         except (AssetObjectMissingError, KeyError, FileNotFoundError):
             source_key = upload_staging_key(asset_id=snapshot["id"])
             try:
-                data = await self.store.get_bytes(source_key)
+                actual = await self._download_pending_object(source_key, path, max_bytes)
             except (AssetObjectMissingError, KeyError, FileNotFoundError) as exc:
                 now = utcnow()
                 created_at = snapshot.get("created_at")
@@ -276,6 +353,9 @@ class AssetReconciler:
                     },
                 )
                 return
+            except AssetObjectTooLargeError:
+                await self._record_corrupt_pending(snapshot, report, source_key)
+                return
             except (
                 AssetStoreUnavailableError,
                 AssetStoreError,
@@ -284,12 +364,16 @@ class AssetReconciler:
             ) as exc:
                 self._unavailable(report, snapshot, "read_staging", exc)
                 return
+        except AssetObjectTooLargeError:
+            await self._record_corrupt_pending(snapshot, report, source_key)
+            return
         except (AssetStoreUnavailableError, AssetStoreError, TimeoutError, ConnectionError) as exc:
             self._unavailable(report, snapshot, "read_primary", exc)
             return
 
-        checksum = hashlib.sha256(data).hexdigest()
-        if snapshot["size_bytes"] and len(data) != snapshot["size_bytes"]:
+        checksum = actual["checksum"]
+        size = actual["size"]
+        if size != snapshot["size_bytes"]:
             if await self._mark_pending_failed(snapshot["id"]):
                 report.corrupt_objects.append(source_key)
             else:
@@ -302,11 +386,8 @@ class AssetReconciler:
                 report.skipped_claimed_assets.append(snapshot["id"])
             return
         try:
-            metadata = await inspect_media(
-                data,
-                snapshot["content_type"],
-                snapshot["filename"],
-                self.settings.ffprobe_binary,
+            metadata = await inspect_media_path(
+                path, snapshot["content_type"], self.settings.ffprobe_binary
             )
         except MediaValidationError:
             if await self._mark_pending_failed(snapshot["id"]):
@@ -319,6 +400,9 @@ class AssetReconciler:
             return
 
         async with self.factory() as session, session.begin():
+            current = await session.get(Asset, snapshot["id"], with_for_update=True)
+            if current is None or has_durable_validation(current):
+                return
             claim_id = await acquire_claim(
                 session,
                 snapshot["id"],
@@ -340,9 +424,19 @@ class AssetReconciler:
                     timeout_seconds=self.claim_timeout_seconds,
                     allowed_statuses={"PENDING", "PENDING_UPLOAD", "VALIDATING"},
                 ) as lost:
-                    await self.store.put_bytes(
-                        snapshot["object_key"], data, snapshot["content_type"]
-                    )
+                    if hasattr(self.store, "put_file_immutable"):
+                        await self.store.put_file_immutable(
+                            snapshot["object_key"],
+                            path,
+                            snapshot["content_type"],
+                            checksum,
+                            max_bytes,
+                        )
+                    else:
+                        data = await asyncio.to_thread(path.read_bytes)
+                        await self.store.put_bytes(
+                            snapshot["object_key"], data, snapshot["content_type"]
+                        )
                     promoted_key = snapshot["object_key"]
                     if lost.is_set():
                         await self._compensate_promoted(
@@ -350,7 +444,7 @@ class AssetReconciler:
                             claim_id,
                             promoted_key,
                             checksum,
-                            len(data),
+                            size,
                             report,
                         )
                         return
@@ -371,13 +465,14 @@ class AssetReconciler:
                 asset
                 and owns_claim(asset, claim_id, REPAIR_CLAIM)
                 and asset.status in {"PENDING", "PENDING_UPLOAD", "VALIDATING"}
+                and not has_durable_validation(asset)
             ):
                 should_compensate = promoted_key is not None
                 if asset and owns_claim(asset, claim_id, REPAIR_CLAIM):
                     clear_claim(asset)
             else:
                 asset.checksum = checksum
-                asset.size_bytes = len(data)
+                asset.size_bytes = size
                 asset.width = metadata.get("width")
                 asset.height = metadata.get("height")
                 asset.duration_seconds = metadata.get("duration_seconds")
@@ -388,7 +483,7 @@ class AssetReconciler:
 
         if should_compensate and promoted_key:
             await self._compensate_promoted(
-                snapshot["id"], claim_id, promoted_key, checksum, len(data), report
+                snapshot["id"], claim_id, promoted_key, checksum, size, report
             )
 
     async def run(self, *, inspect_orphans: bool = True) -> ReconciliationReport:
@@ -408,13 +503,28 @@ class AssetReconciler:
                 continue
             try:
                 head = await self.store.head(snapshot["object_key"])
-                corrupt = head["size"] != snapshot["size_bytes"]
-                if snapshot["checksum"] and head.get("checksum") != snapshot["checksum"]:
+                limit = self._max_bytes_for_role(snapshot.get("role"))
+                corrupt = (
+                    head["size"] != snapshot["size_bytes"]
+                    or head["size"] > limit
+                    or snapshot["size_bytes"] > limit
+                )
+                if snapshot["checksum"] and not corrupt:
                     try:
-                        data = await self.store.get_bytes(
-                            snapshot["object_key"], self.settings.max_upload_bytes
-                        )
-                        corrupt = hashlib.sha256(data).hexdigest() != snapshot["checksum"]
+                        if hasattr(self.store, "checksum_object"):
+                            actual = await self.store.checksum_object(snapshot["object_key"], limit)
+                            corrupt = (
+                                corrupt
+                                or actual["size"] != snapshot["size_bytes"]
+                                or actual["checksum"] != snapshot["checksum"]
+                            )
+                        else:
+                            data = await self._get_compat_bytes(snapshot["object_key"], limit)
+                            corrupt = (
+                                corrupt
+                                or len(data) != snapshot["size_bytes"]
+                                or hashlib.sha256(data).hexdigest() != snapshot["checksum"]
+                            )
                     except _STORAGE_ERRORS as exc:
                         if _is_confirmed_missing(exc):
                             if await self._mark_ready_failed(snapshot["id"]):

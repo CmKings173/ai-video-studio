@@ -1,4 +1,5 @@
 import { apiClient } from "./client";
+import { paginationParams } from "./pagination";
 import type { AssetDTO, Page, ProjectDTO, ResourceCreate, ResourcePatch, VideoDTO } from "./types";
 
 export type ListProjectsParams = {
@@ -9,7 +10,7 @@ export type ListProjectsParams = {
 };
 
 export async function listProjects(params?: ListProjectsParams): Promise<Page<ProjectDTO>> {
-  return apiClient.get<Page<ProjectDTO>>("/api/v1/projects", { params });
+  return apiClient.get<Page<ProjectDTO>>("/api/v1/projects", { params: paginationParams(params) });
 }
 
 export async function createProject(payload: ResourceCreate): Promise<ProjectDTO> {
@@ -36,12 +37,12 @@ export async function getProjectVideos(
   projectId: string,
   params?: { page?: number; size?: number }
 ): Promise<Page<VideoDTO>> {
-  return apiClient.get<Page<VideoDTO>>(`/api/v1/projects/${projectId}/videos`, { params });
+  return apiClient.get<Page<VideoDTO>>(`/api/v1/projects/${projectId}/videos`, { params: paginationParams(params) });
 }
 
 export async function getProjectAssets(
   projectId: string,
   params?: { page?: number; size?: number }
 ): Promise<Page<AssetDTO>> {
-  return apiClient.get<Page<AssetDTO>>(`/api/v1/projects/${projectId}/assets`, { params });
+  return apiClient.get<Page<AssetDTO>>(`/api/v1/projects/${projectId}/assets`, { params: paginationParams(params) });
 }

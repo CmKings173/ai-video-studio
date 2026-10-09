@@ -4,11 +4,24 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from apps.api.app.api.deps import expected_revision, require_csrf, require_editor
 from apps.api.app.core.errors import AppError
+from apps.api.app.db.locking import lock_revisioned_row
 from apps.api.app.db.models import Asset, Scene, SceneGeneration, User, Video
 from apps.api.app.db.session import get_session
 from apps.api.app.schemas.api import Reorder, SceneCreate, SceneDTO, ScenePatch, Selection
+from apps.api.app.services.generation_freshness import (
+    is_generation_fresh,
+    is_selected_generation_fresh,
+)
 
 router = APIRouter(tags=["scenes"])
+
+
+async def _scene_dto(session: AsyncSession, scene: Scene, video: Video) -> SceneDTO:
+    return SceneDTO.model_validate(scene).model_copy(
+        update={
+            "selected_generation_fresh": await is_selected_generation_fresh(session, scene, video),
+        }
+    )
 
 
 async def _scene(session: AsyncSession, scene_id: str, lock: bool = False) -> Scene:
@@ -20,13 +33,14 @@ async def _scene(session: AsyncSession, scene_id: str, lock: bool = False) -> Sc
 
 async def _locked_scene_and_video(session: AsyncSession, scene_id: str) -> tuple[Scene, Video]:
     """Lock parent video before child scene to keep every mutation ordered."""
-    scene_ref = await session.get(Scene, scene_id)
-    if scene_ref is None:
+    with session.no_autoflush:
+        video_id = await session.scalar(select(Scene.video_id).where(Scene.id == scene_id))
+    if video_id is None:
         raise AppError("SCENE_NOT_FOUND", "Scene not found", 404)
-    video = await session.get(Video, scene_ref.video_id, with_for_update=True)
+    video = await lock_revisioned_row(session, Video, video_id)
     if video is None:
         raise AppError("VIDEO_NOT_FOUND", "Video not found", 404)
-    scene = await session.scalar(select(Scene).where(Scene.id == scene_id).with_for_update())
+    scene = await lock_revisioned_row(session, Scene, scene_id, immutable_fields=("video_id",))
     if scene is None:
         raise AppError("SCENE_NOT_FOUND", "Scene not found", 404)
     return scene, video
@@ -46,7 +60,8 @@ async def list_scenes(
     user: User = Depends(require_editor),
     session: AsyncSession = Depends(get_session),
 ) -> list[SceneDTO]:
-    if await session.get(Video, video_id) is None:
+    video = await session.get(Video, video_id)
+    if video is None:
         raise AppError("VIDEO_NOT_FOUND", "Video not found", 404)
     rows = list(
         (
@@ -57,7 +72,7 @@ async def list_scenes(
             )
         ).all()
     )
-    return [SceneDTO.model_validate(row) for row in rows]
+    return [await _scene_dto(session, row, video) for row in rows]
 
 
 @router.get("/scenes/{scene_id}", response_model=SceneDTO)
@@ -66,7 +81,11 @@ async def get_scene(
     user: User = Depends(require_editor),
     session: AsyncSession = Depends(get_session),
 ) -> SceneDTO:
-    return SceneDTO.model_validate(await _scene(session, scene_id))
+    scene = await _scene(session, scene_id)
+    video = await session.get(Video, scene.video_id)
+    if video is None:
+        raise AppError("VIDEO_NOT_FOUND", "Video not found", 404)
+    return await _scene_dto(session, scene, video)
 
 
 @router.post("/videos/{video_id}/scenes", response_model=SceneDTO, status_code=201)
@@ -102,13 +121,14 @@ async def create_scene(
     scene = Scene(
         video_id=video_id,
         scene_order=scene_order,
-        **payload.model_dump(mode="json", exclude={"scene_order"}),
+        **payload.model_dump(mode="json", exclude={"scene_order", "generation_config"}),
+        generation_config=payload.generation_config.model_dump(mode="json", exclude_unset=True),
     )
     session.add(scene)
     video.revision += 1
     video.status = "DIRTY" if video.current_final_video_id else "STORYBOARD_READY"
     await session.flush()
-    return SceneDTO.model_validate(scene)
+    return await _scene_dto(session, scene, video)
 
 
 @router.patch("/scenes/{scene_id}", response_model=SceneDTO)
@@ -131,7 +151,7 @@ async def patch_scene(
         setattr(scene, key, value)
     scene.revision += 1
     _dirty(video)
-    return SceneDTO.model_validate(scene)
+    return await _scene_dto(session, scene, video)
 
 
 @router.post("/videos/{video_id}/scenes/reorder", response_model=list[SceneDTO])
@@ -173,7 +193,7 @@ async def reorder(
     video.revision += 1
     if video.current_final_video_id or video.status == "READY":
         video.status = "DIRTY"
-    return [SceneDTO.model_validate(by_id[scene_id]) for scene_id in provided]
+    return [await _scene_dto(session, by_id[scene_id], video) for scene_id in provided]
 
 
 @router.post("/scenes/{scene_id}/select-generation", response_model=SceneDTO)
@@ -201,13 +221,20 @@ async def select_generation(
         raise AppError("GENERATION_NOT_FOUND", "Generation does not belong to this scene", 404)
     if generation.status != "COMPLETED" or not generation.output_asset_id:
         raise AppError("GENERATION_NOT_READY", "Only completed generations can be selected", 409)
+    if not await is_generation_fresh(session, scene, video, generation):
+        raise AppError(
+            "SCENE_SELECTION_STALE",
+            "Generation no longer matches current scene inputs",
+            409,
+            {"scene_id": scene.id, "generation_id": generation.id},
+        )
     asset = await session.get(Asset, generation.output_asset_id, with_for_update=True)
     if asset is None or asset.status != "READY":
         raise AppError("GENERATION_OUTPUT_NOT_READY", "Generation output is not ready", 409)
     scene.selected_generation_id = generation.id
     scene.revision += 1
     _dirty(video)
-    return SceneDTO.model_validate(scene)
+    return await _scene_dto(session, scene, video)
 
 
 async def _set_enabled(
@@ -225,7 +252,7 @@ async def _set_enabled(
         scene.enabled = enabled
         scene.revision += 1
         _dirty(video)
-    return SceneDTO.model_validate(scene)
+    return await _scene_dto(session, scene, video)
 
 
 @router.post("/scenes/{scene_id}/disable", response_model=SceneDTO)

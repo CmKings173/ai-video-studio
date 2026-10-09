@@ -1,4 +1,5 @@
 import { apiClient } from "./client";
+import { paginationParams } from "./pagination";
 import type { AssetDTO, Page, ProductCreate, ProductDTO, ProductPatch } from "./types";
 
 export type ListProductsParams = {
@@ -10,7 +11,7 @@ export type ListProductsParams = {
 };
 
 export async function listProducts(params?: ListProductsParams): Promise<Page<ProductDTO>> {
-  return apiClient.get<Page<ProductDTO>>("/api/v1/products", { params });
+  return apiClient.get<Page<ProductDTO>>("/api/v1/products", { params: paginationParams(params) });
 }
 
 export async function createProduct(payload: ProductCreate): Promise<ProductDTO> {
@@ -37,5 +38,5 @@ export async function getProductAssets(
   productId: string,
   params?: { page?: number; size?: number }
 ): Promise<Page<AssetDTO>> {
-  return apiClient.get<Page<AssetDTO>>(`/api/v1/products/${productId}/assets`, { params });
+  return apiClient.get<Page<AssetDTO>>(`/api/v1/products/${productId}/assets`, { params: paginationParams(params) });
 }

@@ -1,4 +1,6 @@
 import copy
+import json
+from pathlib import Path
 
 import pytest
 
@@ -6,9 +8,12 @@ from apps.api.app.core.config import Settings
 from apps.api.app.core.errors import AppError
 from apps.api.app.db.models import Project, Scene, User, Video, WorkflowRecord
 from apps.api.app.schemas.api import GenerationRequest
+from apps.api.app.services.executable_weights import collect_executable_weights
 from apps.api.app.services.generation_service import GenerationService
 from apps.api.app.services.idempotency import claim, complete
+from apps.api.app.services.workflow_contracts import profile_hash
 from apps.api.app.services.workflow_registry import ApprovedWorkflow
+from tests.contract_fixtures import synthetic_profile
 
 
 def workflow_data():
@@ -49,8 +54,53 @@ def workflow_data():
     return graph, slots, approved
 
 
+def director_workflow_data(
+    *, mode="t2v", quality="STANDARD", steps=12, execution_scope="single_scene"
+):
+    """Real pinned single-scene graph with synthetic evidence for isolated tests only."""
+    directory = Path(__file__).resolve().parents[2] / "workflows/h3"
+    entry = next(
+        item
+        for item in json.loads((directory / "registry.json").read_text())["workflows"]
+        if item["code"]
+        == f"H3_DIRECTOR_{mode.upper()}_BASE"
+        + ("_AGGREGATE" if execution_scope == "aggregate" else "")
+    )
+    graph = json.loads((directory / entry["file"]).read_text())
+    slots = copy.deepcopy(entry["slots"])
+    approved = ApprovedWorkflow(
+        mode,
+        "1",
+        graph,
+        {k: tuple(v) for k, v in slots.items()},
+        execution_scope=execution_scope,
+    )
+    legacy_graph, legacy_slots, _ = workflow_data()
+    baseline, _ = synthetic_profile(
+        legacy_graph, legacy_slots, mode=mode, quality=quality, steps=steps
+    )
+    profile = copy.deepcopy(entry["profile"])
+    profile.update(
+        quality_profile=quality,
+        steps=steps,
+        resolution=baseline["resolution"],
+        dependency_versions={n["class_type"]: "synthetic-test-only" for n in graph.values()},
+        weight_hashes={w: "a" * 64 for w in collect_executable_weights(graph)},
+    )
+    evidence = baseline["execution_evidence"]
+    evidence.update(
+        workflow_hash=approved.workflow_hash,
+        slot_map_hash=approved.slot_map_hash,
+        profile_hash=profile_hash(profile),
+        dependency_versions=profile["dependency_versions"],
+        weight_hashes=profile["weight_hashes"],
+    )
+    profile.update(poc_verified=True, execution_evidence=evidence)
+    return graph, slots, profile, approved
+
+
 async def seed(session_factory):
-    graph, slots, approved = workflow_data()
+    graph, slots, profile, approved = director_workflow_data()
     async with session_factory() as session, session.begin():
         user = User(email="editor@example.test", name="Editor", password_hash="hash")
         session.add(user)
@@ -74,7 +124,7 @@ async def seed(session_factory):
             workflow=graph,
             slots=slots,
             required_slots=list(slots),
-            profile={"output_node": "2"},
+            profile=profile,
             workflow_hash=approved.workflow_hash,
             slot_map_hash=approved.slot_map_hash,
             enabled=True,
@@ -120,7 +170,8 @@ async def test_generation_creation_freezes_every_execution_input(session_factory
     assert snapshot["width"] == 480
     assert snapshot["height"] == 864
     assert snapshot["scene_revision"] == 1
-    assert snapshot["workflow"]["1"]["inputs"]["prompt"] == snapshot["prompt"]
+    assert snapshot["director_execution"]["prompt"] == snapshot["prompt"]
+    assert snapshot["generation_intent"]["prompt"] == snapshot["prompt"]
 
     async with session_factory() as session:
         stored = await session.get(type(generation), generation_id)

@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
 from collections.abc import AsyncIterator
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import urlencode, urlsplit, urlunsplit
 
@@ -29,7 +31,10 @@ class ComfyAdapter:
             else getattr(settings, "comfyui_base_url", "http://127.0.0.1:8188")
         ).rstrip("/")
         self.timeout = float(getattr(settings, "comfy_timeout_seconds", 30))
-        self.max_download_bytes = int(getattr(settings, "max_upload_bytes", 512 * 1024 * 1024))
+        self.max_download_bytes = int(
+            getattr(settings, "max_generated_output_bytes", 500 * 1024**2)
+        )
+        self.max_upload_bytes = int(getattr(settings, "max_upload_bytes", 500 * 1024**2))
         self.scoped_interrupt = bool(getattr(settings, "comfy_scoped_interrupt", False))
         self._client = client
 
@@ -63,6 +68,9 @@ class ComfyAdapter:
 
     async def system_stats(self) -> dict:
         return await self._json("GET", "/system_stats")
+
+    async def object_info(self) -> dict:
+        return await self._json("GET", "/object_info")
 
     async def queue_status(self) -> dict:
         result = await self._json("GET", "/queue")
@@ -213,6 +221,26 @@ class ComfyAdapter:
         subfolder = self._subfolder(value.get("subfolder", ""))
         return f"{subfolder}/{name}" if subfolder else name
 
+    async def upload_file(self, path: Path, filename: str, content_type: str) -> str:
+        """Stream a bounded local file using ComfyUI's established input upload form."""
+        self._media_name(filename)
+        file_stat = await asyncio.to_thread(path.stat)
+        size = file_stat.st_size
+        if size <= 0 or size > self.max_upload_bytes:
+            raise ComfyError("Media file exceeds the permitted size", "COMFY_UPLOAD_TOO_LARGE")
+        # HTTPX streams multipart file objects in bounded chunks. Keep this
+        # handle open through request completion so staging cleanup cannot race it.
+        with path.open("rb") as source:
+            value = await self._json(
+                "POST",
+                "/upload/image",
+                files={"image": (filename, source, content_type)},
+                data={"type": "input", "overwrite": "false"},
+            )
+        name = self._media_name(value.get("name", ""))
+        subfolder = self._subfolder(value.get("subfolder", ""))
+        return f"{subfolder}/{name}" if subfolder else name
+
     @staticmethod
     def _media_name(value: str) -> str:
         if (
@@ -271,6 +299,93 @@ class ComfyAdapter:
                         seen.add(key)
         return result
 
+    async def download_to_path(
+        self, output: dict, path: str | Path, max_bytes: int | None = None
+    ) -> dict[str, Any]:
+        """Stream to a caller-selected new file, removing it on failure or cancellation.
+
+        Returns a Path, actual byte count and SHA-256 hex digest. An explicit limit
+        may tighten the configured generated-output limit. Existing files are preserved.
+        """
+        destination = Path(path)
+        limit = (
+            self.max_download_bytes
+            if max_bytes is None
+            else min(max_bytes, self.max_download_bytes)
+        )
+        if limit <= 0:
+            raise ValueError("max_bytes must be positive")
+        params = {
+            "filename": self._media_name(output["filename"]),
+            "subfolder": self._subfolder(output.get("subfolder", "")),
+            "type": output.get("type", "output"),
+        }
+        if params["type"] not in {"output", "temp"}:
+            raise ComfyError("Output type is not downloadable", "COMFY_INVALID_RESPONSE")
+
+        created = False
+
+        async def receive(client: httpx.AsyncClient) -> dict[str, Any]:
+            nonlocal created
+            async with client.stream(
+                "GET",
+                f"{self.base_url}/view",
+                params=params,
+                headers={"Accept-Encoding": "identity"},
+                timeout=self.timeout,
+                follow_redirects=False,
+            ) as response:
+                response.raise_for_status()
+                encoding = response.headers.get("content-encoding", "identity").lower()
+                if encoding != "identity":
+                    raise ComfyError("Unexpected output encoding", "COMFY_INVALID_RESPONSE")
+                declared = response.headers.get("content-length")
+                expected = None
+                if declared is not None:
+                    if not declared or any(c not in "0123456789" for c in declared):
+                        raise ComfyError("Invalid output length", "COMFY_INVALID_RESPONSE")
+                    try:
+                        expected = int(declared)
+                    except ValueError as exc:
+                        raise ComfyError("Invalid output length", "COMFY_INVALID_RESPONSE") from exc
+                    if expected > limit:
+                        raise ComfyError(
+                            "Generated output exceeds size limit", "COMFY_OUTPUT_TOO_LARGE"
+                        )
+                digest, size = hashlib.sha256(), 0
+                # Bounded local writes avoid cancellation racing with a writer thread.
+                with destination.open("xb") as target:  # noqa: ASYNC230
+                    created = True
+                    async for chunk in response.aiter_bytes(chunk_size=1024 * 1024):
+                        size += len(chunk)
+                        if size > limit:
+                            raise ComfyError(
+                                "Generated output exceeds size limit", "COMFY_OUTPUT_TOO_LARGE"
+                            )
+                        if expected is not None and size > expected:
+                            raise ComfyError("Output length mismatch", "COMFY_INVALID_RESPONSE")
+                        target.write(chunk)
+                        digest.update(chunk)
+                    if expected is not None and size != expected:
+                        raise ComfyError("Output transfer truncated", "COMFY_INVALID_RESPONSE")
+                return {"path": destination, "size": size, "checksum": digest.hexdigest()}
+
+        # File writes stay on this task: cancellation cannot leave a writer thread
+        # racing with unlink. Remove only a file this call successfully created.
+        try:
+            async with asyncio.timeout(self.timeout):
+                if self._client is not None:
+                    return await receive(self._client)
+                async with httpx.AsyncClient(
+                    timeout=self.timeout, follow_redirects=False
+                ) as client:
+                    return await receive(client)
+        except BaseException:
+            if created:
+                # Cleanup must finish even when the task has been cancelled.
+                destination.unlink(missing_ok=True)  # noqa: ASYNC240
+            raise
+
     async def download(self, output: dict) -> bytes:
         params = {
             "filename": self._media_name(output["filename"]),
@@ -284,7 +399,12 @@ class ComfyAdapter:
             async with client.stream("GET", f"{self.base_url}/view", params=params) as response:
                 response.raise_for_status()
                 data = bytearray()
-                async for chunk in response.aiter_bytes():
+                declared = response.headers.get("content-length")
+                if declared and int(declared) > self.max_download_bytes:
+                    raise ComfyError(
+                        "Generated output exceeds size limit", "COMFY_OUTPUT_TOO_LARGE"
+                    )
+                async for chunk in response.aiter_bytes(chunk_size=1024 * 1024):
                     if len(data) + len(chunk) > self.max_download_bytes:
                         raise ComfyError(
                             "Generated output exceeds size limit", "COMFY_OUTPUT_TOO_LARGE"

@@ -4,6 +4,34 @@ import React from "react";
 import Link from "next/link";
 import { Badge } from "./ui/badge";
 import { Inbox } from "lucide-react";
+import { useI18n } from "@/lib/i18n";
+
+export function QueryErrorNotice({
+  title,
+  detail,
+  onRetry,
+  retryLabel = "Thử lại",
+  isRetrying = false,
+}: {
+  title: string;
+  detail: string;
+  onRetry: () => unknown;
+  retryLabel?: string;
+  isRetrying?: boolean;
+}) {
+  const { t } = useI18n();
+  return (
+    <div role="alert" className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-red-500/40 bg-red-500/5 p-4">
+      <div className="min-w-0">
+        <p className="text-sm font-semibold text-[#f1f3f5]">{title}</p>
+        <p className="mt-1 text-xs text-[#9ea5b0]">{detail}</p>
+      </div>
+      <button type="button" className="primary-action text-xs" disabled={isRetrying} onClick={() => { void onRetry(); }}>
+        {isRetrying ? t("Đang thử lại…", "Retrying…") : retryLabel === "Thử lại" ? t(retryLabel, "Retry") : retryLabel}
+      </button>
+    </div>
+  );
+}
 
 export function PageHeader({
   eyebrow,

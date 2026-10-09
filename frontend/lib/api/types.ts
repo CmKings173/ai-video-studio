@@ -83,7 +83,17 @@ export interface ProductPatch extends BrandPatch {
 }
 
 export type VideoKind = "QUICK_CLIP" | "LONG_VIDEO";
-export type AspectRatio = "9:16" | "16:9" | "1:1";
+export type GenerationAspectRatio =
+  | "16:9"
+  | "9:16"
+  | "1:1"
+  | "4:3"
+  | "3:4"
+  | "3:2"
+  | "2:3"
+  | "21:9"
+  | "Custom";
+export type AspectRatio = GenerationAspectRatio;
 
 export interface VideoDTO {
   id: string;
@@ -98,6 +108,7 @@ export interface VideoDTO {
   config: Record<string, unknown>;
   status: string;
   revision: number;
+  /** Latest promoted artifact; semantically current only when status is READY. */
   current_final_video_id: string | null;
   created_at: string;
 }
@@ -143,9 +154,11 @@ export interface SceneDTO {
   negative_prompt: string;
   duration_seconds: number;
   spec: SceneSpec;
+  generation_config: SceneGenerationConfig;
   enabled: boolean;
   revision: number;
   selected_generation_id: string | null;
+  selected_generation_fresh: boolean;
   created_at: string;
 }
 
@@ -155,6 +168,7 @@ export interface SceneCreate {
   negative_prompt?: string;
   duration_seconds?: number;
   spec?: SceneSpec;
+  generation_config?: SceneGenerationConfig;
 }
 
 export interface ScenePatch {
@@ -163,6 +177,7 @@ export interface ScenePatch {
   duration_seconds?: number;
   spec?: SceneSpec;
   enabled?: boolean;
+  generation_config?: SceneGenerationConfig | null;
 }
 
 export interface VideoDetail extends VideoDTO {
@@ -204,6 +219,7 @@ export interface StoryboardPreviewDTO {
 export type AssetRole =
   | "PRODUCT_IMAGE"
   | "PROJECT_REFERENCE"
+  | "SOURCE_VIDEO"
   | "REFERENCE_VIDEO"
   | "REFERENCE_AUDIO"
   | "BACKGROUND_AUDIO";
@@ -242,10 +258,12 @@ export interface AssetDTO {
   width: number | null;
   height: number | null;
   duration_seconds: number | null;
+  media_metadata: Record<string, unknown>;
   created_at: string;
 }
 
 export interface AssetComplete {
+  retry_validation?: boolean;
   checksum_sha256?: string | null;
 }
 
@@ -254,7 +272,215 @@ export interface DownloadDTO {
   expires_in: number;
 }
 
-export type GenerationMode = "t2v" | "i2v" | "i2v_first_last" | "r2v";
+export type GenerationMode = "t2v" | "i2v" | "fl2v" | "i2v_last" | "i2v_first_last" | "r2v" | "v2v" | "rv2v";
+export type QualityProfile = "DRAFT" | "STANDARD" | "HIGH" | "BASE" | "HD" | "FULL_HD_REFINED" | "CUSTOM";
+export type SeedPolicy = "RANDOM" | "FIXED";
+
+export interface MotionContextSettings {
+  enabled: boolean;
+  context_frames?: 5 | 22 | 39 | 56;
+  [key: string]: unknown;
+}
+
+export interface RefineSettings {
+  enabled: boolean;
+  mode?: "refine" | "upscale" | "latent_upscale";
+  upscale_method?: "h3_latent" | "lanczos" | "nvidia_rtx_vsr";
+  passes?: number;
+  seed_mode?: "inherit" | "offset" | "independent";
+  aspect_ratio?: "follow_director";
+  megapixels?: number;
+  width?: number;
+  height?: number;
+  target_width?: number | null;
+  target_height?: number | null;
+  skip_fl2v?: boolean;
+  enable_latent_chunking?: boolean;
+  enable_tiling?: boolean;
+  [key: string]: unknown;
+}
+
+export interface FaceRefineSettings {
+  enabled: boolean;
+  detector?: "face_yolov8m.pt";
+  confidence?: number;
+  crop_factor?: number;
+  canvas_width?: number;
+  canvas_height?: number;
+  canvas_mode?: "manual" | "auto_capped_768";
+  select?: "largest_face" | "centre_most";
+  denoise?: number;
+  steps?: number;
+  seed_mode?: "inherit" | "offset";
+  paste_region?: "face_only" | "full_crop";
+  mask_dilation?: number;
+  feather?: number;
+  colour_match?: number;
+  blend?: number;
+  [key: string]: unknown;
+}
+
+export interface DirectorAudioSettings {
+  enabled: boolean;
+  preserve_native_audio?: boolean;
+  [key: string]: unknown;
+}
+
+export interface DirectorAudioPolicy {
+  mode: "generate" | "source" | "mute";
+  preserve_source_audio?: boolean;
+}
+
+export interface FrozenDirectorExecutionSpec {
+  schema_version: number;
+  provider: "minimax_h3_director";
+  provider_version: string;
+  source_repository: string;
+  source_commit: string;
+  task: string;
+  prompt: string;
+  canvas: { width: number; height: number; aspect_ratio: GenerationAspectRatio };
+  seed: number;
+  steps: number;
+  cfg: number;
+  fps: number;
+  frames: number;
+  requested_duration_seconds: number;
+  resolved_duration_seconds: number;
+  motion_context: MotionContextSettings;
+  refine: RefineSettings;
+  face_refine: FaceRefineSettings;
+  audio_policy: DirectorAudioPolicy;
+  assets: GenerationInputAssetSnapshot[];
+  execution_hash: string;
+}
+
+export interface DirectorExecutionSpec {
+  schema_version?: number;
+  provider?: {
+    id?: string;
+    repository?: string;
+    commit?: string;
+    comfyui_version?: string;
+    release_qualification_id?: string;
+    workflow_graph_hash?: string;
+    slot_contract_hash?: string;
+    [key: string]: unknown;
+  };
+  intent?: {
+    business_mode?: GenerationMode | string;
+    director_task?: string;
+    accepted_prompt?: string;
+    effective_prompt_metadata?: Record<string, unknown>;
+    [key: string]: unknown;
+  };
+  generation?: {
+    width?: number;
+    height?: number;
+    fps?: number;
+    frame_count?: number;
+    duration_seconds?: number;
+    seed?: number;
+    steps?: number;
+    cfg?: number;
+    [key: string]: unknown;
+  };
+  inputs?: Array<{
+    role?: string;
+    asset_id?: string;
+    ordinal?: number;
+    [key: string]: unknown;
+  }>;
+  continuity?: MotionContextSettings & { mode?: string; hard_cut_boundaries?: number[] };
+  audio?: DirectorAudioSettings | Record<string, unknown>;
+  refine?: RefineSettings | Record<string, unknown>;
+  face_refine?: FaceRefineSettings | Record<string, unknown>;
+  [key: string]: unknown;
+}
+
+export interface SceneGenerationConfig {
+  mode?: GenerationMode | "AUTO";
+  quality_profile?: QualityProfile;
+  aspect_ratio?: GenerationAspectRatio | null;
+  seed_policy?: SeedPolicy;
+  seed?: number | null;
+  first_frame_asset_id?: string | null;
+  last_frame_asset_id?: string | null;
+  source_video_asset_id?: string | null;
+  reference_image_asset_ids?: string[];
+  reference_video_asset_ids?: string[];
+  reference_audio_asset_ids?: string[];
+  width?: number | null;
+  height?: number | null;
+  cfg?: number;
+  fps?: 24;
+  frames?: number;
+  audio_policy?: DirectorAudioPolicy;
+  motion_context?: MotionContextSettings;
+  refine?: RefineSettings;
+  face_refine?: FaceRefineSettings;
+  audio?: DirectorAudioSettings;
+}
+
+export interface GenerationCapability {
+  workflow_id: string;
+  mode: GenerationMode;
+  quality_profile: QualityProfile;
+  aspect_ratio: GenerationAspectRatio;
+  resolved_width: number;
+  resolved_height: number;
+  steps: number;
+  fps: number;
+  workflow_version: string;
+  workflow_hash: string;
+  required_asset_slots: string[];
+  max_reference_images: number;
+  max_reference_videos: number;
+  max_reference_audio: number;
+  max_total_reference_files: number;
+  clip_min_seconds: number;
+  clip_max_seconds: number;
+  category_total_max_seconds: number;
+  reference_video_fps: number;
+  audio_requires_visual_reference: boolean;
+  task?: string;
+  provider?: string;
+  supports_source_video?: boolean;
+  execution_scope?: "single_scene" | "aggregate";
+  supports_motion_context?: boolean;
+  supports_refine?: boolean;
+  supports_face_refine?: boolean;
+  supports_audio?: boolean;
+  audio_modes?: Array<"generate" | "source" | "mute">;
+  director_settings?: Array<Pick<SceneGenerationConfig, "motion_context" | "refine" | "face_refine" | "audio_policy">>;
+}
+
+export interface GenerationSourceCapabilities {
+  tasks?: Array<"t2v" | "i2v" | "fl2v" | "r2v" | "v2v" | "rv2v">;
+  ratios?: GenerationAspectRatio[];
+  custom_canvas?: { min: number; max: number; multiple: number };
+  reference_limits?: { images?: number; videos?: number; audio?: number; total?: number };
+  supports?: {
+    source_video: boolean;
+    first_frame: boolean;
+    last_frame: boolean;
+    motion_context: boolean;
+    refine: boolean;
+    face_refine: boolean;
+    audio: boolean;
+  };
+  file_types?: { image?: string[]; video?: string[]; audio?: string[] };
+  quality_profiles?: string[];
+  [key: string]: unknown;
+}
+
+export interface GenerationCapabilitiesDTO {
+  available: boolean;
+  combinations?: GenerationCapability[];
+  source_capabilities?: GenerationSourceCapabilities;
+  qualified_capabilities?: GenerationCapability[] | { combinations?: GenerationCapability[]; [key: string]: unknown };
+  disabled: { workflow_id: string; mode: string; quality_profile: string; reason: string; code: string }[];
+}
 export type GenerationOperation = "ORIGINAL" | "REGENERATE" | "VARIATION";
 export type GenerationStatus =
   | "CREATED"
@@ -270,6 +496,7 @@ export type GenerationStatus =
 export type GenerationInputAssetRole =
   | "FIRST_FRAME"
   | "LAST_FRAME"
+  | "SOURCE_VIDEO"
   | "REFERENCE_IMAGE"
   | "REFERENCE_AUDIO"
   | "REFERENCE_VIDEO";
@@ -301,17 +528,44 @@ export interface GenerationInputSnapshot {
   frames?: number;
   duration_seconds?: number;
   steps?: number;
+  requested_quality_profile?: string;
+  requested_aspect_ratio?: string;
+  requested_width?: number;
+  requested_height?: number;
+  requested_duration_seconds?: number;
+  requested_fps?: number;
+  requested_frames?: number;
+  resolved_width?: number;
+  resolved_height?: number;
+  resolved_duration_seconds?: number;
+  resolved_fps?: number;
+  resolved_frames?: number;
+  task?: string;
+  provider?: string;
+  provider_version?: string;
+  workflow_version?: string;
+  motion_context?: MotionContextSettings;
+  refine?: RefineSettings;
+  face_refine?: FaceRefineSettings;
+  audio?: DirectorAudioSettings;
+  director_execution_spec?: DirectorExecutionSpec;
+  audio_policy?: DirectorAudioPolicy;
+  director_execution?: FrozenDirectorExecutionSpec;
   assets?: GenerationInputAssetSnapshot[];
   [key: string]: unknown;
 }
 
 export interface GenerationRequest {
   workflow_id?: string | null;
-  mode?: GenerationMode | null;
+  mode?: GenerationMode | "AUTO" | null;
+  quality_profile?: QualityProfile;
+  aspect_ratio?: GenerationAspectRatio;
+  seed_policy?: SeedPolicy;
   operation?: GenerationOperation;
   parent_generation_id?: string | null;
   first_frame_asset_id?: string | null;
   last_frame_asset_id?: string | null;
+  source_video_asset_id?: string | null;
   reference_image_asset_ids?: string[];
   reference_audio_asset_ids?: string[];
   reference_video_asset_ids?: string[];
@@ -322,19 +576,33 @@ export interface GenerationRequest {
   width?: number | null;
   height?: number | null;
   steps?: number;
+  cfg?: number;
+  fps?: 24;
+  frames?: number;
+  audio_policy?: DirectorAudioPolicy;
+  motion_context?: MotionContextSettings;
+  refine?: RefineSettings;
+  face_refine?: FaceRefineSettings;
+  audio?: DirectorAudioSettings;
 }
 
 export interface GenerateAllRequest {
   settings?: GenerationRequest;
   scene_ids?: string[] | null;
+  expected_video_revision?: number;
+  expected_scene_revisions?: Record<string, number>;
 }
 
 export interface VariationRequest {
   parent_generation_id: string;
   workflow_id?: string | null;
-  mode?: GenerationMode | null;
+  mode?: GenerationMode | "AUTO" | null;
+  quality_profile?: QualityProfile;
+  aspect_ratio?: GenerationAspectRatio;
+  seed_policy?: SeedPolicy;
   first_frame_asset_id?: string | null;
   last_frame_asset_id?: string | null;
+  source_video_asset_id?: string | null;
   reference_image_asset_ids?: string[];
   reference_audio_asset_ids?: string[];
   reference_video_asset_ids?: string[];
@@ -345,6 +613,10 @@ export interface VariationRequest {
   width?: number | null;
   height?: number | null;
   steps?: number;
+  motion_context?: MotionContextSettings;
+  refine?: RefineSettings;
+  face_refine?: FaceRefineSettings;
+  audio?: DirectorAudioSettings;
 }
 
 export interface PromptPreviewDTO {
@@ -371,6 +643,7 @@ export interface GenerationDTO {
   progress_total: number | null;
   revision: number;
   input_snapshot: GenerationInputSnapshot;
+  output_metadata: Record<string, unknown>;
   request_id: string | null;
   comfy_prompt_id: string | null;
   output_asset_id: string | null;
@@ -384,7 +657,17 @@ export interface GenerationDTO {
   finished_at: string | null;
 }
 
+export interface ExecutionGroupDTO {
+  execution_scope: "single_scene" | "aggregate";
+  scene_ids: string[];
+  generation_ids: string[];
+  director_run_id: string | null;
+}
+
 export interface BatchGenerationDTO {
+  /** Compatibility only: populated when the batch contains exactly one aggregate run. */
+  director_run_id?: string | null;
+  execution_groups: ExecutionGroupDTO[];
   video_id: string;
   generations: GenerationDTO[];
 }
@@ -403,6 +686,8 @@ export interface GenerationAttemptDTO {
 }
 
 export interface AssemblyRequest {
+  delivery_preset?: "SOCIAL_VERTICAL_1080" | "LANDSCAPE_FHD" | "SQUARE_1080" | "PORTRAIT_4_5" | "PORTRAIT_3_4" | "LANDSCAPE_4_3" | "ULTRAWIDE_2560_1080" | null;
+  fit_mode?: "FIT_PAD" | "CENTER_CROP";
   transition?: "CUT" | "CROSSFADE";
   crossfade_seconds?: number;
   audio_mode?: "KEEP_SCENE_AUDIO" | "MUTE_SCENE_AUDIO";
@@ -491,6 +776,7 @@ export interface ReconciliationDTO {
 }
 
 export interface WorkflowCreate {
+  execution_scope?: "single_scene" | "aggregate";
   code: string;
   mode: GenerationMode;
   version: string;
@@ -501,6 +787,7 @@ export interface WorkflowCreate {
 }
 
 export interface WorkflowDTO extends WorkflowCreate {
+  execution_scope: "single_scene" | "aggregate";
   id: string;
   workflow_hash: string;
   slot_map_hash: string;

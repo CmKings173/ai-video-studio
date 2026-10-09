@@ -23,6 +23,9 @@ x-api-image: &api-image
     BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:?BOOTSTRAP_ADMIN_PASSWORD must be set}
     ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:?ALLOWED_ORIGINS must be set}
     METRICS_TOKEN: ${METRICS_TOKEN:?METRICS_TOKEN must be set}
+    INTERNAL_PROXY_TOKEN: ${INTERNAL_PROXY_TOKEN:-}
+    STUDIO_INGRESS_TOKEN: ${STUDIO_INGRESS_TOKEN:-}
+    REQUEST_BODY_MAX_BYTES: ${REQUEST_BODY_MAX_BYTES:-2097152}
     BACKUP_RPO_HOURS: ${BACKUP_RPO_HOURS:-24}
     BACKUP_RTO_HOURS: ${BACKUP_RTO_HOURS:-4}
     RETENTION_FAILED_HOURS: ${RETENTION_FAILED_HOURS:-24}
@@ -79,7 +82,7 @@ services:
 
   api:
     <<: *api-image
-    command: ["uvicorn", "apps.api.app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    command: ["uvicorn", "apps.api.app.main:app", "--host", "0.0.0.0", "--port", "8000", "--no-proxy-headers"]
     ports:
       - "127.0.0.1:${API_PORT:-8000}:8000"
     healthcheck:
@@ -101,12 +104,31 @@ services:
         required: false
     environment:
       API_BACKEND_URL: http://api:8000
+      APP_ENV: ${APP_ENV:-development}
+      STUDIO_INGRESS_TOKEN: ${STUDIO_INGRESS_TOKEN:-}
+      INTERNAL_PROXY_TOKEN: ${INTERNAL_PROXY_TOKEN:-}
+      REQUEST_BODY_MAX_BYTES: ${REQUEST_BODY_MAX_BYTES:-2097152}
       NEXT_TELEMETRY_DISABLED: "1"
+      PROXY_REQUEST_BODY_TIMEOUT_MS: ${PROXY_REQUEST_BODY_TIMEOUT_MS:-60000}
     ports:
       - "127.0.0.1:${FRONTEND_PORT:-3000}:3000"
     depends_on:
       api:
         condition: service_healthy
+    restart: unless-stopped
+
+  ingress:
+    image: nginx:stable-alpine
+    environment:
+      STUDIO_INGRESS_TOKEN: ${STUDIO_INGRESS_TOKEN:-}
+      REQUEST_BODY_MAX_BYTES: ${REQUEST_BODY_MAX_BYTES:-2097152}
+      NGINX_ENVSUBST_FILTER: ^(STUDIO_INGRESS_TOKEN|REQUEST_BODY_MAX_BYTES)$$
+    volumes:
+      - ./ingress/default.conf.template:/etc/nginx/templates/default.conf.template:ro
+    ports:
+      - "127.0.0.1:${INGRESS_PORT:-8080}:8080"
+    depends_on:
+      - frontend
     restart: unless-stopped
 
   dispatcher:
@@ -121,6 +143,15 @@ services:
   assembler:
     <<: *api-image
     command: ["python", "-m", "workers.assembler"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      minio:
+        condition: service_healthy
+
+  asset-validator:
+    <<: *api-image
+    command: ["python", "-m", "workers.asset_validation"]
     depends_on:
       migrate:
         condition: service_completed_successfully

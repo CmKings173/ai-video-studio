@@ -1,4 +1,5 @@
 import { apiClient } from "./client";
+import { paginationParams } from "./pagination";
 import type { BrandCreate, BrandDTO, BrandPatch, Page } from "./types";
 
 export type ListBrandsParams = {
@@ -9,7 +10,7 @@ export type ListBrandsParams = {
 };
 
 export async function listBrands(params?: ListBrandsParams): Promise<Page<BrandDTO>> {
-  return apiClient.get<Page<BrandDTO>>("/api/v1/brands", { params });
+  return apiClient.get<Page<BrandDTO>>("/api/v1/brands", { params: paginationParams(params) });
 }
 
 export async function createBrand(payload: BrandCreate): Promise<BrandDTO> {

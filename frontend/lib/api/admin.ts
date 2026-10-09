@@ -1,4 +1,5 @@
 import { apiClient } from "./client";
+import { paginationParams } from "./pagination";
 import type {
   CleanupRequest,
   CleanupResultDTO,
@@ -15,7 +16,7 @@ import type {
 } from "./types";
 
 export async function listUsers(params?: { page?: number; size?: number }): Promise<Page<UserDTO>> {
-  return apiClient.get<Page<UserDTO>>("/api/v1/admin/users", { params });
+  return apiClient.get<Page<UserDTO>>("/api/v1/admin/users", { params: paginationParams(params) });
 }
 
 export async function createUser(payload: UserCreateRequest): Promise<UserDTO> {
@@ -30,7 +31,7 @@ export async function listWorkflows(params?: {
   page?: number;
   size?: number;
 }): Promise<Page<WorkflowDTO>> {
-  return apiClient.get<Page<WorkflowDTO>>("/api/v1/admin/workflows", { params });
+  return apiClient.get<Page<WorkflowDTO>>("/api/v1/admin/workflows", { params: paginationParams(params) });
 }
 
 export async function createWorkflow(payload: WorkflowCreate): Promise<WorkflowDTO> {

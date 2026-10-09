@@ -5,6 +5,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from apps.api.app.api.deps import AuthContext, auth_context, current_user, require_csrf
+from apps.api.app.core.client_identity import login_client_host
 from apps.api.app.core.config import Settings, get_settings
 from apps.api.app.core.errors import AppError
 from apps.api.app.core.login_throttle import login_throttle
@@ -27,7 +28,7 @@ async def login(
 ) -> LoginDTO:
     await session.execute(delete(AuthSession).where(AuthSession.expires_at <= utcnow()))
     email = payload.email.strip().lower()
-    client_host = request.client.host if request.client else "unknown"
+    client_host = login_client_host(request, settings)
     throttle_keys = (
         f"ip:{client_host}",
         f"identity:{email}",

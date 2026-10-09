@@ -33,6 +33,11 @@ class Settings(BaseSettings):
     max_pending_prompts: int = Field(default=1, ge=1, le=1)
     min_free_disk_bytes: int = Field(default=5 * 1024**3, ge=0)
     max_upload_bytes: int = Field(default=500 * 1024**2, ge=1)
+    # Independent, bounded in-memory output paths; not an upload entitlement.
+    max_generated_output_bytes: int = Field(default=500 * 1024**2, ge=1, le=5 * 1024**3)
+    asset_validation_max_attempts: int = Field(default=3, ge=1, le=10)
+    asset_validation_timeout_seconds: int = Field(default=900, ge=30, le=3600)
+    asset_validation_retry_seconds: int = Field(default=30, ge=1, le=3600)
     max_media_seconds: float = Field(default=600, gt=0)
     llm_base_url: str = ""
     llm_api_key: str = ""
@@ -54,6 +59,8 @@ class Settings(BaseSettings):
     reconciliation_interval_seconds: int = Field(default=300, ge=10, le=86400)
     request_body_max_bytes: int = Field(default=2 * 1024**2, ge=1024)
     metrics_token: str = ""
+    internal_proxy_token: str = ""
+    studio_ingress_token: str = ""
     backup_rpo_hours: int = Field(default=24, ge=1, le=168)
     backup_rto_hours: int = Field(default=4, ge=1, le=72)
     retention_failed_hours: int = Field(default=24, ge=1)
@@ -62,6 +69,13 @@ class Settings(BaseSettings):
     asset_operation_claim_timeout_seconds: int = Field(default=900, ge=60)
     upload_intent_grace_seconds: int = Field(default=900, ge=60)
     backup_status_file: Path | None = None
+
+    @field_validator("internal_proxy_token")
+    @classmethod
+    def proxy_credential(cls, value: str) -> str:
+        if value and (len(value) < 32 or not value.isascii() or value.startswith("replace-with")):
+            raise ValueError("Internal proxy token must be at least 32 ASCII characters")
+        return value
 
     @field_validator("database_url")
     @classmethod
@@ -77,6 +91,16 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def production_defaults(self) -> "Settings":
         if self.app_env.lower() == "production":
+            for name, token in (
+                ("INTERNAL_PROXY_TOKEN", self.internal_proxy_token),
+                ("STUDIO_INGRESS_TOKEN", self.studio_ingress_token),
+            ):
+                if len(token) < 32 or not token.isascii() or token.startswith("replace-with"):
+                    raise ValueError(
+                        f"Production requires a valid {name} trusted ingress credential"
+                    )
+            if self.internal_proxy_token == self.studio_ingress_token:
+                raise ValueError("Production ingress and internal proxy credentials must differ")
             if not self.cookie_secure:
                 raise ValueError("Production requires COOKIE_SECURE=true")
             database = urlsplit(self.database_url)

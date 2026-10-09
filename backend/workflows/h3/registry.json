@@ -2,153 +2,1264 @@
   "schema_version": 1,
   "workflows": [
     {
-      "code": "H3_T2V_STANDARD",
+      "code": "H3_DIRECTOR_T2V_BASE",
       "mode": "t2v",
-      "version": "2026-09-10-reference",
-      "file": "video_minimax_h3_t2v.api.json",
-      "source": "minimax-h3-frontend/resources/workflows_api/video_minimax_h3_t2v.api.json",
+      "execution_scope": "single_scene",
+      "version": "director-a8f57b8e23c4-config-template-v2",
+      "file": "director_t2v.api.json",
+      "quality_profile": "BASE",
+      "auto_approve": false,
       "slots": {
-        "PROMPT": ["104", "prompt"],
-        "SEED": ["15", "noise_seed"],
-        "DURATION": ["111", "value"],
-        "STEPS": ["9", "steps"],
-        "ASPECT_RATIO": ["115", "aspect_ratio"],
-        "OUTPUT_PREFIX": ["92", "filename_prefix"]
+        "PROMPT": [
+          "5",
+          "global_prompt"
+        ],
+        "SEED": [
+          "5",
+          "seed"
+        ],
+        "STEPS": [
+          "5",
+          "steps"
+        ],
+        "WIDTH": [
+          "5",
+          "width"
+        ],
+        "HEIGHT": [
+          "5",
+          "height"
+        ],
+        "FRAMES": [
+          "5",
+          "total_frames"
+        ],
+        "OUTPUT_PREFIX": [
+          "7",
+          "filename_prefix"
+        ]
       },
-      "required_slots": ["PROMPT", "SEED", "DURATION", "STEPS", "ASPECT_RATIO", "OUTPUT_PREFIX"],
+      "required_slots": [],
       "profile": {
-        "canvas_multiple": 32,
-        "max_pixels": 2088960,
-        "fps": 24,
-        "frame_base": 5,
-        "frame_step": 17,
-        "max_reference_images": 0,
-        "max_reference_audio": 0,
-        "max_reference_videos": 0,
-        "output_node": "92",
-        "aspect_ratio_values": {
-          "9:16": "9:16 (Portrait)",
-          "16:9": "16:9 (Widescreen)",
-          "1:1": "1:1 (Square)"
+        "provider": "minimax_h3_director",
+        "provider_source": {
+          "provider": "minimax_h3_director",
+          "repository": "AIMixer/ComfyUI_MiniMaxH3_Director",
+          "commit": "a8f57b8e23c46ee28fdb96796510fa7b4f3b1fbb",
+          "license": "Apache-2.0",
+          "pipeline_id": "minimax_h3_motion_context_v9"
         },
-        "provenance": "minimax-h3-frontend/resources/workflows_api/video_minimax_h3_t2v.api.json",
-        "poc_verified": false
-      },
-      "auto_approve": false
+        "source_example": "minimax_h3_director_t2v.json",
+        "source_example_sha256": "80cbdf926249344fdfd29e9294881981e3ed2099881960a851f16f436ae9455c",
+        "config_source_example": "minimax_h3_director_\u4e8c\u91c7_\u52a0\u901f.json",
+        "config_source_example_sha256": "8f928ac4005ab289a25ae809bccf5374bb9d4301d6d12f0d4e76f12cca93ab2a",
+        "feature_states": {
+          "refine": {
+            "source_supported": true,
+            "graph_wired": true,
+            "statically_valid": true,
+            "runtime_qualified": false,
+            "advertised": false
+          },
+          "face_refine": {
+            "source_supported": true,
+            "graph_wired": true,
+            "statically_valid": true,
+            "runtime_qualified": false,
+            "advertised": false
+          }
+        },
+        "quality_profile": "BASE",
+        "steps": 25,
+        "fps": 24,
+        "cfg": 1.0,
+        "sampler": "res_multistep",
+        "scheduler": "simple",
+        "turbo": false,
+        "resolution": {
+          "kind": "explicit_slots",
+          "canvases": {
+            "16:9": [
+              864,
+              480
+            ]
+          }
+        },
+        "duration_resolver": {
+          "kind": "director_frames"
+        },
+        "output_node": "7",
+        "output_artifacts": [
+          {
+            "role": "final",
+            "node_id": "7",
+            "required": true
+          }
+        ],
+        "workflow_hash": "3a06b1fb1743509734d6d2c5c5c2a43c7b43cf4aa396e56599bede9b93f7aa43",
+        "slot_map_hash": "9b4ed217a2bc0d35ad62e98b8e717056a429cc2040a523dc494484e194cf64f0",
+        "dependency_versions": {},
+        "weight_hashes": {},
+        "poc_verified": false,
+        "qualification_status": "SOURCE_TEMPLATE_ONLY"
+      }
     },
     {
-      "code": "H3_I2V_STANDARD",
+      "code": "H3_DIRECTOR_I2V_BASE",
       "mode": "i2v",
-      "version": "2026-09-10-reference",
-      "file": "video_minimax_h3_i2v.api.json",
-      "source": "minimax-h3-frontend/resources/workflows_api/video_minimax_h3_i2v.api.json",
+      "execution_scope": "single_scene",
+      "version": "director-a8f57b8e23c4-config-template-v2",
+      "file": "director_i2v.api.json",
+      "quality_profile": "BASE",
+      "auto_approve": false,
       "slots": {
-        "PROMPT": ["104", "prompt"],
-        "SEED": ["15", "noise_seed"],
-        "DURATION": ["111", "value"],
-        "STEPS": ["9", "steps"],
-        "ASPECT_RATIO": ["115", "aspect_ratio"],
-        "OUTPUT_PREFIX": ["92", "filename_prefix"],
-        "FIRST_FRAME": ["114", "image"]
+        "PROMPT": [
+          "5",
+          "global_prompt"
+        ],
+        "SEED": [
+          "5",
+          "seed"
+        ],
+        "STEPS": [
+          "5",
+          "steps"
+        ],
+        "WIDTH": [
+          "5",
+          "width"
+        ],
+        "HEIGHT": [
+          "5",
+          "height"
+        ],
+        "FRAMES": [
+          "5",
+          "total_frames"
+        ],
+        "OUTPUT_PREFIX": [
+          "7",
+          "filename_prefix"
+        ]
       },
-      "required_slots": ["PROMPT", "SEED", "DURATION", "STEPS", "ASPECT_RATIO", "OUTPUT_PREFIX", "FIRST_FRAME"],
+      "required_slots": [],
       "profile": {
-        "canvas_multiple": 32,
-        "max_pixels": 2088960,
-        "fps": 24,
-        "frame_base": 5,
-        "frame_step": 17,
-        "max_reference_images": 0,
-        "max_reference_audio": 0,
-        "max_reference_videos": 0,
-        "output_node": "92",
-        "aspect_ratio_values": {
-          "9:16": "9:16 (Portrait)",
-          "16:9": "16:9 (Widescreen)",
-          "1:1": "1:1 (Square)"
+        "provider": "minimax_h3_director",
+        "provider_source": {
+          "provider": "minimax_h3_director",
+          "repository": "AIMixer/ComfyUI_MiniMaxH3_Director",
+          "commit": "a8f57b8e23c46ee28fdb96796510fa7b4f3b1fbb",
+          "license": "Apache-2.0",
+          "pipeline_id": "minimax_h3_motion_context_v9"
         },
-        "provenance": "minimax-h3-frontend/resources/workflows_api/video_minimax_h3_i2v.api.json",
-        "poc_verified": false
-      },
-      "auto_approve": false
+        "source_example": "minimax_h3_director_fl2v.json",
+        "source_example_sha256": "4ca62c90726c480a2f20e35bfb41ce44d5b231299152bfff0c041819882245c0",
+        "config_source_example": "minimax_h3_director_\u4e8c\u91c7_\u52a0\u901f.json",
+        "config_source_example_sha256": "8f928ac4005ab289a25ae809bccf5374bb9d4301d6d12f0d4e76f12cca93ab2a",
+        "feature_states": {
+          "refine": {
+            "source_supported": true,
+            "graph_wired": true,
+            "statically_valid": true,
+            "runtime_qualified": false,
+            "advertised": false
+          },
+          "face_refine": {
+            "source_supported": true,
+            "graph_wired": true,
+            "statically_valid": true,
+            "runtime_qualified": false,
+            "advertised": false
+          }
+        },
+        "quality_profile": "BASE",
+        "steps": 25,
+        "fps": 24,
+        "cfg": 1.0,
+        "sampler": "res_multistep",
+        "scheduler": "simple",
+        "turbo": false,
+        "resolution": {
+          "kind": "explicit_slots",
+          "canvases": {
+            "16:9": [
+              864,
+              480
+            ]
+          }
+        },
+        "duration_resolver": {
+          "kind": "director_frames"
+        },
+        "output_node": "7",
+        "output_artifacts": [
+          {
+            "role": "final",
+            "node_id": "7",
+            "required": true
+          }
+        ],
+        "workflow_hash": "dafada9d9095f8ae3e11bf7ca8185b0ddafe92d073d90c849be352a3181d7505",
+        "slot_map_hash": "9b4ed217a2bc0d35ad62e98b8e717056a429cc2040a523dc494484e194cf64f0",
+        "dependency_versions": {},
+        "weight_hashes": {},
+        "poc_verified": false,
+        "qualification_status": "SOURCE_TEMPLATE_ONLY"
+      }
     },
     {
-      "code": "H3_FIRST_LAST_STANDARD",
-      "mode": "i2v_first_last",
-      "version": "2026-09-10-reference",
-      "file": "video_minimax_h3_i2v.api.json",
-      "source": "minimax-h3-frontend/resources/workflows_api/video_minimax_h3_i2v.api.json",
-      "derive": {
-        "type": "first_last",
-        "loader_node": "116",
-        "target_node": "104"
-      },
+      "code": "H3_DIRECTOR_FL2V_BASE",
+      "mode": "fl2v",
+      "execution_scope": "single_scene",
+      "version": "director-a8f57b8e23c4-config-template-v2",
+      "file": "director_fl2v.api.json",
+      "quality_profile": "BASE",
+      "auto_approve": false,
       "slots": {
-        "PROMPT": ["104", "prompt"],
-        "SEED": ["15", "noise_seed"],
-        "DURATION": ["111", "value"],
-        "STEPS": ["9", "steps"],
-        "ASPECT_RATIO": ["115", "aspect_ratio"],
-        "OUTPUT_PREFIX": ["92", "filename_prefix"],
-        "FIRST_FRAME": ["114", "image"],
-        "LAST_FRAME": ["116", "image"]
+        "PROMPT": [
+          "5",
+          "global_prompt"
+        ],
+        "SEED": [
+          "5",
+          "seed"
+        ],
+        "STEPS": [
+          "5",
+          "steps"
+        ],
+        "WIDTH": [
+          "5",
+          "width"
+        ],
+        "HEIGHT": [
+          "5",
+          "height"
+        ],
+        "FRAMES": [
+          "5",
+          "total_frames"
+        ],
+        "OUTPUT_PREFIX": [
+          "7",
+          "filename_prefix"
+        ]
       },
-      "required_slots": ["PROMPT", "SEED", "DURATION", "STEPS", "ASPECT_RATIO", "OUTPUT_PREFIX", "FIRST_FRAME", "LAST_FRAME"],
+      "required_slots": [],
       "profile": {
-        "canvas_multiple": 32,
-        "max_pixels": 2088960,
-        "fps": 24,
-        "frame_base": 5,
-        "frame_step": 17,
-        "max_reference_images": 0,
-        "max_reference_audio": 0,
-        "max_reference_videos": 0,
-        "output_node": "92",
-        "aspect_ratio_values": {
-          "9:16": "9:16 (Portrait)",
-          "16:9": "16:9 (Widescreen)",
-          "1:1": "1:1 (Square)"
+        "provider": "minimax_h3_director",
+        "provider_source": {
+          "provider": "minimax_h3_director",
+          "repository": "AIMixer/ComfyUI_MiniMaxH3_Director",
+          "commit": "a8f57b8e23c46ee28fdb96796510fa7b4f3b1fbb",
+          "license": "Apache-2.0",
+          "pipeline_id": "minimax_h3_motion_context_v9"
         },
-        "provenance": "derived from minimax-h3-frontend i2v API workflow",
-        "poc_verified": false
-      },
-      "auto_approve": false
+        "source_example": "minimax_h3_director_fl2v.json",
+        "source_example_sha256": "4ca62c90726c480a2f20e35bfb41ce44d5b231299152bfff0c041819882245c0",
+        "config_source_example": "minimax_h3_director_\u4e8c\u91c7_\u52a0\u901f.json",
+        "config_source_example_sha256": "8f928ac4005ab289a25ae809bccf5374bb9d4301d6d12f0d4e76f12cca93ab2a",
+        "feature_states": {
+          "refine": {
+            "source_supported": true,
+            "graph_wired": true,
+            "statically_valid": true,
+            "runtime_qualified": false,
+            "advertised": false
+          },
+          "face_refine": {
+            "source_supported": true,
+            "graph_wired": true,
+            "statically_valid": true,
+            "runtime_qualified": false,
+            "advertised": false
+          }
+        },
+        "quality_profile": "BASE",
+        "steps": 25,
+        "fps": 24,
+        "cfg": 1.0,
+        "sampler": "res_multistep",
+        "scheduler": "simple",
+        "turbo": false,
+        "resolution": {
+          "kind": "explicit_slots",
+          "canvases": {
+            "16:9": [
+              864,
+              480
+            ]
+          }
+        },
+        "duration_resolver": {
+          "kind": "director_frames"
+        },
+        "output_node": "7",
+        "output_artifacts": [
+          {
+            "role": "final",
+            "node_id": "7",
+            "required": true
+          }
+        ],
+        "workflow_hash": "d72ee4262f27bc1ecb33ea47b3f0d9b37012de6c6e67679e5ff802b2b5929d36",
+        "slot_map_hash": "9b4ed217a2bc0d35ad62e98b8e717056a429cc2040a523dc494484e194cf64f0",
+        "dependency_versions": {},
+        "weight_hashes": {},
+        "poc_verified": false,
+        "qualification_status": "SOURCE_TEMPLATE_ONLY"
+      }
     },
     {
-      "code": "H3_R2V_1_IMAGE_REFERENCE",
+      "code": "H3_DIRECTOR_R2V_BASE",
       "mode": "r2v",
-      "version": "2026-09-10-reference",
-      "file": "video_minimax_h3_r2v_1ref.api.json",
-      "source": "Calliope/example_ComfyUI_workflows/video_minimax_h3_r2v_API.json",
+      "execution_scope": "single_scene",
+      "version": "director-a8f57b8e23c4-config-template-v2",
+      "file": "director_r2v.api.json",
+      "quality_profile": "BASE",
+      "auto_approve": false,
       "slots": {
-        "PROMPT": ["138", "value"],
-        "SEED": ["171", "noise_seed"],
-        "DURATION": ["132", "value"],
-        "STEPS": ["170", "steps"],
-        "ASPECT_RATIO": ["115", "aspect_ratio"],
-        "OUTPUT_PREFIX": ["176", "filename_prefix"],
-        "REFERENCE_IMAGE_1": ["148", "image"]
+        "PROMPT": [
+          "5",
+          "global_prompt"
+        ],
+        "SEED": [
+          "5",
+          "seed"
+        ],
+        "STEPS": [
+          "5",
+          "steps"
+        ],
+        "WIDTH": [
+          "5",
+          "width"
+        ],
+        "HEIGHT": [
+          "5",
+          "height"
+        ],
+        "FRAMES": [
+          "5",
+          "total_frames"
+        ],
+        "OUTPUT_PREFIX": [
+          "7",
+          "filename_prefix"
+        ]
       },
-      "required_slots": ["PROMPT", "SEED", "DURATION", "STEPS", "ASPECT_RATIO", "OUTPUT_PREFIX", "REFERENCE_IMAGE_1"],
+      "required_slots": [],
       "profile": {
-        "canvas_multiple": 32,
-        "max_pixels": 2088960,
-        "fps": 24,
-        "frame_base": 5,
-        "frame_step": 17,
-        "max_reference_images": 1,
-        "max_reference_audio": 0,
-        "max_reference_videos": 0,
-        "output_node": "176",
-        "aspect_ratio_values": {
-          "9:16": "9:16 (Portrait)",
-          "16:9": "16:9 (Widescreen)",
-          "1:1": "1:1 (Square)"
+        "provider": "minimax_h3_director",
+        "provider_source": {
+          "provider": "minimax_h3_director",
+          "repository": "AIMixer/ComfyUI_MiniMaxH3_Director",
+          "commit": "a8f57b8e23c46ee28fdb96796510fa7b4f3b1fbb",
+          "license": "Apache-2.0",
+          "pipeline_id": "minimax_h3_motion_context_v9"
         },
-        "provenance": "Calliope/example_ComfyUI_workflows/video_minimax_h3_r2v_API.json",
-        "poc_verified": false
+        "source_example": "minimax_h3_director_r2v.json",
+        "source_example_sha256": "060403fa0d99cf1ff763575c78c6d03444a5104e28a26be8156db209dec61eae",
+        "config_source_example": "minimax_h3_director_\u4e8c\u91c7_\u52a0\u901f.json",
+        "config_source_example_sha256": "8f928ac4005ab289a25ae809bccf5374bb9d4301d6d12f0d4e76f12cca93ab2a",
+        "feature_states": {
+          "refine": {
+            "source_supported": true,
+            "graph_wired": true,
+            "statically_valid": true,
+            "runtime_qualified": false,
+            "advertised": false
+          },
+          "face_refine": {
+            "source_supported": true,
+            "graph_wired": true,
+            "statically_valid": true,
+            "runtime_qualified": false,
+            "advertised": false
+          }
+        },
+        "quality_profile": "BASE",
+        "steps": 25,
+        "fps": 24,
+        "cfg": 1.0,
+        "sampler": "res_multistep",
+        "scheduler": "simple",
+        "turbo": false,
+        "resolution": {
+          "kind": "explicit_slots",
+          "canvases": {
+            "16:9": [
+              864,
+              480
+            ]
+          }
+        },
+        "duration_resolver": {
+          "kind": "director_frames"
+        },
+        "output_node": "7",
+        "output_artifacts": [
+          {
+            "role": "final",
+            "node_id": "7",
+            "required": true
+          }
+        ],
+        "workflow_hash": "639b50714feebdcb16133532a3472c045b1997e5e34416f4125e138ff5932b47",
+        "slot_map_hash": "9b4ed217a2bc0d35ad62e98b8e717056a429cc2040a523dc494484e194cf64f0",
+        "dependency_versions": {},
+        "weight_hashes": {},
+        "poc_verified": false,
+        "qualification_status": "SOURCE_TEMPLATE_ONLY"
+      }
+    },
+    {
+      "code": "H3_DIRECTOR_V2V_BASE",
+      "mode": "v2v",
+      "execution_scope": "single_scene",
+      "version": "director-a8f57b8e23c4-config-template-v2",
+      "file": "director_v2v.api.json",
+      "quality_profile": "BASE",
+      "auto_approve": false,
+      "slots": {
+        "PROMPT": [
+          "5",
+          "global_prompt"
+        ],
+        "SEED": [
+          "5",
+          "seed"
+        ],
+        "STEPS": [
+          "5",
+          "steps"
+        ],
+        "WIDTH": [
+          "5",
+          "width"
+        ],
+        "HEIGHT": [
+          "5",
+          "height"
+        ],
+        "FRAMES": [
+          "5",
+          "total_frames"
+        ],
+        "OUTPUT_PREFIX": [
+          "7",
+          "filename_prefix"
+        ]
       },
-      "auto_approve": false
+      "required_slots": [],
+      "profile": {
+        "provider": "minimax_h3_director",
+        "provider_source": {
+          "provider": "minimax_h3_director",
+          "repository": "AIMixer/ComfyUI_MiniMaxH3_Director",
+          "commit": "a8f57b8e23c46ee28fdb96796510fa7b4f3b1fbb",
+          "license": "Apache-2.0",
+          "pipeline_id": "minimax_h3_motion_context_v9"
+        },
+        "source_example": "minimax_h3_director_v2v.json",
+        "source_example_sha256": "41e2f44ad5a53bbe34da444b9b7d4cd4838d57b543a270cc27b0cb00eac64fb3",
+        "config_source_example": "minimax_h3_director_\u4e8c\u91c7_\u52a0\u901f.json",
+        "config_source_example_sha256": "8f928ac4005ab289a25ae809bccf5374bb9d4301d6d12f0d4e76f12cca93ab2a",
+        "feature_states": {
+          "refine": {
+            "source_supported": true,
+            "graph_wired": true,
+            "statically_valid": true,
+            "runtime_qualified": false,
+            "advertised": false
+          },
+          "face_refine": {
+            "source_supported": true,
+            "graph_wired": true,
+            "statically_valid": true,
+            "runtime_qualified": false,
+            "advertised": false
+          }
+        },
+        "quality_profile": "BASE",
+        "steps": 25,
+        "fps": 24,
+        "cfg": 1.0,
+        "sampler": "res_multistep",
+        "scheduler": "simple",
+        "turbo": false,
+        "resolution": {
+          "kind": "explicit_slots",
+          "canvases": {
+            "16:9": [
+              864,
+              480
+            ]
+          }
+        },
+        "duration_resolver": {
+          "kind": "director_frames"
+        },
+        "output_node": "7",
+        "output_artifacts": [
+          {
+            "role": "final",
+            "node_id": "7",
+            "required": true
+          }
+        ],
+        "workflow_hash": "9f844f435cceeb3fb455478242c6277c1ab696b9b95d2c467617635f17026f2f",
+        "slot_map_hash": "9b4ed217a2bc0d35ad62e98b8e717056a429cc2040a523dc494484e194cf64f0",
+        "dependency_versions": {},
+        "weight_hashes": {},
+        "poc_verified": false,
+        "qualification_status": "SOURCE_TEMPLATE_ONLY"
+      }
+    },
+    {
+      "code": "H3_DIRECTOR_RV2V_BASE",
+      "mode": "rv2v",
+      "execution_scope": "single_scene",
+      "version": "director-a8f57b8e23c4-config-template-v2",
+      "file": "director_rv2v.api.json",
+      "quality_profile": "BASE",
+      "auto_approve": false,
+      "slots": {
+        "PROMPT": [
+          "5",
+          "global_prompt"
+        ],
+        "SEED": [
+          "5",
+          "seed"
+        ],
+        "STEPS": [
+          "5",
+          "steps"
+        ],
+        "WIDTH": [
+          "5",
+          "width"
+        ],
+        "HEIGHT": [
+          "5",
+          "height"
+        ],
+        "FRAMES": [
+          "5",
+          "total_frames"
+        ],
+        "OUTPUT_PREFIX": [
+          "7",
+          "filename_prefix"
+        ]
+      },
+      "required_slots": [],
+      "profile": {
+        "provider": "minimax_h3_director",
+        "provider_source": {
+          "provider": "minimax_h3_director",
+          "repository": "AIMixer/ComfyUI_MiniMaxH3_Director",
+          "commit": "a8f57b8e23c46ee28fdb96796510fa7b4f3b1fbb",
+          "license": "Apache-2.0",
+          "pipeline_id": "minimax_h3_motion_context_v9"
+        },
+        "source_example": "minimax_h3_director_rv2v.json",
+        "source_example_sha256": "772957fe9ef71d8d0361228f518ca593bbb5cc4f613c2b01216a91a00516b771",
+        "config_source_example": "minimax_h3_director_\u4e8c\u91c7_\u52a0\u901f.json",
+        "config_source_example_sha256": "8f928ac4005ab289a25ae809bccf5374bb9d4301d6d12f0d4e76f12cca93ab2a",
+        "feature_states": {
+          "refine": {
+            "source_supported": true,
+            "graph_wired": true,
+            "statically_valid": true,
+            "runtime_qualified": false,
+            "advertised": false
+          },
+          "face_refine": {
+            "source_supported": true,
+            "graph_wired": true,
+            "statically_valid": true,
+            "runtime_qualified": false,
+            "advertised": false
+          }
+        },
+        "quality_profile": "BASE",
+        "steps": 25,
+        "fps": 24,
+        "cfg": 1.0,
+        "sampler": "res_multistep",
+        "scheduler": "simple",
+        "turbo": false,
+        "resolution": {
+          "kind": "explicit_slots",
+          "canvases": {
+            "16:9": [
+              864,
+              480
+            ]
+          }
+        },
+        "duration_resolver": {
+          "kind": "director_frames"
+        },
+        "output_node": "7",
+        "output_artifacts": [
+          {
+            "role": "final",
+            "node_id": "7",
+            "required": true
+          }
+        ],
+        "workflow_hash": "0d173222b53b5ca756f21a9bb8983b227a2a62401bc437cefbf7d8469d020353",
+        "slot_map_hash": "9b4ed217a2bc0d35ad62e98b8e717056a429cc2040a523dc494484e194cf64f0",
+        "dependency_versions": {},
+        "weight_hashes": {},
+        "poc_verified": false,
+        "qualification_status": "SOURCE_TEMPLATE_ONLY"
+      }
+    },
+    {
+      "code": "H3_DIRECTOR_T2V_BASE_AGGREGATE",
+      "mode": "t2v",
+      "execution_scope": "aggregate",
+      "version": "director-a8f57b8e23c4-config-template-v2-aggregate-dynamic-bridge-v1",
+      "file": "director_t2v_aggregate.api.json",
+      "quality_profile": "BASE",
+      "auto_approve": false,
+      "slots": {
+        "PROMPT": [
+          "5",
+          "global_prompt"
+        ],
+        "SEED": [
+          "5",
+          "seed"
+        ],
+        "STEPS": [
+          "5",
+          "steps"
+        ],
+        "WIDTH": [
+          "5",
+          "width"
+        ],
+        "HEIGHT": [
+          "5",
+          "height"
+        ],
+        "FRAMES": [
+          "5",
+          "total_frames"
+        ],
+        "OUTPUT_PREFIX": [
+          "5",
+          "studio_output_prefix"
+        ]
+      },
+      "required_slots": [],
+      "profile": {
+        "provider": "minimax_h3_director",
+        "provider_source": {
+          "provider": "minimax_h3_director",
+          "repository": "AIMixer/ComfyUI_MiniMaxH3_Director",
+          "commit": "a8f57b8e23c46ee28fdb96796510fa7b4f3b1fbb",
+          "license": "Apache-2.0",
+          "pipeline_id": "minimax_h3_motion_context_v9"
+        },
+        "source_example": "minimax_h3_director_t2v.json",
+        "source_example_sha256": "80cbdf926249344fdfd29e9294881981e3ed2099881960a851f16f436ae9455c",
+        "config_source_example": "minimax_h3_director_\u4e8c\u91c7_\u52a0\u901f.json",
+        "config_source_example_sha256": "8f928ac4005ab289a25ae809bccf5374bb9d4301d6d12f0d4e76f12cca93ab2a",
+        "feature_states": {
+          "refine": {
+            "source_supported": true,
+            "graph_wired": true,
+            "statically_valid": true,
+            "runtime_qualified": false,
+            "advertised": false
+          },
+          "face_refine": {
+            "source_supported": true,
+            "graph_wired": true,
+            "statically_valid": true,
+            "runtime_qualified": false,
+            "advertised": false
+          }
+        },
+        "quality_profile": "BASE",
+        "steps": 25,
+        "fps": 24,
+        "cfg": 1.0,
+        "sampler": "res_multistep",
+        "scheduler": "simple",
+        "turbo": false,
+        "resolution": {
+          "kind": "explicit_slots",
+          "canvases": {
+            "16:9": [
+              864,
+              480
+            ]
+          }
+        },
+        "duration_resolver": {
+          "kind": "director_frames"
+        },
+        "output_node": "5",
+        "output_artifacts": [
+          {
+            "role": "segment",
+            "node_id": "5",
+            "required": true,
+            "coverage": "all_members",
+            "transport": "studio_native_segments_v1"
+          }
+        ],
+        "workflow_hash": "c1afc1ddd048cbdb8d57b13f619b373fc4940b367e4d333dddd6bddb870955cb",
+        "slot_map_hash": "7a7d0847be7ea2113bdf260e57a827da9d239e9b88ef1311f700fe87d9ee684f",
+        "dependency_versions": {},
+        "weight_hashes": {},
+        "poc_verified": false,
+        "qualification_status": "SOURCE_TEMPLATE_ONLY",
+        "export_mode": "segments",
+        "bridge_version": "studio-director-bridge-v1"
+      }
+    },
+    {
+      "code": "H3_DIRECTOR_I2V_BASE_AGGREGATE",
+      "mode": "i2v",
+      "execution_scope": "aggregate",
+      "version": "director-a8f57b8e23c4-config-template-v2-aggregate-dynamic-bridge-v1",
+      "file": "director_i2v_aggregate.api.json",
+      "quality_profile": "BASE",
+      "auto_approve": false,
+      "slots": {
+        "PROMPT": [
+          "5",
+          "global_prompt"
+        ],
+        "SEED": [
+          "5",
+          "seed"
+        ],
+        "STEPS": [
+          "5",
+          "steps"
+        ],
+        "WIDTH": [
+          "5",
+          "width"
+        ],
+        "HEIGHT": [
+          "5",
+          "height"
+        ],
+        "FRAMES": [
+          "5",
+          "total_frames"
+        ],
+        "OUTPUT_PREFIX": [
+          "5",
+          "studio_output_prefix"
+        ]
+      },
+      "required_slots": [],
+      "profile": {
+        "provider": "minimax_h3_director",
+        "provider_source": {
+          "provider": "minimax_h3_director",
+          "repository": "AIMixer/ComfyUI_MiniMaxH3_Director",
+          "commit": "a8f57b8e23c46ee28fdb96796510fa7b4f3b1fbb",
+          "license": "Apache-2.0",
+          "pipeline_id": "minimax_h3_motion_context_v9"
+        },
+        "source_example": "minimax_h3_director_fl2v.json",
+        "source_example_sha256": "4ca62c90726c480a2f20e35bfb41ce44d5b231299152bfff0c041819882245c0",
+        "config_source_example": "minimax_h3_director_\u4e8c\u91c7_\u52a0\u901f.json",
+        "config_source_example_sha256": "8f928ac4005ab289a25ae809bccf5374bb9d4301d6d12f0d4e76f12cca93ab2a",
+        "feature_states": {
+          "refine": {
+            "source_supported": true,
+            "graph_wired": true,
+            "statically_valid": true,
+            "runtime_qualified": false,
+            "advertised": false
+          },
+          "face_refine": {
+            "source_supported": true,
+            "graph_wired": true,
+            "statically_valid": true,
+            "runtime_qualified": false,
+            "advertised": false
+          }
+        },
+        "quality_profile": "BASE",
+        "steps": 25,
+        "fps": 24,
+        "cfg": 1.0,
+        "sampler": "res_multistep",
+        "scheduler": "simple",
+        "turbo": false,
+        "resolution": {
+          "kind": "explicit_slots",
+          "canvases": {
+            "16:9": [
+              864,
+              480
+            ]
+          }
+        },
+        "duration_resolver": {
+          "kind": "director_frames"
+        },
+        "output_node": "5",
+        "output_artifacts": [
+          {
+            "role": "segment",
+            "node_id": "5",
+            "required": true,
+            "coverage": "all_members",
+            "transport": "studio_native_segments_v1"
+          }
+        ],
+        "workflow_hash": "4c8313ab6f50cfda13ee8a24beac8eed1771320a3bdfae5829412305d36d30d9",
+        "slot_map_hash": "7a7d0847be7ea2113bdf260e57a827da9d239e9b88ef1311f700fe87d9ee684f",
+        "dependency_versions": {},
+        "weight_hashes": {},
+        "poc_verified": false,
+        "qualification_status": "SOURCE_TEMPLATE_ONLY",
+        "export_mode": "segments",
+        "bridge_version": "studio-director-bridge-v1"
+      }
+    },
+    {
+      "code": "H3_DIRECTOR_FL2V_BASE_AGGREGATE",
+      "mode": "fl2v",
+      "execution_scope": "aggregate",
+      "version": "director-a8f57b8e23c4-config-template-v2-aggregate-dynamic-bridge-v1",
+      "file": "director_fl2v_aggregate.api.json",
+      "quality_profile": "BASE",
+      "auto_approve": false,
+      "slots": {
+        "PROMPT": [
+          "5",
+          "global_prompt"
+        ],
+        "SEED": [
+          "5",
+          "seed"
+        ],
+        "STEPS": [
+          "5",
+          "steps"
+        ],
+        "WIDTH": [
+          "5",
+          "width"
+        ],
+        "HEIGHT": [
+          "5",
+          "height"
+        ],
+        "FRAMES": [
+          "5",
+          "total_frames"
+        ],
+        "OUTPUT_PREFIX": [
+          "5",
+          "studio_output_prefix"
+        ]
+      },
+      "required_slots": [],
+      "profile": {
+        "provider": "minimax_h3_director",
+        "provider_source": {
+          "provider": "minimax_h3_director",
+          "repository": "AIMixer/ComfyUI_MiniMaxH3_Director",
+          "commit": "a8f57b8e23c46ee28fdb96796510fa7b4f3b1fbb",
+          "license": "Apache-2.0",
+          "pipeline_id": "minimax_h3_motion_context_v9"
+        },
+        "source_example": "minimax_h3_director_fl2v.json",
+        "source_example_sha256": "4ca62c90726c480a2f20e35bfb41ce44d5b231299152bfff0c041819882245c0",
+        "config_source_example": "minimax_h3_director_\u4e8c\u91c7_\u52a0\u901f.json",
+        "config_source_example_sha256": "8f928ac4005ab289a25ae809bccf5374bb9d4301d6d12f0d4e76f12cca93ab2a",
+        "feature_states": {
+          "refine": {
+            "source_supported": true,
+            "graph_wired": true,
+            "statically_valid": true,
+            "runtime_qualified": false,
+            "advertised": false
+          },
+          "face_refine": {
+            "source_supported": true,
+            "graph_wired": true,
+            "statically_valid": true,
+            "runtime_qualified": false,
+            "advertised": false
+          }
+        },
+        "quality_profile": "BASE",
+        "steps": 25,
+        "fps": 24,
+        "cfg": 1.0,
+        "sampler": "res_multistep",
+        "scheduler": "simple",
+        "turbo": false,
+        "resolution": {
+          "kind": "explicit_slots",
+          "canvases": {
+            "16:9": [
+              864,
+              480
+            ]
+          }
+        },
+        "duration_resolver": {
+          "kind": "director_frames"
+        },
+        "output_node": "5",
+        "output_artifacts": [
+          {
+            "role": "segment",
+            "node_id": "5",
+            "required": true,
+            "coverage": "all_members",
+            "transport": "studio_native_segments_v1"
+          }
+        ],
+        "workflow_hash": "57e96eca93412ecfc9068b15f7fc5691b74ef889d4790299c72dc06854df4fc3",
+        "slot_map_hash": "7a7d0847be7ea2113bdf260e57a827da9d239e9b88ef1311f700fe87d9ee684f",
+        "dependency_versions": {},
+        "weight_hashes": {},
+        "poc_verified": false,
+        "qualification_status": "SOURCE_TEMPLATE_ONLY",
+        "export_mode": "segments",
+        "bridge_version": "studio-director-bridge-v1"
+      }
+    },
+    {
+      "code": "H3_DIRECTOR_R2V_BASE_AGGREGATE",
+      "mode": "r2v",
+      "execution_scope": "aggregate",
+      "version": "director-a8f57b8e23c4-config-template-v2-aggregate-dynamic-bridge-v1",
+      "file": "director_r2v_aggregate.api.json",
+      "quality_profile": "BASE",
+      "auto_approve": false,
+      "slots": {
+        "PROMPT": [
+          "5",
+          "global_prompt"
+        ],
+        "SEED": [
+          "5",
+          "seed"
+        ],
+        "STEPS": [
+          "5",
+          "steps"
+        ],
+        "WIDTH": [
+          "5",
+          "width"
+        ],
+        "HEIGHT": [
+          "5",
+          "height"
+        ],
+        "FRAMES": [
+          "5",
+          "total_frames"
+        ],
+        "OUTPUT_PREFIX": [
+          "5",
+          "studio_output_prefix"
+        ]
+      },
+      "required_slots": [],
+      "profile": {
+        "provider": "minimax_h3_director",
+        "provider_source": {
+          "provider": "minimax_h3_director",
+          "repository": "AIMixer/ComfyUI_MiniMaxH3_Director",
+          "commit": "a8f57b8e23c46ee28fdb96796510fa7b4f3b1fbb",
+          "license": "Apache-2.0",
+          "pipeline_id": "minimax_h3_motion_context_v9"
+        },
+        "source_example": "minimax_h3_director_r2v.json",
+        "source_example_sha256": "060403fa0d99cf1ff763575c78c6d03444a5104e28a26be8156db209dec61eae",
+        "config_source_example": "minimax_h3_director_\u4e8c\u91c7_\u52a0\u901f.json",
+        "config_source_example_sha256": "8f928ac4005ab289a25ae809bccf5374bb9d4301d6d12f0d4e76f12cca93ab2a",
+        "feature_states": {
+          "refine": {
+            "source_supported": true,
+            "graph_wired": true,
+            "statically_valid": true,
+            "runtime_qualified": false,
+            "advertised": false
+          },
+          "face_refine": {
+            "source_supported": true,
+            "graph_wired": true,
+            "statically_valid": true,
+            "runtime_qualified": false,
+            "advertised": false
+          }
+        },
+        "quality_profile": "BASE",
+        "steps": 25,
+        "fps": 24,
+        "cfg": 1.0,
+        "sampler": "res_multistep",
+        "scheduler": "simple",
+        "turbo": false,
+        "resolution": {
+          "kind": "explicit_slots",
+          "canvases": {
+            "16:9": [
+              864,
+              480
+            ]
+          }
+        },
+        "duration_resolver": {
+          "kind": "director_frames"
+        },
+        "output_node": "5",
+        "output_artifacts": [
+          {
+            "role": "segment",
+            "node_id": "5",
+            "required": true,
+            "coverage": "all_members",
+            "transport": "studio_native_segments_v1"
+          }
+        ],
+        "workflow_hash": "4fc0e8dd065da58b69cddbf2df74b42606aba76860d486edd95fef9c3acf26ae",
+        "slot_map_hash": "7a7d0847be7ea2113bdf260e57a827da9d239e9b88ef1311f700fe87d9ee684f",
+        "dependency_versions": {},
+        "weight_hashes": {},
+        "poc_verified": false,
+        "qualification_status": "SOURCE_TEMPLATE_ONLY",
+        "export_mode": "segments",
+        "bridge_version": "studio-director-bridge-v1"
+      }
+    },
+    {
+      "code": "H3_DIRECTOR_V2V_BASE_AGGREGATE",
+      "mode": "v2v",
+      "execution_scope": "aggregate",
+      "version": "director-a8f57b8e23c4-config-template-v2-aggregate-dynamic-bridge-v1",
+      "file": "director_v2v_aggregate.api.json",
+      "quality_profile": "BASE",
+      "auto_approve": false,
+      "slots": {
+        "PROMPT": [
+          "5",
+          "global_prompt"
+        ],
+        "SEED": [
+          "5",
+          "seed"
+        ],
+        "STEPS": [
+          "5",
+          "steps"
+        ],
+        "WIDTH": [
+          "5",
+          "width"
+        ],
+        "HEIGHT": [
+          "5",
+          "height"
+        ],
+        "FRAMES": [
+          "5",
+          "total_frames"
+        ],
+        "OUTPUT_PREFIX": [
+          "5",
+          "studio_output_prefix"
+        ]
+      },
+      "required_slots": [],
+      "profile": {
+        "provider": "minimax_h3_director",
+        "provider_source": {
+          "provider": "minimax_h3_director",
+          "repository": "AIMixer/ComfyUI_MiniMaxH3_Director",
+          "commit": "a8f57b8e23c46ee28fdb96796510fa7b4f3b1fbb",
+          "license": "Apache-2.0",
+          "pipeline_id": "minimax_h3_motion_context_v9"
+        },
+        "source_example": "minimax_h3_director_v2v.json",
+        "source_example_sha256": "41e2f44ad5a53bbe34da444b9b7d4cd4838d57b543a270cc27b0cb00eac64fb3",
+        "config_source_example": "minimax_h3_director_\u4e8c\u91c7_\u52a0\u901f.json",
+        "config_source_example_sha256": "8f928ac4005ab289a25ae809bccf5374bb9d4301d6d12f0d4e76f12cca93ab2a",
+        "feature_states": {
+          "refine": {
+            "source_supported": true,
+            "graph_wired": true,
+            "statically_valid": true,
+            "runtime_qualified": false,
+            "advertised": false
+          },
+          "face_refine": {
+            "source_supported": true,
+            "graph_wired": true,
+            "statically_valid": true,
+            "runtime_qualified": false,
+            "advertised": false
+          }
+        },
+        "quality_profile": "BASE",
+        "steps": 25,
+        "fps": 24,
+        "cfg": 1.0,
+        "sampler": "res_multistep",
+        "scheduler": "simple",
+        "turbo": false,
+        "resolution": {
+          "kind": "explicit_slots",
+          "canvases": {
+            "16:9": [
+              864,
+              480
+            ]
+          }
+        },
+        "duration_resolver": {
+          "kind": "director_frames"
+        },
+        "output_node": "5",
+        "output_artifacts": [
+          {
+            "role": "segment",
+            "node_id": "5",
+            "required": true,
+            "coverage": "all_members",
+            "transport": "studio_native_segments_v1"
+          }
+        ],
+        "workflow_hash": "f6f6ab33f7b64e1110af28ab9de5fca7135eb0c6ee01de9d7ac44b6b2079431b",
+        "slot_map_hash": "7a7d0847be7ea2113bdf260e57a827da9d239e9b88ef1311f700fe87d9ee684f",
+        "dependency_versions": {},
+        "weight_hashes": {},
+        "poc_verified": false,
+        "qualification_status": "SOURCE_TEMPLATE_ONLY",
+        "export_mode": "segments",
+        "bridge_version": "studio-director-bridge-v1"
+      }
+    },
+    {
+      "code": "H3_DIRECTOR_RV2V_BASE_AGGREGATE",
+      "mode": "rv2v",
+      "execution_scope": "aggregate",
+      "version": "director-a8f57b8e23c4-config-template-v2-aggregate-dynamic-bridge-v1",
+      "file": "director_rv2v_aggregate.api.json",
+      "quality_profile": "BASE",
+      "auto_approve": false,
+      "slots": {
+        "PROMPT": [
+          "5",
+          "global_prompt"
+        ],
+        "SEED": [
+          "5",
+          "seed"
+        ],
+        "STEPS": [
+          "5",
+          "steps"
+        ],
+        "WIDTH": [
+          "5",
+          "width"
+        ],
+        "HEIGHT": [
+          "5",
+          "height"
+        ],
+        "FRAMES": [
+          "5",
+          "total_frames"
+        ],
+        "OUTPUT_PREFIX": [
+          "5",
+          "studio_output_prefix"
+        ]
+      },
+      "required_slots": [],
+      "profile": {
+        "provider": "minimax_h3_director",
+        "provider_source": {
+          "provider": "minimax_h3_director",
+          "repository": "AIMixer/ComfyUI_MiniMaxH3_Director",
+          "commit": "a8f57b8e23c46ee28fdb96796510fa7b4f3b1fbb",
+          "license": "Apache-2.0",
+          "pipeline_id": "minimax_h3_motion_context_v9"
+        },
+        "source_example": "minimax_h3_director_rv2v.json",
+        "source_example_sha256": "772957fe9ef71d8d0361228f518ca593bbb5cc4f613c2b01216a91a00516b771",
+        "config_source_example": "minimax_h3_director_\u4e8c\u91c7_\u52a0\u901f.json",
+        "config_source_example_sha256": "8f928ac4005ab289a25ae809bccf5374bb9d4301d6d12f0d4e76f12cca93ab2a",
+        "feature_states": {
+          "refine": {
+            "source_supported": true,
+            "graph_wired": true,
+            "statically_valid": true,
+            "runtime_qualified": false,
+            "advertised": false
+          },
+          "face_refine": {
+            "source_supported": true,
+            "graph_wired": true,
+            "statically_valid": true,
+            "runtime_qualified": false,
+            "advertised": false
+          }
+        },
+        "quality_profile": "BASE",
+        "steps": 25,
+        "fps": 24,
+        "cfg": 1.0,
+        "sampler": "res_multistep",
+        "scheduler": "simple",
+        "turbo": false,
+        "resolution": {
+          "kind": "explicit_slots",
+          "canvases": {
+            "16:9": [
+              864,
+              480
+            ]
+          }
+        },
+        "duration_resolver": {
+          "kind": "director_frames"
+        },
+        "output_node": "5",
+        "output_artifacts": [
+          {
+            "role": "segment",
+            "node_id": "5",
+            "required": true,
+            "coverage": "all_members",
+            "transport": "studio_native_segments_v1"
+          }
+        ],
+        "workflow_hash": "065b3d16fa1416f6936db5fb1b9594f74c7d26e24f53a9714f2dbab25d9ab9a5",
+        "slot_map_hash": "7a7d0847be7ea2113bdf260e57a827da9d239e9b88ef1311f700fe87d9ee684f",
+        "dependency_versions": {},
+        "weight_hashes": {},
+        "poc_verified": false,
+        "qualification_status": "SOURCE_TEMPLATE_ONLY",
+        "export_mode": "segments",
+        "bridge_version": "studio-director-bridge-v1"
+      }
     }
   ]
 }

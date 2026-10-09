@@ -1,6 +1,7 @@
 "use client";
 
 import React from "react";
+import { useI18n } from "@/lib/i18n";
 
 export interface BadgeProps extends React.HTMLAttributes<HTMLSpanElement> {
   status?: string;
@@ -8,7 +9,17 @@ export interface BadgeProps extends React.HTMLAttributes<HTMLSpanElement> {
 }
 
 export function Badge({ status, variant, className = "", children, ...props }: BadgeProps) {
+  const { t } = useI18n();
   const normStatus = (status || "").toLowerCase().replace(/_/g, "");
+  const names: Record<string, string> = {
+    ready: t("Sẵn sàng", "Ready"), completed: t("Hoàn tất", "Completed"), ok: t("Ổn định", "OK"),
+    generating: t("Đang tạo", "Generating"), created: t("Đã tạo", "Created"), running: t("Đang chạy", "Running"),
+    queued: t("Đang chờ", "Queued"), dispatching: t("Đang gửi", "Dispatching"), collecting: t("Đang nhận", "Collecting"),
+    cancelrequested: t("Đang hủy", "Cancelling"), assembling: t("Đang ghép", "Assembling"), validating: t("Đang kiểm tra", "Validating"),
+    degraded: t("Suy giảm", "Degraded"), failed: t("Thất bại", "Failed"), error: t("Lỗi", "Error"), cancelled: t("Đã hủy", "Cancelled"),
+    dirty: t("Cần cập nhật", "Outdated"), draft: t("Bản nháp", "Draft"), archived: t("Đã lưu trữ", "Archived"),
+    admin: t("Quản trị", "Admin"), editor: t("Biên tập", "Editor"), viewer: t("Chỉ xem", "Viewer"),
+  };
 
   let resolvedVariant = variant;
   if (!resolvedVariant && status) {
@@ -51,11 +62,11 @@ export function Badge({ status, variant, className = "", children, ...props }: B
 
   return (
     <span
-      className={`inline-flex min-h-[22px] items-center gap-1.5 rounded-md border px-2 py-0.5 text-xs font-medium ${variantStyles[currentVariant]} ${className}`}
+      className={`inline-flex shrink-0 whitespace-nowrap min-h-[22px] items-center gap-1.5 rounded-md border px-2 py-0.5 text-xs font-medium ${variantStyles[currentVariant]} ${className}`}
       {...props}
     >
       <span className="w-1.5 h-1.5 rounded-full bg-current" />
-      {children || status}
+      {children || names[normStatus] || status}
     </span>
   );
 }

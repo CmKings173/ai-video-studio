@@ -1,4 +1,5 @@
 import { apiClient } from "./client";
+import { paginationParams } from "./pagination";
 import type {
   Page,
   StoryboardPreviewDTO,
@@ -20,7 +21,7 @@ export type ListVideosParams = {
 };
 
 export async function listVideos(params?: ListVideosParams): Promise<Page<VideoDTO>> {
-  return apiClient.get<Page<VideoDTO>>("/api/v1/videos", { params });
+  return apiClient.get<Page<VideoDTO>>("/api/v1/videos", { params: paginationParams(params) });
 }
 
 export async function createVideo(payload: VideoCreate): Promise<VideoDetail> {

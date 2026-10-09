@@ -6,7 +6,6 @@ from pathlib import Path
 import uvicorn
 from dotenv import load_dotenv
 
-
 if __name__ == "__main__":
     backend_dir = Path(__file__).resolve().parent
     # Shell settings win; local settings override shared Compose defaults.

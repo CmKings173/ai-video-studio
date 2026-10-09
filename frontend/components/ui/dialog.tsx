@@ -2,6 +2,7 @@
 
 import React, { useEffect, useRef } from "react";
 import { X } from "lucide-react";
+import { useI18n } from "@/lib/i18n";
 
 export interface DialogProps {
   isOpen: boolean;
@@ -12,6 +13,14 @@ export interface DialogProps {
   maxWidth?: "sm" | "md" | "lg" | "xl";
 }
 
+function focusableControls(container: HTMLElement) {
+  return Array.from(container.querySelectorAll<HTMLElement>(
+    'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])'
+  )).filter((element) => element.tabIndex >= 0 && !element.matches(":disabled")
+    && !element.closest("[inert]") && element.getClientRects().length > 0
+    && getComputedStyle(element).visibility !== "hidden");
+}
+
 export function Dialog({
   isOpen,
   onClose,
@@ -20,8 +29,12 @@ export function Dialog({
   children,
   maxWidth = "md",
 }: DialogProps) {
+  const { t } = useI18n();
   const dialogRef = useRef<HTMLDivElement>(null);
   const triggerElementRef = useRef<HTMLElement | null>(null);
+  const onCloseRef = useRef(onClose);
+
+  useEffect(() => { onCloseRef.current = onClose; }, [onClose]);
 
   useEffect(() => {
     if (!isOpen) return;
@@ -31,27 +44,29 @@ export function Dialog({
 
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
-        onClose();
+        onCloseRef.current();
         return;
       }
 
-      // Basic focus trap
+      // Recompute because validation and submission can disable controls while open.
       if (e.key === "Tab" && dialogRef.current) {
-        const focusableElements = dialogRef.current.querySelectorAll<HTMLElement>(
-          'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])'
-        );
-        if (focusableElements.length === 0) return;
+        const focusableElements = focusableControls(dialogRef.current);
+        if (focusableElements.length === 0) {
+          e.preventDefault();
+          dialogRef.current.focus();
+          return;
+        }
 
         const firstElement = focusableElements[0];
         const lastElement = focusableElements[focusableElements.length - 1];
 
         if (e.shiftKey) {
-          if (document.activeElement === firstElement) {
+          if (document.activeElement === firstElement || !focusableElements.includes(document.activeElement as HTMLElement)) {
             e.preventDefault();
             lastElement.focus();
           }
         } else {
-          if (document.activeElement === lastElement) {
+          if (document.activeElement === lastElement || !focusableElements.includes(document.activeElement as HTMLElement)) {
             e.preventDefault();
             firstElement.focus();
           }
@@ -65,10 +80,8 @@ export function Dialog({
     // Initial focus into dialog
     const timer = setTimeout(() => {
       if (dialogRef.current) {
-        const firstFocusable = dialogRef.current.querySelector<HTMLElement>(
-          'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])'
-        );
-        firstFocusable?.focus();
+        const firstFocusable = focusableControls(dialogRef.current)[0];
+        (firstFocusable ?? dialogRef.current).focus();
       }
     }, 50);
 
@@ -79,7 +92,7 @@ export function Dialog({
       // Restore focus on close
       triggerElementRef.current?.focus?.();
     };
-  }, [isOpen, onClose]);
+  }, [isOpen]);
 
   if (!isOpen) return null;
 
@@ -100,6 +113,7 @@ export function Dialog({
     >
       <div
         ref={dialogRef}
+        tabIndex={-1}
         role="dialog"
         aria-modal="true"
         aria-labelledby={titleId}
@@ -121,7 +135,7 @@ export function Dialog({
           <button
             onClick={onClose}
             className="rounded-md p-1 text-[#9ea5b0] transition-colors hover:bg-[#22252b] hover:text-white"
-            aria-label="Close dialog"
+            aria-label={t("Đóng hộp thoại", "Close dialog")}
           >
             <X className="w-5 h-5" />
           </button>

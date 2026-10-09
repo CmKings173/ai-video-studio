@@ -7,7 +7,7 @@ from apps.api.app.main import app
 
 
 def main() -> None:
-    root = Path(__file__).resolve().parents[3]
+    root = Path(__file__).resolve().parents[4]
     destination = root / "docs" / "openapi.yaml"
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(

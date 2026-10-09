@@ -16,6 +16,10 @@ from apps.api.app.schemas.api import (
     VideoDTO,
 )
 from apps.api.app.services.domain_guards import require_active_brand
+from apps.api.app.services.generation_dependency_invalidation import (
+    invalidate_product_dependents,
+    lock_dependency_graph,
+)
 
 router = APIRouter(prefix="/products", tags=["products"])
 
@@ -46,8 +50,7 @@ async def list_products(
     rows = list(
         (
             await session.scalars(
-                query
-                .order_by(Product.created_at.desc(), Product.id.desc())
+                query.order_by(Product.created_at.desc(), Product.id.desc())
                 .offset((page - 1) * size)
                 .limit(size)
             )
@@ -67,6 +70,7 @@ async def create_product(
     user: User = Depends(require_csrf),
     session: AsyncSession = Depends(get_session),
 ) -> ProductDTO:
+    await lock_dependency_graph(session)
     await require_active_brand(session, str(payload.brand_id) if payload.brand_id else None)
     product = Product(**payload.model_dump(mode="json"), created_by=user.id)
     session.add(product)
@@ -94,21 +98,19 @@ async def patch_product(
     user: User = Depends(require_csrf),
     session: AsyncSession = Depends(get_session),
 ) -> ProductDTO:
-    product = await session.get(Product, product_id, with_for_update=True)
-    if product is None:
-        raise AppError("PRODUCT_NOT_FOUND", "Product not found", 404)
-    values = payload.model_dump(exclude_unset=True, mode="json")
-    await require_active_brand(session, values.get("brand_id"))
-    if product.revision != revision:
-        raise AppError(
-            "REVISION_CONFLICT",
-            "Resource changed since it was loaded",
-            412,
-            {"expected": revision, "actual": product.revision},
-        )
-    for key, value in values.items():
-        setattr(product, key, value)
-    product.revision += 1
+    async with invalidate_product_dependents(session, product_id) as product:
+        values = payload.model_dump(exclude_unset=True, mode="json")
+        await require_active_brand(session, values.get("brand_id"))
+        if product.revision != revision:
+            raise AppError(
+                "REVISION_CONFLICT",
+                "Resource changed since it was loaded",
+                412,
+                {"expected": revision, "actual": product.revision},
+            )
+        for key, value in values.items():
+            setattr(product, key, value)
+        product.revision += 1
     return ProductDTO.model_validate(product)
 
 
@@ -119,19 +121,17 @@ async def archive_product(
     user: User = Depends(require_csrf),
     session: AsyncSession = Depends(get_session),
 ) -> ProductDTO:
-    product = await session.get(Product, product_id, with_for_update=True)
-    if product is None:
-        raise AppError("PRODUCT_NOT_FOUND", "Product not found", 404)
-    if product.revision != revision:
-        raise AppError(
-            "REVISION_CONFLICT",
-            "Resource changed since it was loaded",
-            412,
-            {"expected": revision, "actual": product.revision},
-        )
-    if not product.archived:
-        product.archived = True
-        product.revision += 1
+    async with invalidate_product_dependents(session, product_id) as product:
+        if product.revision != revision:
+            raise AppError(
+                "REVISION_CONFLICT",
+                "Resource changed since it was loaded",
+                412,
+                {"expected": revision, "actual": product.revision},
+            )
+        if not product.archived:
+            product.archived = True
+            product.revision += 1
     return ProductDTO.model_validate(product)
 
 

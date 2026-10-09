@@ -10,6 +10,7 @@ from tempfile import TemporaryDirectory
 from typing import Any
 
 from apps.api.app.integrations.media import inspect_path
+from apps.api.app.services.delivery_presets import resolve_delivery
 
 
 class FFmpegError(RuntimeError):
@@ -36,9 +37,26 @@ class FFmpeg:
         )
         try:
             _, stderr = await asyncio.wait_for(process.communicate(), timeout=self.timeout)
-        except TimeoutError as exc:
-            process.kill()
-            await process.wait()
+        except (TimeoutError, asyncio.CancelledError) as exc:
+            # The staging context may unlink outputs only after the encoder exits.
+            async def stop_encoder():
+                if process.returncode is None:
+                    try:
+                        process.kill()
+                    except ProcessLookupError:
+                        pass
+                await process.wait()
+
+            stopped = asyncio.create_task(stop_encoder())
+            cancelled = isinstance(exc, asyncio.CancelledError)
+            while not stopped.done():
+                try:
+                    await asyncio.shield(stopped)
+                except asyncio.CancelledError:
+                    cancelled = True
+            stopped.result()
+            if cancelled:
+                raise asyncio.CancelledError() from None
             raise FFmpegError("ffmpeg timed out") from exc
         if process.returncode != 0:
             raise FFmpegError(stderr.decode("utf-8", errors="replace")[-2000:])
@@ -47,16 +65,28 @@ class FFmpeg:
         return await inspect_path(path, self.ffprobe)
 
     async def _normalize(
-        self, source: Path, destination: Path, width: int, height: int, fps: int
+        self,
+        source: Path,
+        destination: Path,
+        width: int,
+        height: int,
+        fps: int,
+        fit_mode: str = "FIT_PAD",
     ) -> dict[str, Any]:
         metadata = await self.probe(source)
-        video_filter = (
-            f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
-            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={fps},format=yuv420p"
-        )
+        video_filter = resolve_delivery(
+            width=width,
+            height=height,
+            fps=fps,
+            fit_mode=fit_mode,
+        ).video_filter()
         args = ["-i", str(source)]
         if metadata.get("has_audio"):
             args += [
+                "-map",
+                "0:v:0",
+                "-map",
+                "0:a:0",
                 "-vf",
                 video_filter,
                 "-af",
@@ -96,7 +126,7 @@ class FFmpeg:
                 "-b:a",
                 "192k",
             ]
-        args += ["-movflags", "+faststart", "-y", str(destination)]
+        args += ["-ar", "48000", "-ac", "2", "-movflags", "+faststart", "-y", str(destination)]
         await self._run(*args)
         return await self.probe(destination)
 
@@ -171,9 +201,14 @@ class FFmpeg:
     ) -> dict[str, Any]:
         if not inputs:
             raise FFmpegError("assembly needs at least one clip")
-        width = int(config.get("width", 1080))
-        height = int(config.get("height", 1920))
-        fps = int(config.get("fps", 24))
+        delivery = resolve_delivery(
+            preset=config.get("delivery_preset"),
+            width=config.get("width"),
+            height=config.get("height"),
+            fps=config.get("fps", 24),
+            fit_mode=config.get("fit_mode", "FIT_PAD"),
+        )
+        width, height, fps = delivery.width, delivery.height, delivery.fps
         transition = config.get("transition", "CUT")
         crossfade = float(config.get("crossfade_seconds", 0.5))
         if width <= 0 or height <= 0 or width % 2 or height % 2 or fps not in {24, 25, 30}:
@@ -184,7 +219,14 @@ class FFmpeg:
             durations: list[float] = []
             for index, source in enumerate(inputs):
                 destination = Path(directory) / f"scene-{index:03d}.mp4"
-                metadata = await self._normalize(source, destination, width, height, fps)
+                metadata = await self._normalize(
+                    source,
+                    destination,
+                    width,
+                    height,
+                    fps,
+                    delivery.fit_mode,
+                )
                 normalized.append(destination)
                 durations.append(float(metadata.get("duration_seconds") or 0))
             assembled = Path(directory) / "assembled.mp4"
@@ -234,16 +276,39 @@ class FFmpeg:
                     str(assembled),
                     "-map",
                     "0:v:0",
-                    "-an",
+                    "-map",
+                    "0:a:0",
+                    "-af",
+                    "volume=0",
                     "-c:v",
                     "copy",
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    "192k",
                     "-movflags",
                     "+faststart",
                     "-y",
                     str(output),
                 )
             else:
-                await asyncio.to_thread(shutil.copyfile, assembled, output)
+                copy_task = asyncio.create_task(
+                    asyncio.to_thread(shutil.copyfile, assembled, output)
+                )
+                try:
+                    await asyncio.shield(copy_task)
+                except asyncio.CancelledError:
+                    # The copy owns both handles until it finishes, even if cancelled again.
+                    while not copy_task.done():
+                        try:
+                            await asyncio.shield(copy_task)
+                        except asyncio.CancelledError:
+                            continue
+                        except Exception:
+                            break
+                    if not copy_task.cancelled():
+                        copy_task.exception()
+                    raise
         metadata = await self.probe(output)
         if not metadata.get("has_video"):
             raise FFmpegError("assembled output has no video stream")

@@ -34,7 +34,7 @@ from apps.api.app.integrations.minio import (
     AssetStoreError,
     AssetStoreUnavailableError,
 )
-from apps.api.app.schemas.api import AssetComplete, UploadRequest
+from apps.api.app.schemas.api import ASSET_ROLE_KINDS, AssetComplete, UploadRequest
 from apps.api.app.services.asset_claims import (
     OUTPUT_WRITE_CLAIM,
     acquire_claim,
@@ -81,6 +81,65 @@ def upload_staging_key(asset: Asset | None = None, *, asset_id: str | None = Non
     return f"staging/assets/{resolved_id}/upload"
 
 
+def has_durable_validation(asset: Asset) -> bool:
+    """The validation envelope fences legacy repair, including terminal failures."""
+    return isinstance((asset.media_metadata or {}).get("validation"), dict)
+
+
+async def enqueue_asset_validation(
+    session: AsyncSession,
+    settings: Settings,
+    asset: Asset,
+    payload: AssetComplete,
+    *,
+    user_id: str,
+) -> Asset:
+    """Bind validation intent under a lock in the caller's request transaction.
+
+    No storage or media I/O occurs here. The request's commit publishes the queue
+    entry atomically; rollback publishes nothing. Null is also a bound checksum
+    intent, so a duplicate cannot silently strengthen or weaken it.
+    """
+    row = await session.get(Asset, asset.id, with_for_update=True, populate_existing=True)
+    if row is None or row.deleted_at is not None:
+        raise AppError("ASSET_NOT_FOUND", "Asset not found", 404)
+    if row.created_by != user_id:
+        raise AppError("ASSET_FORBIDDEN", "Only the uploader can complete this asset", 403)
+    expected = payload.checksum_sha256.lower() if payload.checksum_sha256 else None
+    envelope = (row.media_metadata or {}).get("validation")
+    if row.status == "READY":
+        if expected and expected != (row.checksum or "").lower():
+            raise AppError("ASSET_CHECKSUM_CONFLICT", "Completed checksum differs", 409)
+        return row
+    if row.status not in {"PENDING", "PENDING_UPLOAD", "VALIDATING", "FAILED"}:
+        raise AppError("ASSET_STATE_CONFLICT", "Asset cannot be completed in this state", 409)
+    if isinstance(envelope, dict) and envelope.get("expected_checksum") != expected:
+        raise AppError("ASSET_CHECKSUM_CONFLICT", "Queued checksum differs", 409)
+    if row.status == "VALIDATING" and isinstance(envelope, dict):
+        return row
+    if row.status == "FAILED" and not getattr(payload, "retry_validation", False):
+        raise AppError("ASSET_RETRY_REQUIRED", "Set retry_validation to retry a failed asset", 409)
+    if claim_is_active(
+        row, now=utcnow(),
+        timeout_seconds=int(getattr(settings, "asset_operation_claim_timeout_seconds", 900)),
+    ):
+        raise AppError("ASSET_OPERATION_BUSY", "Asset is owned by another operation", 409)
+    clear_claim(row)
+    row.status = "VALIDATING"
+    row.failed_at = None
+    row.media_metadata = {
+        **(row.media_metadata or {}),
+        "validation": {
+            "phase": "QUEUED", "expected_checksum": expected, "attempts": 0,
+            "next_attempt_at": None, "error": None,
+            **({"verified_checksum": envelope["verified_checksum"]}
+               if isinstance(envelope, dict) and envelope.get("verified_checksum") else {}),
+        },
+    }
+    await session.flush()
+    return row
+
+
 async def create_pending_asset(
     session: AsyncSession,
     store: AssetStore,
@@ -90,6 +149,19 @@ async def create_pending_asset(
 ) -> tuple[Asset, dict]:
     if payload.size_bytes > settings.max_upload_bytes:
         raise AppError("UPLOAD_TOO_LARGE", "Upload exceeds configured size limit", 413)
+    expected_kind = ASSET_ROLE_KINDS.get(payload.role)
+    if expected_kind is None:
+        raise AppError("ASSET_ROLE_INVALID", "Unsupported asset role", 422)
+    try:
+        asset_kind = kind_for_content_type(payload.content_type)
+    except MediaValidationError as exc:
+        raise AppError("ASSET_TYPE_INVALID", "Unsupported upload content type", 422) from exc
+    if asset_kind != expected_kind:
+        raise AppError(
+            "ASSET_TYPE_INVALID",
+            f"{payload.role} requires a {expected_kind.lower()} upload",
+            422,
+        )
     if payload.project_id:
         owner = await session.get(Project, str(payload.project_id))
         if owner is None or owner.archived:
@@ -103,7 +175,7 @@ async def create_pending_asset(
         id=asset_id,
         project_id=str(payload.project_id) if payload.project_id else None,
         product_id=str(payload.product_id) if payload.product_id else None,
-        kind=kind_for_content_type(payload.content_type),
+        kind=asset_kind,
         role=payload.role,
         filename=payload.filename,
         content_type=payload.content_type,
@@ -112,18 +184,6 @@ async def create_pending_asset(
         size_bytes=payload.size_bytes,
         created_by=user_id,
     )
-    expected_kind = {
-        "PRODUCT_IMAGE": "IMAGE",
-        "REFERENCE_VIDEO": "VIDEO",
-        "REFERENCE_AUDIO": "AUDIO",
-        "BACKGROUND_AUDIO": "AUDIO",
-    }.get(payload.role)
-    if expected_kind and asset.kind != expected_kind:
-        raise AppError(
-            "ASSET_TYPE_INVALID",
-            f"{payload.role} requires a {expected_kind.lower()} upload",
-            422,
-        )
     session.add(asset)
     await session.flush()
     upload = await store.presign_upload(upload_staging_key(asset), asset.content_type)
@@ -140,9 +200,7 @@ async def complete_asset(
     factory=None,
 ) -> Asset:
     asset_id = asset.id
-    claim_timeout_seconds = int(
-        getattr(settings, "asset_operation_claim_timeout_seconds", 900)
-    )
+    claim_timeout_seconds = int(getattr(settings, "asset_operation_claim_timeout_seconds", 900))
     session_factory = factory or async_sessionmaker(
         session.bind, expire_on_commit=False, autoflush=False
     )
@@ -156,6 +214,10 @@ async def complete_asset(
         row = await phase.get(Asset, asset_id, with_for_update=True)
         if row is None:
             raise AppError("ASSET_NOT_FOUND", "Asset not found", 404)
+        if row.status != "READY" and has_durable_validation(row):
+            raise AppError(
+                "ASSET_STATE_CONFLICT", "Durable validation must be handled by its worker", 409
+            )
         if row.status == "READY":
             if row.operation_claim_id:
                 if claim_is_active(row, now=utcnow(), timeout_seconds=claim_timeout_seconds):
@@ -243,9 +305,7 @@ async def complete_asset(
                 )
         if safe_delete and needs_retry_before_delete:
             try:
-                retry_queued = await requeue_deletion_retry(
-                    session_factory, asset_id, object_key
-                )
+                retry_queued = await requeue_deletion_retry(session_factory, asset_id, object_key)
             except SQLAlchemyError as exc:
                 safe_delete = False
                 error_type = type(exc).__name__
@@ -431,6 +491,14 @@ async def complete_asset(
             completed.width = metadata.get("width")
             completed.height = metadata.get("height")
             completed.duration_seconds = duration
+            completed.media_metadata = {
+                **metadata,
+                "checksum": checksum,
+                "size_bytes": len(data),
+                "inspection_method": "image_decode"
+                if completed.kind == "IMAGE"
+                else "ffprobe_declarations",
+            }
             completed.status = "READY"
             completed.failed_at = None
             clear_claim(completed)
