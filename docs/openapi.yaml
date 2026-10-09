@@ -39,6 +39,35 @@
             "title": "Crossfade Seconds",
             "type": "number"
           },
+          "delivery_preset": {
+            "anyOf": [
+              {
+                "enum": [
+                  "SOCIAL_VERTICAL_1080",
+                  "LANDSCAPE_FHD",
+                  "SQUARE_1080",
+                  "PORTRAIT_4_5",
+                  "PORTRAIT_3_4",
+                  "LANDSCAPE_4_3",
+                  "ULTRAWIDE_2560_1080"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Delivery Preset"
+          },
+          "fit_mode": {
+            "default": "FIT_PAD",
+            "enum": [
+              "FIT_PAD",
+              "CENTER_CROP"
+            ],
+            "title": "Fit Mode",
+            "type": "string"
+          },
           "fps": {
             "default": 24,
             "enum": [
@@ -50,12 +79,18 @@
             "type": "integer"
           },
           "height": {
-            "default": 1920,
-            "maximum": 1920.0,
-            "minimum": 256.0,
-            "multipleOf": 2.0,
-            "title": "Height",
-            "type": "integer"
+            "anyOf": [
+              {
+                "maximum": 4096.0,
+                "minimum": 256.0,
+                "multipleOf": 2.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Height"
           },
           "transition": {
             "default": "CUT",
@@ -67,12 +102,18 @@
             "type": "string"
           },
           "width": {
-            "default": 1080,
-            "maximum": 1920.0,
-            "minimum": 256.0,
-            "multipleOf": 2.0,
-            "title": "Width",
-            "type": "integer"
+            "anyOf": [
+              {
+                "maximum": 4096.0,
+                "minimum": 256.0,
+                "multipleOf": 2.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Width"
           }
         },
         "title": "AssemblyRequest",
@@ -92,6 +133,11 @@
               }
             ],
             "title": "Checksum Sha256"
+          },
+          "retry_validation": {
+            "default": false,
+            "title": "Retry Validation",
+            "type": "boolean"
           }
         },
         "title": "AssetComplete",
@@ -152,6 +198,11 @@
           "kind": {
             "title": "Kind",
             "type": "string"
+          },
+          "media_metadata": {
+            "additionalProperties": true,
+            "title": "Media Metadata",
+            "type": "object"
           },
           "product_id": {
             "anyOf": [
@@ -220,6 +271,26 @@
       },
       "BatchGenerationDTO": {
         "properties": {
+          "director_run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "deprecated": true,
+            "description": "Compatibility field for exactly one aggregate run; use execution_groups.",
+            "title": "Director Run Id"
+          },
+          "execution_groups": {
+            "items": {
+              "$ref": "#/components/schemas/ExecutionGroupDTO"
+            },
+            "title": "Execution Groups",
+            "type": "array"
+          },
           "generations": {
             "items": {
               "$ref": "#/components/schemas/GenerationDTO"
@@ -414,6 +485,11 @@
             "title": "Dry Run",
             "type": "boolean"
           },
+          "has_more": {
+            "default": false,
+            "title": "Has More",
+            "type": "boolean"
+          },
           "retained_records": {
             "title": "Retained Records",
             "type": "integer"
@@ -469,6 +545,331 @@
           "assemblies_pending"
         ],
         "title": "DashboardSummaryDTO",
+        "type": "object"
+      },
+      "DirectorAudioPolicy": {
+        "additionalProperties": false,
+        "properties": {
+          "mode": {
+            "default": "generate",
+            "enum": [
+              "generate",
+              "source",
+              "mute"
+            ],
+            "title": "Mode",
+            "type": "string"
+          },
+          "preserve_source_audio": {
+            "const": true,
+            "default": true,
+            "title": "Preserve Source Audio",
+            "type": "boolean"
+          }
+        },
+        "title": "DirectorAudioPolicy",
+        "type": "object"
+      },
+      "DirectorFaceRefine": {
+        "additionalProperties": false,
+        "properties": {
+          "blend": {
+            "default": 1.0,
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Blend",
+            "type": "number"
+          },
+          "canvas_height": {
+            "default": 768,
+            "maximum": 1344.0,
+            "minimum": 128.0,
+            "multipleOf": 32.0,
+            "title": "Canvas Height",
+            "type": "integer"
+          },
+          "canvas_mode": {
+            "default": "manual",
+            "enum": [
+              "manual",
+              "auto_capped_768"
+            ],
+            "title": "Canvas Mode",
+            "type": "string"
+          },
+          "canvas_width": {
+            "default": 768,
+            "maximum": 1344.0,
+            "minimum": 128.0,
+            "multipleOf": 32.0,
+            "title": "Canvas Width",
+            "type": "integer"
+          },
+          "colour_match": {
+            "default": 1.0,
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Colour Match",
+            "type": "number"
+          },
+          "confidence": {
+            "default": 0.35,
+            "maximum": 0.95,
+            "minimum": 0.05,
+            "title": "Confidence",
+            "type": "number"
+          },
+          "crop_factor": {
+            "default": 2.5,
+            "maximum": 8.0,
+            "minimum": 1.2,
+            "title": "Crop Factor",
+            "type": "number"
+          },
+          "denoise": {
+            "default": 0.4,
+            "maximum": 1.0,
+            "minimum": 0.02,
+            "title": "Denoise",
+            "type": "number"
+          },
+          "detector": {
+            "const": "face_yolov8m.pt",
+            "default": "face_yolov8m.pt",
+            "title": "Detector",
+            "type": "string"
+          },
+          "enabled": {
+            "default": false,
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "feather": {
+            "default": 24,
+            "maximum": 256.0,
+            "minimum": 0.0,
+            "title": "Feather",
+            "type": "integer"
+          },
+          "mask_dilation": {
+            "default": 16,
+            "maximum": 256.0,
+            "minimum": 0.0,
+            "title": "Mask Dilation",
+            "type": "integer"
+          },
+          "paste_region": {
+            "default": "face_only",
+            "enum": [
+              "face_only",
+              "full_crop"
+            ],
+            "title": "Paste Region",
+            "type": "string"
+          },
+          "seed_mode": {
+            "default": "inherit",
+            "enum": [
+              "inherit",
+              "offset"
+            ],
+            "title": "Seed Mode",
+            "type": "string"
+          },
+          "select": {
+            "default": "largest_face",
+            "enum": [
+              "largest_face",
+              "centre_most"
+            ],
+            "title": "Select",
+            "type": "string"
+          },
+          "steps": {
+            "default": 8,
+            "maximum": 50.0,
+            "minimum": 1.0,
+            "title": "Steps",
+            "type": "integer"
+          }
+        },
+        "title": "DirectorFaceRefine",
+        "type": "object"
+      },
+      "DirectorMotionContext": {
+        "additionalProperties": false,
+        "properties": {
+          "audio_context_frames": {
+            "const": 24,
+            "default": 24,
+            "title": "Audio Context Frames",
+            "type": "integer"
+          },
+          "context_frames": {
+            "default": 22,
+            "enum": [
+              5,
+              22,
+              39,
+              56
+            ],
+            "title": "Context Frames",
+            "type": "integer"
+          },
+          "continuity": {
+            "const": true,
+            "default": true,
+            "title": "Continuity",
+            "type": "boolean"
+          },
+          "enabled": {
+            "default": false,
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "keep_tail": {
+            "default": false,
+            "title": "Keep Tail",
+            "type": "boolean"
+          }
+        },
+        "title": "DirectorMotionContext",
+        "type": "object"
+      },
+      "DirectorRefine": {
+        "additionalProperties": false,
+        "properties": {
+          "aspect_ratio": {
+            "const": "follow_director",
+            "default": "follow_director",
+            "title": "Aspect Ratio",
+            "type": "string"
+          },
+          "enable_latent_chunking": {
+            "default": false,
+            "title": "Enable Latent Chunking",
+            "type": "boolean"
+          },
+          "enable_tiling": {
+            "default": false,
+            "title": "Enable Tiling",
+            "type": "boolean"
+          },
+          "enabled": {
+            "default": false,
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "height": {
+            "default": 0,
+            "maximum": 8192.0,
+            "minimum": 0.0,
+            "multipleOf": 32.0,
+            "title": "Height",
+            "type": "integer"
+          },
+          "megapixels": {
+            "default": 0.0,
+            "maximum": 16.0,
+            "minimum": 0.0,
+            "title": "Megapixels",
+            "type": "number"
+          },
+          "mode": {
+            "default": "refine",
+            "enum": [
+              "refine",
+              "upscale",
+              "latent_upscale"
+            ],
+            "title": "Mode",
+            "type": "string"
+          },
+          "passes": {
+            "default": 1,
+            "maximum": 4.0,
+            "minimum": 1.0,
+            "title": "Passes",
+            "type": "integer"
+          },
+          "seed_mode": {
+            "default": "inherit",
+            "enum": [
+              "inherit",
+              "offset",
+              "independent"
+            ],
+            "title": "Seed Mode",
+            "type": "string"
+          },
+          "skip_fl2v": {
+            "default": true,
+            "title": "Skip Fl2V",
+            "type": "boolean"
+          },
+          "upscale_method": {
+            "default": "h3_latent",
+            "enum": [
+              "h3_latent",
+              "lanczos",
+              "nvidia_rtx_vsr"
+            ],
+            "title": "Upscale Method",
+            "type": "string"
+          },
+          "width": {
+            "default": 0,
+            "maximum": 8192.0,
+            "minimum": 0.0,
+            "multipleOf": 32.0,
+            "title": "Width",
+            "type": "integer"
+          }
+        },
+        "title": "DirectorRefine",
+        "type": "object"
+      },
+      "DirectorTimelineSegment": {
+        "additionalProperties": false,
+        "properties": {
+          "continuity_from_previous": {
+            "default": false,
+            "title": "Continuity From Previous",
+            "type": "boolean"
+          },
+          "frame_count": {
+            "default": 124,
+            "maximum": 100000.0,
+            "minimum": 5.0,
+            "title": "Frame Count",
+            "type": "integer"
+          },
+          "prompt": {
+            "default": "",
+            "maxLength": 30000,
+            "title": "Prompt",
+            "type": "string"
+          },
+          "scene_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Scene Id"
+          },
+          "start_frame": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Start Frame",
+            "type": "integer"
+          }
+        },
+        "title": "DirectorTimelineSegment",
         "type": "object"
       },
       "DownloadDTO": {
@@ -535,6 +936,50 @@
           "error"
         ],
         "title": "ErrorEnvelope",
+        "type": "object"
+      },
+      "ExecutionGroupDTO": {
+        "properties": {
+          "director_run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Director Run Id"
+          },
+          "execution_scope": {
+            "enum": [
+              "single_scene",
+              "aggregate"
+            ],
+            "title": "Execution Scope",
+            "type": "string"
+          },
+          "generation_ids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Generation Ids",
+            "type": "array"
+          },
+          "scene_ids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Scene Ids",
+            "type": "array"
+          }
+        },
+        "required": [
+          "execution_scope",
+          "scene_ids",
+          "generation_ids"
+        ],
+        "title": "ExecutionGroupDTO",
         "type": "object"
       },
       "FinalDTO": {
@@ -703,6 +1148,36 @@
       "GenerateAll": {
         "additionalProperties": false,
         "properties": {
+          "expected_scene_revisions": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "minimum": 1.0,
+                  "type": "integer"
+                },
+                "propertyNames": {
+                  "format": "uuid"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected Scene Revisions"
+          },
+          "expected_video_revision": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected Video Revision"
+          },
           "scene_ids": {
             "anyOf": [
               {
@@ -814,6 +1289,47 @@
         "title": "GenerationAttemptDTO",
         "type": "object"
       },
+      "GenerationCapabilitiesDTO": {
+        "properties": {
+          "available": {
+            "title": "Available",
+            "type": "boolean"
+          },
+          "combinations": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Combinations",
+            "type": "array"
+          },
+          "disabled": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Disabled",
+            "type": "array"
+          },
+          "qualified_capabilities": {
+            "additionalProperties": true,
+            "title": "Qualified Capabilities",
+            "type": "object"
+          },
+          "source_capabilities": {
+            "additionalProperties": true,
+            "title": "Source Capabilities",
+            "type": "object"
+          }
+        },
+        "required": [
+          "available",
+          "combinations",
+          "disabled"
+        ],
+        "title": "GenerationCapabilitiesDTO",
+        "type": "object"
+      },
       "GenerationDTO": {
         "properties": {
           "attempt_count": {
@@ -901,6 +1417,11 @@
               }
             ],
             "title": "Output Asset Id"
+          },
+          "output_metadata": {
+            "additionalProperties": true,
+            "title": "Output Metadata",
+            "type": "object"
           },
           "parent_generation_id": {
             "anyOf": [
@@ -1047,6 +1568,51 @@
       "GenerationRequest": {
         "additionalProperties": false,
         "properties": {
+          "aspect_ratio": {
+            "anyOf": [
+              {
+                "enum": [
+                  "16:9",
+                  "9:16",
+                  "1:1",
+                  "4:3",
+                  "3:4",
+                  "3:2",
+                  "2:3",
+                  "21:9",
+                  "Custom"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Aspect Ratio"
+          },
+          "audio_policy": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DirectorAudioPolicy"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "cfg": {
+            "anyOf": [
+              {
+                "maximum": 30.0,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cfg"
+          },
           "execution_prompt": {
             "anyOf": [
               {
@@ -1060,6 +1626,16 @@
             ],
             "title": "Execution Prompt"
           },
+          "face_refine": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DirectorFaceRefine"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "first_frame_asset_id": {
             "anyOf": [
               {
@@ -1072,11 +1648,37 @@
             ],
             "title": "First Frame Asset Id"
           },
+          "fps": {
+            "anyOf": [
+              {
+                "const": 24,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fps"
+          },
+          "frames": {
+            "anyOf": [
+              {
+                "maximum": 100000.0,
+                "minimum": 5.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Frames"
+          },
           "height": {
             "anyOf": [
               {
-                "maximum": 4096.0,
+                "maximum": 8192.0,
                 "minimum": 32.0,
+                "multipleOf": 32.0,
                 "type": "integer"
               },
               {
@@ -1103,9 +1705,17 @@
                 "enum": [
                   "t2v",
                   "i2v",
+                  "fl2v",
+                  "i2v_last",
                   "i2v_first_last",
-                  "r2v"
+                  "r2v",
+                  "v2v",
+                  "rv2v"
                 ],
+                "type": "string"
+              },
+              {
+                "const": "AUTO",
                 "type": "string"
               },
               {
@@ -1113,6 +1723,16 @@
               }
             ],
             "title": "Mode"
+          },
+          "motion_context": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DirectorMotionContext"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "operation": {
             "default": "ORIGINAL",
@@ -1135,6 +1755,26 @@
               }
             ],
             "title": "Parent Generation Id"
+          },
+          "quality_profile": {
+            "anyOf": [
+              {
+                "enum": [
+                  "DRAFT",
+                  "STANDARD",
+                  "HIGH",
+                  "BASE",
+                  "HD",
+                  "FULL_HD_REFINED",
+                  "CUSTOM"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Quality Profile"
           },
           "reference_audio_asset_ids": {
             "items": {
@@ -1163,10 +1803,20 @@
             "title": "Reference Video Asset Ids",
             "type": "array"
           },
+          "refine": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DirectorRefine"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "seed": {
             "anyOf": [
               {
-                "maximum": 9.223372036854776e+18,
+                "maximum": 9007199254740991.0,
                 "minimum": 0.0,
                 "type": "integer"
               },
@@ -1175,6 +1825,21 @@
               }
             ],
             "title": "Seed"
+          },
+          "seed_policy": {
+            "anyOf": [
+              {
+                "enum": [
+                  "RANDOM",
+                  "FIXED"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Seed Policy"
           },
           "source_scene_revision": {
             "anyOf": [
@@ -1187,6 +1852,18 @@
               }
             ],
             "title": "Source Scene Revision"
+          },
+          "source_video_asset_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Video Asset Id"
           },
           "source_video_revision": {
             "anyOf": [
@@ -1201,17 +1878,39 @@
             "title": "Source Video Revision"
           },
           "steps": {
-            "default": 8,
-            "maximum": 100.0,
-            "minimum": 1.0,
-            "title": "Steps",
-            "type": "integer"
+            "anyOf": [
+              {
+                "maximum": 100.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Steps"
+          },
+          "timeline": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/DirectorTimelineSegment"
+                },
+                "maxItems": 100,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Timeline"
           },
           "width": {
             "anyOf": [
               {
-                "maximum": 4096.0,
+                "maximum": 8192.0,
                 "minimum": 32.0,
+                "multipleOf": 32.0,
                 "type": "integer"
               },
               {
@@ -1780,6 +2479,376 @@
         "title": "PromptPreviewDTO",
         "type": "object"
       },
+      "PromptPreviewRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "aspect_ratio": {
+            "anyOf": [
+              {
+                "enum": [
+                  "16:9",
+                  "9:16",
+                  "1:1",
+                  "4:3",
+                  "3:4",
+                  "3:2",
+                  "2:3",
+                  "21:9",
+                  "Custom"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Aspect Ratio"
+          },
+          "audio_policy": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DirectorAudioPolicy"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "cfg": {
+            "anyOf": [
+              {
+                "maximum": 30.0,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cfg"
+          },
+          "execution_prompt": {
+            "anyOf": [
+              {
+                "maxLength": 30000,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Execution Prompt"
+          },
+          "face_refine": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DirectorFaceRefine"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "first_frame_asset_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "First Frame Asset Id"
+          },
+          "fps": {
+            "anyOf": [
+              {
+                "const": 24,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fps"
+          },
+          "frames": {
+            "anyOf": [
+              {
+                "maximum": 100000.0,
+                "minimum": 5.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Frames"
+          },
+          "height": {
+            "anyOf": [
+              {
+                "maximum": 8192.0,
+                "minimum": 32.0,
+                "multipleOf": 32.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Height"
+          },
+          "last_frame_asset_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Frame Asset Id"
+          },
+          "mode": {
+            "anyOf": [
+              {
+                "enum": [
+                  "t2v",
+                  "i2v",
+                  "fl2v",
+                  "i2v_last",
+                  "i2v_first_last",
+                  "r2v",
+                  "v2v",
+                  "rv2v"
+                ],
+                "type": "string"
+              },
+              {
+                "const": "AUTO",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mode"
+          },
+          "motion_context": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DirectorMotionContext"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "operation": {
+            "default": "ORIGINAL",
+            "enum": [
+              "ORIGINAL",
+              "REGENERATE",
+              "VARIATION"
+            ],
+            "title": "Operation",
+            "type": "string"
+          },
+          "parent_generation_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parent Generation Id"
+          },
+          "quality_profile": {
+            "anyOf": [
+              {
+                "enum": [
+                  "DRAFT",
+                  "STANDARD",
+                  "HIGH",
+                  "BASE",
+                  "HD",
+                  "FULL_HD_REFINED",
+                  "CUSTOM"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Quality Profile"
+          },
+          "reference_audio_asset_ids": {
+            "items": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "maxItems": 3,
+            "title": "Reference Audio Asset Ids",
+            "type": "array"
+          },
+          "reference_image_asset_ids": {
+            "items": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "maxItems": 9,
+            "title": "Reference Image Asset Ids",
+            "type": "array"
+          },
+          "reference_video_asset_ids": {
+            "items": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "maxItems": 3,
+            "title": "Reference Video Asset Ids",
+            "type": "array"
+          },
+          "refine": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DirectorRefine"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "seed": {
+            "anyOf": [
+              {
+                "maximum": 9007199254740991.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Seed"
+          },
+          "seed_policy": {
+            "anyOf": [
+              {
+                "enum": [
+                  "RANDOM",
+                  "FIXED"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Seed Policy"
+          },
+          "source_scene_revision": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Scene Revision"
+          },
+          "source_video_asset_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Video Asset Id"
+          },
+          "source_video_revision": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Video Revision"
+          },
+          "steps": {
+            "anyOf": [
+              {
+                "maximum": 100.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Steps"
+          },
+          "timeline": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/DirectorTimelineSegment"
+                },
+                "maxItems": 100,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Timeline"
+          },
+          "width": {
+            "anyOf": [
+              {
+                "maximum": 8192.0,
+                "minimum": 32.0,
+                "multipleOf": 32.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Width"
+          },
+          "workflow_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workflow Id"
+          }
+        },
+        "title": "PromptPreviewRequest",
+        "type": "object"
+      },
       "ReconciliationDTO": {
         "properties": {
           "corrupt_objects": {
@@ -1826,6 +2895,49 @@
           "repaired_assets"
         ],
         "title": "ReconciliationDTO",
+        "type": "object"
+      },
+      "RegenerateRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "parent_generation_id": {
+            "format": "uuid",
+            "title": "Parent Generation Id",
+            "type": "string"
+          },
+          "seed": {
+            "anyOf": [
+              {
+                "maximum": 9007199254740991.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Seed"
+          },
+          "seed_policy": {
+            "anyOf": [
+              {
+                "enum": [
+                  "RANDOM",
+                  "FIXED"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Seed Policy"
+          }
+        },
+        "required": [
+          "parent_generation_id"
+        ],
+        "title": "RegenerateRequest",
         "type": "object"
       },
       "Reorder": {
@@ -1941,6 +3053,9 @@
             "title": "Duration Seconds",
             "type": "number"
           },
+          "generation_config": {
+            "$ref": "#/components/schemas/SceneGenerationConfig"
+          },
           "negative_prompt": {
             "default": "",
             "maxLength": 10000,
@@ -1990,6 +3105,11 @@
             "title": "Enabled",
             "type": "boolean"
           },
+          "generation_config": {
+            "additionalProperties": true,
+            "title": "Generation Config",
+            "type": "object"
+          },
           "id": {
             "title": "Id",
             "type": "string"
@@ -2009,6 +3129,11 @@
           "scene_order": {
             "title": "Scene Order",
             "type": "integer"
+          },
+          "selected_generation_fresh": {
+            "default": false,
+            "title": "Selected Generation Fresh",
+            "type": "boolean"
           },
           "selected_generation_id": {
             "anyOf": [
@@ -2047,6 +3172,229 @@
         "title": "SceneDTO",
         "type": "object"
       },
+      "SceneGenerationConfig": {
+        "additionalProperties": false,
+        "properties": {
+          "aspect_ratio": {
+            "anyOf": [
+              {
+                "enum": [
+                  "16:9",
+                  "9:16",
+                  "1:1",
+                  "4:3",
+                  "3:4",
+                  "3:2",
+                  "2:3",
+                  "21:9",
+                  "Custom"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Aspect Ratio"
+          },
+          "audio_policy": {
+            "$ref": "#/components/schemas/DirectorAudioPolicy"
+          },
+          "cfg": {
+            "default": 1.0,
+            "maximum": 30.0,
+            "minimum": 0.0,
+            "title": "Cfg",
+            "type": "number"
+          },
+          "face_refine": {
+            "$ref": "#/components/schemas/DirectorFaceRefine"
+          },
+          "first_frame_asset_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "First Frame Asset Id"
+          },
+          "fps": {
+            "anyOf": [
+              {
+                "const": 24,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fps"
+          },
+          "frames": {
+            "anyOf": [
+              {
+                "maximum": 100000.0,
+                "minimum": 5.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Frames"
+          },
+          "height": {
+            "anyOf": [
+              {
+                "maximum": 8192.0,
+                "minimum": 32.0,
+                "multipleOf": 32.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Height"
+          },
+          "last_frame_asset_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Frame Asset Id"
+          },
+          "mode": {
+            "anyOf": [
+              {
+                "enum": [
+                  "t2v",
+                  "i2v",
+                  "fl2v",
+                  "i2v_last",
+                  "i2v_first_last",
+                  "r2v",
+                  "v2v",
+                  "rv2v"
+                ],
+                "type": "string"
+              },
+              {
+                "const": "AUTO",
+                "type": "string"
+              }
+            ],
+            "default": "AUTO",
+            "title": "Mode"
+          },
+          "motion_context": {
+            "$ref": "#/components/schemas/DirectorMotionContext"
+          },
+          "quality_profile": {
+            "default": "STANDARD",
+            "enum": [
+              "DRAFT",
+              "STANDARD",
+              "HIGH",
+              "BASE",
+              "HD",
+              "FULL_HD_REFINED",
+              "CUSTOM"
+            ],
+            "title": "Quality Profile",
+            "type": "string"
+          },
+          "reference_audio_asset_ids": {
+            "items": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "maxItems": 3,
+            "title": "Reference Audio Asset Ids",
+            "type": "array"
+          },
+          "reference_image_asset_ids": {
+            "items": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "maxItems": 9,
+            "title": "Reference Image Asset Ids",
+            "type": "array"
+          },
+          "reference_video_asset_ids": {
+            "items": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "maxItems": 3,
+            "title": "Reference Video Asset Ids",
+            "type": "array"
+          },
+          "refine": {
+            "$ref": "#/components/schemas/DirectorRefine"
+          },
+          "seed": {
+            "anyOf": [
+              {
+                "maximum": 9007199254740991.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Seed"
+          },
+          "seed_policy": {
+            "default": "RANDOM",
+            "enum": [
+              "RANDOM",
+              "FIXED"
+            ],
+            "title": "Seed Policy",
+            "type": "string"
+          },
+          "source_video_asset_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Video Asset Id"
+          },
+          "width": {
+            "anyOf": [
+              {
+                "maximum": 8192.0,
+                "minimum": 32.0,
+                "multipleOf": 32.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Width"
+          }
+        },
+        "title": "SceneGenerationConfig",
+        "type": "object"
+      },
       "ScenePatch": {
         "additionalProperties": false,
         "properties": {
@@ -2073,6 +3421,16 @@
               }
             ],
             "title": "Enabled"
+          },
+          "generation_config": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SceneGenerationConfig"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "negative_prompt": {
             "anyOf": [
@@ -2371,10 +3729,12 @@
               "image/webp",
               "video/mp4",
               "video/webm",
+              "video/quicktime",
               "audio/wav",
               "audio/mpeg",
               "audio/mp4",
-              "audio/ogg"
+              "audio/ogg",
+              "audio/flac"
             ],
             "title": "Content Type",
             "type": "string"
@@ -2416,6 +3776,7 @@
               "PROJECT_REFERENCE",
               "REFERENCE_VIDEO",
               "REFERENCE_AUDIO",
+              "SOURCE_VIDEO",
               "BACKGROUND_AUDIO"
             ],
             "title": "Role",
@@ -2619,6 +3980,51 @@
       "VariationRequest": {
         "additionalProperties": false,
         "properties": {
+          "aspect_ratio": {
+            "anyOf": [
+              {
+                "enum": [
+                  "16:9",
+                  "9:16",
+                  "1:1",
+                  "4:3",
+                  "3:4",
+                  "3:2",
+                  "2:3",
+                  "21:9",
+                  "Custom"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Aspect Ratio"
+          },
+          "audio_policy": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DirectorAudioPolicy"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "cfg": {
+            "anyOf": [
+              {
+                "maximum": 30.0,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cfg"
+          },
           "execution_prompt": {
             "anyOf": [
               {
@@ -2632,6 +4038,16 @@
             ],
             "title": "Execution Prompt"
           },
+          "face_refine": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DirectorFaceRefine"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "first_frame_asset_id": {
             "anyOf": [
               {
@@ -2644,11 +4060,37 @@
             ],
             "title": "First Frame Asset Id"
           },
+          "fps": {
+            "anyOf": [
+              {
+                "const": 24,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fps"
+          },
+          "frames": {
+            "anyOf": [
+              {
+                "maximum": 100000.0,
+                "minimum": 5.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Frames"
+          },
           "height": {
             "anyOf": [
               {
-                "maximum": 4096.0,
+                "maximum": 8192.0,
                 "minimum": 32.0,
+                "multipleOf": 32.0,
                 "type": "integer"
               },
               {
@@ -2675,9 +4117,17 @@
                 "enum": [
                   "t2v",
                   "i2v",
+                  "fl2v",
+                  "i2v_last",
                   "i2v_first_last",
-                  "r2v"
+                  "r2v",
+                  "v2v",
+                  "rv2v"
                 ],
+                "type": "string"
+              },
+              {
+                "const": "AUTO",
                 "type": "string"
               },
               {
@@ -2686,10 +4136,40 @@
             ],
             "title": "Mode"
           },
+          "motion_context": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DirectorMotionContext"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "parent_generation_id": {
             "format": "uuid",
             "title": "Parent Generation Id",
             "type": "string"
+          },
+          "quality_profile": {
+            "anyOf": [
+              {
+                "enum": [
+                  "DRAFT",
+                  "STANDARD",
+                  "HIGH",
+                  "BASE",
+                  "HD",
+                  "FULL_HD_REFINED",
+                  "CUSTOM"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Quality Profile"
           },
           "reference_audio_asset_ids": {
             "items": {
@@ -2718,10 +4198,20 @@
             "title": "Reference Video Asset Ids",
             "type": "array"
           },
+          "refine": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DirectorRefine"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "seed": {
             "anyOf": [
               {
-                "maximum": 9.223372036854776e+18,
+                "maximum": 9007199254740991.0,
                 "minimum": 0.0,
                 "type": "integer"
               },
@@ -2730,6 +4220,21 @@
               }
             ],
             "title": "Seed"
+          },
+          "seed_policy": {
+            "anyOf": [
+              {
+                "enum": [
+                  "RANDOM",
+                  "FIXED"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Seed Policy"
           },
           "source_scene_revision": {
             "anyOf": [
@@ -2742,6 +4247,18 @@
               }
             ],
             "title": "Source Scene Revision"
+          },
+          "source_video_asset_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Video Asset Id"
           },
           "source_video_revision": {
             "anyOf": [
@@ -2756,17 +4273,39 @@
             "title": "Source Video Revision"
           },
           "steps": {
-            "default": 8,
-            "maximum": 100.0,
-            "minimum": 1.0,
-            "title": "Steps",
-            "type": "integer"
+            "anyOf": [
+              {
+                "maximum": 100.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Steps"
+          },
+          "timeline": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/DirectorTimelineSegment"
+                },
+                "maxItems": 100,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Timeline"
           },
           "width": {
             "anyOf": [
               {
-                "maximum": 4096.0,
+                "maximum": 8192.0,
                 "minimum": 32.0,
+                "multipleOf": 32.0,
                 "type": "integer"
               },
               {
@@ -2800,9 +4339,15 @@
           "aspect_ratio": {
             "default": "9:16",
             "enum": [
-              "9:16",
               "16:9",
-              "1:1"
+              "9:16",
+              "1:1",
+              "4:3",
+              "3:4",
+              "3:2",
+              "2:3",
+              "21:9",
+              "Custom"
             ],
             "title": "Aspect Ratio",
             "type": "string"
@@ -3099,6 +4644,28 @@
       "VideoPatch": {
         "additionalProperties": false,
         "properties": {
+          "aspect_ratio": {
+            "anyOf": [
+              {
+                "enum": [
+                  "16:9",
+                  "9:16",
+                  "1:1",
+                  "4:3",
+                  "3:4",
+                  "3:2",
+                  "2:3",
+                  "21:9",
+                  "Custom"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Aspect Ratio"
+          },
           "brief": {
             "anyOf": [
               {
@@ -3164,12 +4731,25 @@
             "title": "Code",
             "type": "string"
           },
+          "execution_scope": {
+            "default": "single_scene",
+            "enum": [
+              "single_scene",
+              "aggregate"
+            ],
+            "title": "Execution Scope",
+            "type": "string"
+          },
           "mode": {
             "enum": [
               "t2v",
               "i2v",
+              "fl2v",
+              "i2v_last",
               "i2v_first_last",
-              "r2v"
+              "r2v",
+              "v2v",
+              "rv2v"
             ],
             "title": "Mode",
             "type": "string"
@@ -3178,6 +4758,20 @@
             "additionalProperties": true,
             "title": "Profile",
             "type": "object"
+          },
+          "quality_profile": {
+            "default": "STANDARD",
+            "enum": [
+              "DRAFT",
+              "STANDARD",
+              "HIGH",
+              "BASE",
+              "HD",
+              "FULL_HD_REFINED",
+              "CUSTOM"
+            ],
+            "title": "Quality Profile",
+            "type": "string"
           },
           "required_slots": {
             "items": {
@@ -3204,7 +4798,7 @@
             "type": "object"
           },
           "version": {
-            "maxLength": 50,
+            "maxLength": 128,
             "minLength": 1,
             "title": "Version",
             "type": "string"
@@ -3255,6 +4849,15 @@
             "title": "Enabled",
             "type": "boolean"
           },
+          "execution_scope": {
+            "default": "single_scene",
+            "enum": [
+              "single_scene",
+              "aggregate"
+            ],
+            "title": "Execution Scope",
+            "type": "string"
+          },
           "id": {
             "title": "Id",
             "type": "string"
@@ -3263,8 +4866,12 @@
             "enum": [
               "t2v",
               "i2v",
+              "fl2v",
+              "i2v_last",
               "i2v_first_last",
-              "r2v"
+              "r2v",
+              "v2v",
+              "rv2v"
             ],
             "title": "Mode",
             "type": "string"
@@ -3273,6 +4880,20 @@
             "additionalProperties": true,
             "title": "Profile",
             "type": "object"
+          },
+          "quality_profile": {
+            "default": "STANDARD",
+            "enum": [
+              "DRAFT",
+              "STANDARD",
+              "HIGH",
+              "BASE",
+              "HD",
+              "FULL_HD_REFINED",
+              "CUSTOM"
+            ],
+            "title": "Quality Profile",
+            "type": "string"
           },
           "required_slots": {
             "items": {
@@ -3303,7 +4924,7 @@
             "type": "object"
           },
           "version": {
-            "maxLength": 50,
+            "maxLength": 128,
             "minLength": 1,
             "title": "Version",
             "type": "string"
@@ -4695,6 +6316,70 @@
         "parameters": [
           {
             "in": "query",
+            "name": "project_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Project Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "product_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Product Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Status"
+            }
+          },
+          {
+            "in": "query",
+            "name": "kind",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Kind"
+            }
+          },
+          {
+            "in": "query",
             "name": "page",
             "required": false,
             "schema": {
@@ -4825,6 +6510,124 @@
           }
         ],
         "summary": "List Assets",
+        "tags": [
+          "assets"
+        ]
+      }
+    },
+    "/api/v1/assets/upload-policy": {
+      "get": {
+        "operationId": "upload_policy_api_v1_assets_upload_policy_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Upload Policy Api V1 Assets Upload Policy Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Invalid request or business rule"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Authentication required"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Permission denied"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Resource not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "State or idempotency conflict"
+          },
+          "412": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Revision precondition failed"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Request validation failed"
+          },
+          "428": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Required precondition missing"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Unexpected server error"
+          }
+        },
+        "security": [
+          {
+            "StudioSession": []
+          }
+        ],
+        "summary": "Upload Policy",
         "tags": [
           "assets"
         ]
@@ -5264,7 +7067,7 @@
           "required": true
         },
         "responses": {
-          "200": {
+          "202": {
             "content": {
               "application/json": {
                 "schema": {
@@ -6953,6 +8756,122 @@
         "summary": "Download Final Version",
         "tags": [
           "assembly"
+        ]
+      }
+    },
+    "/api/v1/generation-capabilities": {
+      "get": {
+        "operationId": "generation_capabilities_api_v1_generation_capabilities_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenerationCapabilitiesDTO"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Invalid request or business rule"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Authentication required"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Permission denied"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Resource not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "State or idempotency conflict"
+          },
+          "412": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Revision precondition failed"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Request validation failed"
+          },
+          "428": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Required precondition missing"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Unexpected server error"
+          }
+        },
+        "security": [
+          {
+            "StudioSession": []
+          }
+        ],
+        "summary": "Generation Capabilities",
+        "tags": [
+          "generations"
         ]
       }
     },
@@ -10562,6 +12481,23 @@
             }
           }
         ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/PromptPreviewRequest"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Payload"
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
             "content": {
@@ -10670,6 +12606,161 @@
           }
         ],
         "summary": "Preview Prompt",
+        "tags": [
+          "generations"
+        ]
+      }
+    },
+    "/api/v1/scenes/{scene_id}/regenerations": {
+      "post": {
+        "operationId": "create_regeneration_api_v1_scenes__scene_id__regenerations_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scene_id",
+            "required": true,
+            "schema": {
+              "title": "Scene Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "title": "Idempotency-Key",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-CSRF-Token",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RegenerateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenerationDTO"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Invalid request or business rule"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Authentication required"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Permission denied"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Resource not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "State or idempotency conflict"
+          },
+          "412": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Revision precondition failed"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Request validation failed"
+          },
+          "428": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Required precondition missing"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Unexpected server error"
+          }
+        },
+        "security": [
+          {
+            "StudioSession": []
+          }
+        ],
+        "summary": "Create Regeneration",
         "tags": [
           "generations"
         ]

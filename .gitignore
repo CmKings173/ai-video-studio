@@ -1,9 +1,19 @@
 .env
 .venv/
+backend/.venv/
+frontend/.next/
+frontend/.next-correction/
+frontend/node_modules/
+frontend/.tmp/
+frontend/out/
+frontend/.env.local
+*.tsbuildinfo
 __pycache__/
 *.py[cod]
 .pytest_cache/
 .ruff_cache/
+backend/.pytest_cache/
+backend/.ruff_cache/
 .coverage
 htmlcov/
 dist/
@@ -11,6 +21,7 @@ dist/
 data/
 workspace/
 *.db
+/backups/
 
 # Local reference checkouts and developer tooling (not part of the studio app)
 Calliope/
@@ -18,3 +29,18 @@ h3-webui/
 minimax-h3-frontend/
 codex-with-chatgpt/
 pytest-of-Admin/
+/.artifacts/final-ui-media-closeout/
+
+# Secrets and local review/runtime outputs
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+/tasks/evidence/*.png
+/tasks/evidence/*.json
+/tasks/evidence/*.log
+/tasks/evidence/*.txt
+/tasks/h3-reference-artifacts/
+/docs/h3-poc/runtime-cpu-verification-*.json
