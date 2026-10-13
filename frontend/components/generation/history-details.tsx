@@ -11,24 +11,31 @@ import { historyGenerationRequiresAggregate } from "@/lib/generation/eligible-sc
 import { aggregateGuidance } from "@/lib/generation/workspace-state";
 import { useI18n } from "@/lib/i18n";
 import { Button } from "@/components/ui/button";
+import { OutputMetadataSummary } from "@/components/generation/output-metadata-summary";
 
-export function GenerationHistoryDetails({ generation, scene, scenes, onRegenerate, onVariation, onReuse, busy }: {
+export function GenerationHistoryDetails({ generation, scene, scenes, onRegenerate, onVariation, onReuse, onReuseSeed, busy }: {
   scene: SceneDTO | undefined; scenes: SceneDTO[];
-  generation: GenerationDTO; onRegenerate: () => void; onVariation: () => void; onReuse: () => void; busy: boolean;
+  generation: GenerationDTO; onRegenerate: () => void; onVariation: () => void;
+  onReuse: () => void; onReuseSeed: (seed: number) => void; busy: boolean;
 }) {
   const { t } = useI18n();
-  const shown = (value: unknown): string => typeof value === "string" || typeof value === "number" ? String(value) : t("Chưa có dữ liệu", "No data");
-  const qualityLabel = (value: unknown) => typeof value === "string" ? ({ DRAFT: t("Bản nháp", "Draft"), STANDARD: t("Tiêu chuẩn", "Standard"), HIGH: t("Cao", "High"), BASE: t("Cơ bản", "Base"), HD: t("HD", "HD"), FULL_HD_REFINED: t("Full HD đã tinh chỉnh", "Refined Full HD"), CUSTOM: t("Tùy chỉnh", "Custom") } as Record<string, string>)[value] ?? shown(value) : shown(value);
   const snapshot = generation.input_snapshot;
+  const freshness = snapshot.generation_freshness;
+  const executionGroup = freshness && typeof freshness === "object" && !Array.isArray(freshness)
+    ? (freshness as Record<string, unknown>).execution_group
+    : null;
+  const isAggregateMember = Boolean(executionGroup && typeof executionGroup === "object");
+  const recordedSeed = [
+    generation.output_metadata?.resolved_global_seed,
+    ...(isAggregateMember ? [] : [
+      snapshot.seed,
+      snapshot.director_execution?.seed,
+      snapshot.director_execution_spec?.generation?.seed,
+    ]),
+  ].find((value): value is number =>
+    typeof value === "number" && Number.isSafeInteger(value) && value >= 0,
+  );
   const requiresAggregate = !!scene && historyGenerationRequiresAggregate(scene, scenes, generation);
-  const director = snapshot.director_execution_spec;
-  const frozenDirector = snapshot.director_execution;
-  const frozenGeneration = frozenDirector ? {
-    width: frozenDirector.canvas.width, height: frozenDirector.canvas.height,
-    fps: frozenDirector.fps, frame_count: frozenDirector.frames, seed: frozenDirector.seed,
-    duration_seconds: frozenDirector.resolved_duration_seconds,
-  } : director?.generation;
-  const measured = generation.output_metadata ?? {};
   const caps = useQuery({ queryKey: ["generation-capabilities"], queryFn: generationCapabilities });
   const parentAvailable = caps.data?.available && qualifiedCombinations(caps.data).some((item) => item.workflow_id === generation.workflow_id
     && (item.mode === generation.mode || (item.mode === "fl2v" && ["i2v_last", "i2v_first_last"].includes(generation.mode)))
@@ -38,26 +45,7 @@ export function GenerationHistoryDetails({ generation, scene, scenes, onRegenera
     queryFn: () => downloadAsset(generation.output_asset_id!), enabled: generation.status === "COMPLETED" && !!generation.output_asset_id });
 
   return <div className="space-y-3">
-    <dl className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs sm:grid-cols-4">
-      <dt className="text-[#9ea5b0]">{t("Thao tác / chất lượng", "Operation / quality")}</dt><dd>{generation.operation === "ORIGINAL" ? t("Tạo mới", "Original") : generation.operation === "REGENERATE" ? t("Tạo lại", "Regenerate") : t("Biến thể", "Variation")} · {qualityLabel(snapshot.requested_quality_profile)}</dd>
-      <dt className="text-[#9ea5b0]">{t("Tác vụ", "Task")}</dt><dd>{shown(frozenDirector?.task ?? snapshot.task ?? director?.intent?.director_task ?? generation.mode)}</dd>
-      <dt className="text-[#9ea5b0]">{t("Seed", "Seed")}</dt><dd>{shown(snapshot.seed ?? frozenGeneration?.seed)}</dd>
-      {measured.director_run_id != null && <>
-        <dt className="text-[#9ea5b0]">{t("Lần chạy Director", "Director run")}</dt><dd>{shown(measured.director_run_id)}</dd>
-        <dt className="text-[#9ea5b0]">{t("Seed chung của nhóm", "Aggregate global seed")}</dt><dd>{shown(measured.resolved_global_seed)}</dd>
-      </>}
-      <dt className="text-[#9ea5b0]">{t("Kích thước yêu cầu", "Requested dimensions")}</dt><dd>{shown(snapshot.requested_width ?? frozenGeneration?.width ?? snapshot.width)} x {shown(snapshot.requested_height ?? frozenGeneration?.height ?? snapshot.height)}</dd>
-      <dt className="text-[#9ea5b0]">{t("Kích thước được xác định", "Resolved dimensions")}</dt><dd>{shown(snapshot.resolved_width ?? frozenGeneration?.width ?? snapshot.width)} x {shown(snapshot.resolved_height ?? frozenGeneration?.height ?? snapshot.height)}</dd>
-      <dt className="text-[#9ea5b0]">{t("Kích thước đo được", "Measured dimensions")}</dt><dd>{shown(measured.width)} x {shown(measured.height)}</dd>
-      <dt className="text-[#9ea5b0]">{t("FPS yêu cầu / xác định / đo được", "FPS requested / resolved / measured")}</dt><dd>{shown(snapshot.requested_fps ?? frozenGeneration?.fps ?? snapshot.fps)} / {shown(snapshot.resolved_fps ?? frozenGeneration?.fps ?? snapshot.fps)} / {shown(measured.fps)}</dd>
-      <dt className="text-[#9ea5b0]">{t("Thời lượng yêu cầu / xác định / đo được", "Duration requested / resolved / measured")}</dt><dd>{shown(snapshot.requested_duration_seconds ?? frozenDirector?.requested_duration_seconds ?? snapshot.duration_seconds ?? frozenGeneration?.duration_seconds)} / {shown(snapshot.resolved_duration_seconds ?? frozenGeneration?.duration_seconds)} / {shown(measured.video_duration_seconds ?? measured.duration_seconds)} s</dd>
-      <dt className="text-[#9ea5b0]">{t("Số khung yêu cầu / xác định / đo được", "Frames requested / resolved / measured")}</dt><dd>{shown(snapshot.requested_frames ?? frozenGeneration?.frame_count ?? snapshot.frames)} / {shown(snapshot.resolved_frames ?? frozenGeneration?.frame_count)} / {shown(measured.frames ?? measured.frame_count)}</dd>
-      <dt className="text-[#9ea5b0]">{t("Workflow", "Workflow")}</dt><dd>{shown(snapshot.workflow_version)}</dd>
-      <dt className="text-[#9ea5b0]">{t("Phiên bản nguồn Director cố định", "Pinned Director source")}</dt><dd>{shown(frozenDirector?.provider ?? director?.provider?.id)} · {shown(frozenDirector?.source_commit ?? director?.provider?.commit)}</dd>
-      <dt className="text-[#9ea5b0]">{t("Nhà cung cấp", "Provider")}</dt><dd>{shown(snapshot.provider)} · {shown(frozenDirector?.provider_version ?? snapshot.provider_version)}</dd>
-      <dt className="text-[#9ea5b0]">{t("Thời gian chạy", "Execution time")}</dt><dd>{shown(measured.execution_seconds)}</dd>
-      <dt className="text-[#9ea5b0]">{t("Số byte đầu ra", "Output bytes")}</dt><dd>{shown(measured.size_bytes)}</dd>
-    </dl>
+    <OutputMetadataSummary generation={generation} />
     <details className="text-xs"><summary className="cursor-pointer rounded focus-visible:outline focus-visible:outline-2 focus-visible:outline-blue-400">{t("Prompt đã thực thi", "Executed prompt")}</summary><pre className="mt-2 whitespace-pre-wrap break-words text-[#c3c6d7]">{snapshot.prompt ?? t("Chưa có dữ liệu", "No data")}</pre></details>
     <div className="flex flex-wrap items-center gap-2">
       {generation.status === "COMPLETED" && <>
@@ -67,6 +55,10 @@ export function GenerationHistoryDetails({ generation, scene, scenes, onRegenera
         {!parentAvailable && <span className="text-xs text-amber-300">{t("Workflow của bản cha chưa khả dụng cho lần chạy mới.", "The parent workflow is unavailable for a new run.")}</span>}
       </>}
       <Button size="sm" variant="secondary" disabled={busy} onClick={onReuse}>{t("Dùng lại cấu hình cho cảnh", "Reuse settings for scene")}</Button>
+      {recordedSeed !== undefined && <Button
+        size="sm" variant="secondary" disabled={busy} onClick={() => onReuseSeed(recordedSeed)}>
+        {t(`Dùng lại seed ${recordedSeed}`, `Reuse seed ${recordedSeed}`)}
+      </Button>}
       {download && <a className="secondary-action text-xs focus-visible:outline focus-visible:outline-2 focus-visible:outline-blue-400" href={download.url} target="_blank" rel="noopener noreferrer" download>{t("Tải xuống", "Download")}</a>}
       {generation.status === "COMPLETED" && <span className="text-xs text-[#9ea5b0]">{t("Nâng cao chất lượng: chưa có nhà cung cấp được cấu hình.", "Enhancement: no provider is configured.")}</span>}
     </div>

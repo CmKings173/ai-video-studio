@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import copy
 import math
-from dataclasses import fields
+from dataclasses import dataclass, fields
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StrictBool
@@ -19,7 +19,12 @@ from apps.api.app.schemas.api import GenerationMode, GenerationRatio, QualityPro
 from apps.api.app.services.executable_weights import collect_executable_weights
 from apps.api.app.services.h3_validator import H3Profile
 from apps.api.app.services.qualification_binding import execution_profile_hash
-from apps.api.app.services.workflow_qualification import SHA256, MeasuredOutput, require_qualified
+from apps.api.app.services.workflow_qualification import (
+    SHA256,
+    MeasuredOutput,
+    qualification_for_combination,
+    require_qualified,
+)
 from apps.api.app.services.workflow_registry import (
     ApprovedWorkflow,
     _stable_hash,
@@ -282,6 +287,11 @@ def require_asset_slot(approved: ApprovedWorkflow, name: str) -> None:
 def require_contract(
     record, approved: ApprovedWorkflow, quality: str | None = None, ratio: str | None = None
 ) -> WorkflowProfile:
+    profile_data = getattr(record, "profile", None)
+    if isinstance(profile_data, dict) and profile_data.get("retired") is True:
+        raise AppError(
+            "WORKFLOW_RETIRED", "Retired workflows cannot run new generations", 409
+        )
     require_qualified(record.profile, approved.workflow_hash, approved.slot_map_hash)
     try:
         approved.validate()
@@ -598,6 +608,68 @@ def require_contract(
     if not valid_ratios or ratio is not None and ratio not in valid_ratios:
         raise invalid("Requested mode/profile/ratio has no executed qualification")
     return profile
+
+
+@dataclass(frozen=True)
+class QualifiedGenerationCombination:
+    """The exact executed baseline combination resolved for a request."""
+
+    profile: WorkflowProfile
+    combination: ExecutedCombination
+    width: int
+    height: int
+    frames: int
+
+    @property
+    def duration_seconds(self) -> float:
+        return self.frames / self.profile.fps
+
+
+def resolve_qualified_generation_combination(
+    record,
+    approved: ApprovedWorkflow,
+    *,
+    quality_profile: str,
+    aspect_ratio: str,
+    duration_seconds: float,
+) -> QualifiedGenerationCombination:
+    """Resolve one exact, graph-qualified canvas/frame combination.
+
+    `require_contract` verifies the full stored profile and every executed
+    combination. This helper then selects the exact requested evidence row and
+    applies the profile's authoritative canvas and duration resolvers.
+    """
+    profile = require_contract(record, approved, quality_profile, aspect_ratio)
+    status, raw_combination = qualification_for_combination(
+        record.profile,
+        record.workflow_hash,
+        record.slot_map_hash,
+        mode=record.mode,
+        quality_profile=quality_profile,
+        aspect_ratio=aspect_ratio,
+    )
+    if not status.qualified or raw_combination is None:
+        raise invalid(status.reason or "Requested configuration lacks exact executed evidence")
+    try:
+        combination = ExecutedCombination.model_validate(raw_combination)
+        width, height = resolve_canvas(profile.resolution, approved, aspect_ratio)
+        frames = resolve_frames(profile, approved, duration_seconds)
+    except (TypeError, ValueError, KeyError) as exc:
+        raise invalid("Requested qualified combination could not be resolved") from exc
+    if (
+        combination.mode != record.mode
+        or combination.quality_profile != quality_profile
+        or combination.aspect_ratio != aspect_ratio
+        or (combination.width, combination.height) != (width, height)
+    ):
+        raise invalid("Executed combination differs from the requested qualified configuration")
+    return QualifiedGenerationCombination(
+        profile=profile,
+        combination=combination,
+        width=width,
+        height=height,
+        frames=frames,
+    )
 
 
 def approved_record(record) -> ApprovedWorkflow:

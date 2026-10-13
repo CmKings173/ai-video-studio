@@ -3,6 +3,7 @@
 from copy import deepcopy
 from typing import Any
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from apps.api.app.db.models import Scene, SceneGeneration, Video
@@ -80,7 +81,15 @@ async def unchanged_batch_inputs(
             or scene["revision"] != original["revision"] + 1
         ):
             return False
-        generation = await session.get(SceneGeneration, selected)
+        generation = await session.scalar(
+            select(SceneGeneration)
+            .join(Scene, Scene.id == SceneGeneration.scene_id)
+            .where(
+                Scene.id == scene["id"],
+                SceneGeneration.id == selected,
+                SceneGeneration.video_id == Scene.video_id,
+            )
+        )
         if (
             generation is None
             or generation.scene_id != scene["id"]

@@ -9,7 +9,7 @@ import { getErrorMessage } from "@/lib/api/errors";
 import type { GenerationAspectRatio, GenerationRequest, PromptPreviewDTO, SceneDTO, SceneGenerationConfig, VideoDTO } from "@/lib/api/types";
 import { acceptPrompt, acceptedGenerationRequest, createPromptContext, isAcceptedPromptCurrent } from "@/lib/generation/accepted-prompt";
 import type { AcceptedPrompt, PromptContext } from "@/lib/generation/accepted-prompt";
-import { aggregateCapability, deriveMode, generationInputProblems, matchingQualifiedCapabilities, singleSceneCapability, qualifiedCombinations, qualifiedDirectorFeature } from "@/lib/generation/capabilities";
+import { aggregateCapability, capabilityRunnable, deriveMode, generationInputProblems, matchingQualifiedCapabilities, singleSceneCapability, qualifiedCombinations, qualifiedDirectorFeature, qualifiedDiscoveryCapabilities, qualifiedQualityProfiles, resolvedConfigurationMatchesRequest } from "@/lib/generation/capabilities";
 import { useI18n } from "@/lib/i18n";
 import { directGenerationRequiresAggregate } from "@/lib/generation/eligible-scenes";
 import { aggregateGuidance } from "@/lib/generation/workspace-state";
@@ -19,6 +19,7 @@ import { Button } from "@/components/ui/button";
 import { Dialog } from "@/components/ui/dialog";
 import { Alert } from "@/components/ui/alert";
 import { OrderedReferences } from "./ordered-references";
+import { GenerationSettingsSummary } from "./generation-settings-summary";
 
 const modes = [
   ["AUTO", "Tự động", "Automatic"], ["t2v", "Văn bản thành video", "Text to video"], ["i2v", "Khung đầu", "Starting frame"],
@@ -42,7 +43,7 @@ export function GenerationEditor({ scene, scenes, video, onClose, onSubmit, isLo
   const [acceptedScope, setAcceptedScope] = useState<"single_scene" | "aggregate">("single_scene");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const capsQuery = useQuery({ queryKey: ["generation-capabilities"], queryFn: generationCapabilities });
+  const capsQuery = useQuery({ queryKey: ["generation-capabilities"], queryFn: generationCapabilities, staleTime: 0 });
   const assetScope = { project_id: video.project_id, product_id: video.product_id ?? undefined, status: "READY" };
   const assetsQuery = useInfiniteQuery({
     queryKey: queryKeys.assets.list({ ...assetScope, size: 50 }),
@@ -66,7 +67,9 @@ export function GenerationEditor({ scene, scenes, video, onClose, onSubmit, isLo
   const requiresAggregate = directGenerationRequiresAggregate(scene, scenes, baseDraft);
   const scope = requiresAggregate ? "aggregate" : "single_scene";
   // Scope-bound choices become automatic immediately if the scene context changes.
-  const [workflowSelection, setWorkflowSelection] = useState(() => ({ scope, workflowId: "", resolutionKey: "" }));
+  const [workflowSelection, setWorkflowSelection] = useState(() => ({
+    scope, workflowId: "", resolutionKey: config.width && config.height ? `${config.width}x${config.height}` : "",
+  }));
   if (workflowSelection.scope !== scope) {
     setWorkflowSelection({ scope, workflowId: "", resolutionKey: "" });
     setAccepted(null);
@@ -74,28 +77,39 @@ export function GenerationEditor({ scene, scenes, video, onClose, onSubmit, isLo
   const workflowId = workflowSelection.scope === scope ? workflowSelection.workflowId : "";
   const resolutionKey = workflowSelection.scope === scope ? workflowSelection.resolutionKey : "";
   function selectWorkflow(value: string) { setWorkflowSelection({ scope, workflowId: value, resolutionKey }); }
-  function selectResolution(value: string) { setWorkflowSelection({ scope, workflowId: "", resolutionKey: value }); }
-  const available = matchingQualifiedCapabilities(capsQuery.data, baseDraft, scope, true);
-  const resolutionCapabilities = matchingQualifiedCapabilities(capsQuery.data, baseDraft, scope, false);
+  const discoveryCapabilities = qualifiedDiscoveryCapabilities(capsQuery.data, baseDraft, scope, false);
+  const resolutionCapabilities = discoveryCapabilities;
   const sizeKey = (width: number, height: number) => `${width}x${height}`;
-  const selectedSizeCapabilities = resolutionKey
-    ? resolutionCapabilities.filter((item) => sizeKey(item.resolved_width, item.resolved_height) === resolutionKey)
+  const selectedResolutionKey = resolutionKey || (config.width && config.height ? sizeKey(config.width, config.height) : "");
+  const selectedSizeCapabilities = selectedResolutionKey
+    ? resolutionCapabilities.filter((item) => sizeKey(item.resolved_width, item.resolved_height) === selectedResolutionKey)
     : resolutionCapabilities;
   const selectedWorkflowCapabilities = workflowId
     ? selectedSizeCapabilities.filter((item) => item.workflow_id === workflowId)
     : selectedSizeCapabilities;
-  const invalidResolutionSelection = (!!resolutionKey && !selectedSizeCapabilities.length)
+  const activeMode = config.mode === "AUTO" ? deriveMode(baseDraft) : config.mode;
+  const workflowForSelectedSize = selectedWorkflowCapabilities.find((item) => matchingQualifiedCapabilities(
+    capsQuery.data,
+    { ...baseDraft, mode: activeMode, width: item.resolved_width, height: item.resolved_height },
+    scope,
+    true,
+  ).some((candidate) => candidate.workflow_id === item.workflow_id));
+  const invalidResolutionSelection = (!!selectedResolutionKey && !selectedSizeCapabilities.length)
     || (!!workflowId && !selectedWorkflowCapabilities.length);
-  const requestedWorkflowId = workflowId || (resolutionKey ? selectedWorkflowCapabilities[0]?.workflow_id : undefined);
+  const requestedWorkflowId = workflowId || (selectedResolutionKey ? workflowForSelectedSize?.workflow_id : undefined);
   const draft: GenerationRequest = { ...baseDraft, workflow_id: requestedWorkflowId };
   const cap = invalidResolutionSelection ? null : singleSceneCapability(capsQuery.data, draft);
   const aggregateCap = invalidResolutionSelection ? null : aggregateCapability(capsQuery.data, draft);
   const settingsCap = requiresAggregate ? aggregateCap : cap;
-  const workflows = available.filter((item, index, all) =>
-    (!resolutionKey || sizeKey(item.resolved_width, item.resolved_height) === resolutionKey)
+  const workflows = discoveryCapabilities.filter((item, index, all) =>
+    (!selectedResolutionKey || sizeKey(item.resolved_width, item.resolved_height) === selectedResolutionKey)
+    && (config.aspect_ratio !== "Custom" || config.width == null || config.height == null
+      || (item.resolved_width === config.width && item.resolved_height === config.height))
     && all.findIndex((candidate) => candidate.workflow_id === item.workflow_id) === index);
   const settings: GenerationRequest = { ...draft, ...(settingsCap ? { workflow_id: settingsCap.workflow_id } : {}) };
   const context = createPromptContext(scene.id, scene.revision, video.id, video.revision, settings);
+  const acceptedContext = createPromptContext(scene.id, scene.revision, video.id, video.revision, settings,
+    preview?.data.resolved_configuration?.configuration_hash ?? null);
   const customCanvasCapabilities = config.aspect_ratio === "Custom" ? resolutionCapabilities : [];
   const problems = generationInputProblems(settings, cap, assets, customCanvasCapabilities);
   const settingsProblems = generationInputProblems(draft, settingsCap, assets, customCanvasCapabilities);
@@ -105,24 +119,49 @@ export function GenerationEditor({ scene, scenes, video, onClose, onSubmit, isLo
     (!item.refine?.enabled || qualifiedDirectorFeature(settingsCap, "refine"))
     && (!item.face_refine?.enabled || qualifiedDirectorFeature(settingsCap, "face_refine"))
     && (!item.motion_context?.enabled || qualifiedDirectorFeature(settingsCap, "motion_context"))) ?? [];
-  const qualified = capsQuery.data?.available ? qualifiedCombinations(capsQuery.data).filter((item) => item.execution_scope === scope) : [];
-  const referenceCapabilities = workflowId ? available.filter((item) => item.workflow_id === workflowId) : available;
-  const refCap = referenceCapabilities.find((item) => item.mode === "r2v") ?? referenceCapabilities.find((item) => item.mode === "rv2v");
+  const qualified = capsQuery.data?.available ? qualifiedCombinations(capsQuery.data)
+    .filter((item) => item.execution_scope === scope && capabilityRunnable(item)) : [];
+  const referenceCapabilities = discoveryCapabilities.filter((item) => ["r2v", "rv2v"].includes(item.mode)
+    && (!selectedResolutionKey || sizeKey(item.resolved_width, item.resolved_height) === selectedResolutionKey)
+    && (!workflowId || item.workflow_id === workflowId));
+  const referenceImageLimit = Math.max(0, ...referenceCapabilities.map((item) => item.max_reference_images));
+  const referenceVideoLimit = Math.max(0, ...referenceCapabilities.map((item) => item.max_reference_videos));
+  const referenceAudioLimit = Math.max(0, ...referenceCapabilities.map((item) => item.max_reference_audio));
+  const selectableModes = new Set(modes.filter(([value]) => value === "AUTO"
+    || matchingQualifiedCapabilities(capsQuery.data, { ...baseDraft, mode: value }, scope, false).length > 0)
+    .map(([value]) => value));
   const profileLabel = (profile: string) => ({ DRAFT: t("Bản nháp", "Draft"), STANDARD: t("Tiêu chuẩn", "Standard"), HIGH: t("Cao", "High"), BASE: t("Cơ bản", "Base"), HD: t("HD", "HD"), FULL_HD_REFINED: t("Full HD đã tinh chỉnh", "Refined Full HD"), CUSTOM: t("Tùy chỉnh", "Custom") } as Record<string, string>)[profile] ?? profile;
   const modeLabel = (mode: string) => { const item = modes.find(([value]) => value === mode); return item ? t(item[1], item[2]) : mode; };
   const audioLabel = (mode: string) => mode === "source" ? t("Âm thanh nguồn", "Source audio") : mode === "mute" ? t("Tắt tiếng", "Muted") : t("Tạo âm thanh", "Generate audio");
-  const activeMode = draft.mode && draft.mode !== "AUTO" ? draft.mode : deriveMode(draft);
-  const profiles = Array.from(new Set(qualified.filter((item) => item.aspect_ratio === config.aspect_ratio
-    && (item.mode === activeMode || (item.mode === "fl2v" && ["i2v_last", "i2v_first_last"].includes(activeMode))))
-    .map((item) => item.quality_profile)));
-  const acceptedCurrent = acceptedScope === scope && isAcceptedPromptCurrent(accepted, context) && accepted?.text === text;
-  const previewCurrent = preview?.scope === scope && preview && isAcceptedPromptCurrent({ context: preview.context, text: "" }, context);
+  const qualityInput: GenerationRequest = {
+    ...baseDraft,
+    ...(workflowId ? { workflow_id: workflowId } : {}),
+  };
+  const profiles = qualifiedQualityProfiles(capsQuery.data, qualityInput, scope);
+  const acceptedCurrent = acceptedScope === scope && isAcceptedPromptCurrent(accepted, acceptedContext) && accepted?.text === text;
+  const previewCurrent = preview?.scope === scope && preview && isAcceptedPromptCurrent({ context: preview.context }, context);
+  const previewRunnable = !!previewCurrent && resolvedConfigurationMatchesRequest(
+    preview?.data.resolved_configuration, settings, scope, capsQuery.data,
+  );
   const images = assets.filter((item) => item.content_type.startsWith("image/"));
   function change(update: Partial<SceneGenerationConfig>) {
-    setConfig((old) => ({ ...old, ...update }));
+    setConfig((old) => {
+      const next = { ...old, ...update };
+      if ("aspect_ratio" in update && update.aspect_ratio !== old.aspect_ratio) {
+        delete next.width;
+        delete next.height;
+      }
+      return next;
+    });
     if (["mode", "quality_profile", "aspect_ratio", "width", "height", "first_frame_asset_id", "last_frame_asset_id",
       "source_video_asset_id", "reference_image_asset_ids", "reference_video_asset_ids", "reference_audio_asset_ids", "motion_context"]
       .some((key) => key in update)) setWorkflowSelection({ scope, workflowId: "", resolutionKey: "" });
+    setAccepted(null);
+  }
+  function selectResolution(value: string) {
+    const selected = value ? resolutionCapabilities.find((item) => sizeKey(item.resolved_width, item.resolved_height) === value) : undefined;
+    setWorkflowSelection({ scope, workflowId: "", resolutionKey: value });
+    setConfig((old) => ({ ...old, width: selected?.resolved_width ?? null, height: selected?.resolved_height ?? null }));
     setAccepted(null);
   }
   function modeChange(mode: SceneGenerationConfig["mode"]) {
@@ -134,20 +173,55 @@ export function GenerationEditor({ scene, scenes, video, onClose, onSubmit, isLo
     try { await action(); } catch (err) { setError(getErrorMessage(err)); } finally { setBusy(false); }
   }
   async function loadPreview() {
+    setPreview(null);
+    setAccepted(null);
+    const latestCapabilities = await queryClient.fetchQuery({
+      queryKey: ["generation-capabilities"], queryFn: generationCapabilities, staleTime: 0,
+    });
+    const latestMatch = matchingQualifiedCapabilities(latestCapabilities, settings, scope, true)
+      .some((item) => settings.workflow_id == null || item.workflow_id === settings.workflow_id);
+    if (!latestMatch || !settingsCap) {
+      throw new Error(t("Workflow hoặc cấu hình đã bị thu hồi. Hãy chọn lại trước khi xem trước.",
+        "The workflow or settings were revoked. Choose a currently qualified option before previewing."));
+    }
     const captured = context;
     const data = await previewPrompt(scene.id, settings);
     setPreview({ context: captured, data, scope }); setText(data.execution_prompt); setAccepted(null);
   }
-  function acceptPreview() {
+  async function acceptPreview() {
     if (!preview) return;
+    if (!previewCurrent) {
+      throw new Error(t("Prompt hoặc cấu hình đã thay đổi. Hãy xem trước lại.", "The prompt or settings changed. Preview again."));
+    }
+    setAccepted(null);
+    const latestCapabilities = await queryClient.fetchQuery({
+      queryKey: ["generation-capabilities"], queryFn: generationCapabilities, staleTime: 0,
+    });
+    if (!resolvedConfigurationMatchesRequest(preview.data.resolved_configuration, settings, scope, latestCapabilities)) {
+      throw new Error(t("Cấu hình thực thi thiếu, không còn đủ điều kiện hoặc đã thay đổi. Hãy xem trước lại.",
+        "The resolved execution configuration is missing, no longer qualified, or has changed. Preview again."));
+    }
     if (preview.data.scene_revision !== context.sceneRevision || preview.data.video_revision !== context.videoRevision) {
       throw new Error(t("Prompt đã cũ; hãy xem trước lại trước khi chấp nhận.", "The prompt is stale; preview again before accepting."));
     }
     if (!text.trim() || [...text].length > 30000) {
       throw new Error(t("Prompt phải có nội dung và tối đa 30000 ký tự.", "The prompt must contain text and at most 30000 characters."));
     }
-    setAccepted(acceptPrompt(preview.context, preview.data, text));
+    setAccepted(acceptPrompt(acceptedContext, preview.data, text));
     setAcceptedScope(scope);
+  }
+  async function submitAcceptedPrompt() {
+    if (!preview || !accepted || !acceptedCurrent) return;
+    setAccepted(null);
+    const latestCapabilities = await queryClient.fetchQuery({
+      queryKey: ["generation-capabilities"], queryFn: generationCapabilities, staleTime: 0,
+    });
+    if (!resolvedConfigurationMatchesRequest(preview.data.resolved_configuration, settings, scope, latestCapabilities)) {
+      setAccepted(null);
+      throw new Error(t("Workflow hoặc cấu hình đã bị thu hồi sau khi xem trước. Hãy tạo preview mới.",
+        "The workflow or settings were revoked after preview. Create a new preview."));
+    }
+    await onSubmit(acceptedGenerationRequest(accepted, acceptedContext));
   }
   async function saveConfig() {
     if (saveBlocked) throw new Error(settingsProblems.join(" "));
@@ -160,14 +234,14 @@ export function GenerationEditor({ scene, scenes, video, onClose, onSubmit, isLo
       : config.mode === "i2v_first_last" ? ["first_frame_asset_id", "last_frame_asset_id"] : []) as ("first_frame_asset_id" | "last_frame_asset_id")[];
   return <Dialog isOpen onClose={onClose} title={t(`Tạo video · Cảnh ${scene.scene_order + 1}`, `Generate video · Scene ${scene.scene_order + 1}`)}
     description={t("Lưu cấu hình riêng cho cảnh hoặc xem trước, chấp nhận prompt rồi tạo video.", "Save scene settings or preview and accept the prompt to generate video.")} maxWidth="lg">
-    <div className="space-y-4">
+    <fieldset disabled={busy} className="m-0 min-w-0 space-y-4 border-0 p-0">
       {error && <Alert variant="destructive">{error}</Alert>}
       {requiresAggregate && <Alert>{aggregateGuidance(scene, scenes)}</Alert>}
       {capsQuery.isLoading ? <p role="status">{t("Đang kiểm tra workflow…", "Checking workflows…")}</p> : capsQuery.error ? <Alert variant="destructive">{getErrorMessage(capsQuery.error)}<Button onClick={() => capsQuery.refetch()} variant="secondary">{t("Thử lại", "Retry")}</Button></Alert>
         : !capsQuery.data?.available && <Alert>{t("Chưa có workflow được xác minh. Bạn vẫn có thể lưu cấu hình cảnh; tạo video sẽ mở khi workflow được duyệt.", "No verified workflow is available. You can save scene settings; generation will become available when a workflow is approved.")}</Alert>}
       <div className="grid gap-3 sm:grid-cols-3">
         <label className="space-y-1 text-xs">{t("Chế độ", "Mode")}<select className={inputClass} value={config.mode} onChange={(event) => modeChange(event.target.value as SceneGenerationConfig["mode"])}>
-          {modes.map(([value, vi, en]) => <option key={value} value={value} disabled={value !== "AUTO" && !available.some((item) => item.mode === value || (item.mode === "fl2v" && ["i2v_last", "i2v_first_last"].includes(value)))}>{t(vi, en)}</option>)}
+          {modes.map(([value, vi, en]) => <option key={value} value={value} disabled={!selectableModes.has(value)}>{t(vi, en)}</option>)}
         </select></label>
         <label className="space-y-1 text-xs">{t("Cấu hình chất lượng", "Quality profile")}<select className={inputClass} value={config.quality_profile} onChange={(event) => change({ quality_profile: event.target.value as SceneGenerationConfig["quality_profile"] })}>
           {Array.from(new Set([...profiles, config.quality_profile ?? "STANDARD"])).map((value) => <option key={value} value={value} disabled={!profiles.includes(value)}>{profileLabel(value)}</option>)}
@@ -176,16 +250,13 @@ export function GenerationEditor({ scene, scenes, video, onClose, onSubmit, isLo
           {ratios.map((value) => <option key={value} value={value}>{value === "Custom" ? t("Tùy chỉnh", "Custom") : value}</option>)}
         </select></label>
       </div>
-      <label className="block space-y-1 text-xs">{t("Độ phân giải clip AI", "AI clip resolution")}
-        <select className={inputClass} value={resolutionKey} onChange={(event) => {
+      <label className="block space-y-1 text-xs">{t("Độ phân giải gốc đã xác minh", "Qualified native resolution")}
+        <select className={inputClass} value={selectedResolutionKey} onChange={(event) => {
           const next = event.target.value;
-          selectResolution(next); setAccepted(null);
-          if (config.aspect_ratio === "Custom" && next) {
-            const selected = resolutionCapabilities.find((item) => sizeKey(item.resolved_width, item.resolved_height) === next);
-            if (selected) setConfig((old) => ({ ...old, width: selected.resolved_width, height: selected.resolved_height }));
-          }
+          selectResolution(next);
         }}>
-          <option value="">{t("Tự động chọn độ phân giải phù hợp", "Automatically select a compatible resolution")}</option>
+          {config.aspect_ratio !== "Custom" && <option value="">{t("Để máy chủ tự chọn", "Let the server choose")}</option>}
+          {selectedResolutionKey && !selectedSizeCapabilities.length && <option value={selectedResolutionKey} disabled>{t("Độ phân giải đã chọn không còn đủ điều kiện", "Selected resolution is no longer qualified")}</option>}
           {resolutionCapabilities.filter((item, index, all) => all.findIndex((candidate) => sizeKey(candidate.resolved_width, candidate.resolved_height) === sizeKey(item.resolved_width, item.resolved_height)) === index)
             .map((item) => <option key={sizeKey(item.resolved_width, item.resolved_height)} value={sizeKey(item.resolved_width, item.resolved_height)}>{item.resolved_width}×{item.resolved_height} px</option>)}
         </select>
@@ -204,6 +275,7 @@ export function GenerationEditor({ scene, scenes, video, onClose, onSubmit, isLo
       {config.aspect_ratio === "Custom" && <div className="grid gap-3 sm:grid-cols-2">
         <label className="space-y-1 text-xs">{t("Chiều rộng tùy chỉnh", "Custom width")}<input className={inputClass} type="number" min="32" max="8192" step="32" value={config.width ?? ""} onChange={(event) => change({ width: event.target.value === "" ? null : Number(event.target.value) })} /></label>
         <label className="space-y-1 text-xs">{t("Chiều cao tùy chỉnh", "Custom height")}<input className={inputClass} type="number" min="32" max="8192" step="32" value={config.height ?? ""} onChange={(event) => change({ height: event.target.value === "" ? null : Number(event.target.value) })} /></label>
+        <p className="text-xs text-[#9ea5b0] sm:col-span-2">{t("Kích thước nhập phải trùng chính xác với một cấu hình đã xác minh ở trên.", "Entered dimensions must exactly match a qualified size listed above.")}</p>
       </div>}
       <div className="grid gap-3 sm:grid-cols-2">
         <label className="space-y-1 text-xs">{t("Seed", "Seed")}<select className={inputClass} value={config.seed_policy} onChange={(event) => change({ seed_policy: event.target.value as SceneGenerationConfig["seed_policy"] })}><option value="RANDOM">{t("Ngẫu nhiên", "Random")}</option><option value="FIXED">{t("Cố định", "Fixed")}</option></select></label>
@@ -224,9 +296,10 @@ export function GenerationEditor({ scene, scenes, video, onClose, onSubmit, isLo
           <option value="">{t("Không chọn", "None")}</option>{assets.filter((item) => item.content_type.startsWith("video/")).map((asset) => <option key={asset.id} value={asset.id}>{asset.filename}</option>)}
         </select></label>}
       {(config.mode === "AUTO" || config.mode === "r2v" || config.mode === "rv2v") && <div className="grid gap-3">
-        <OrderedReferences label={t("Ảnh tham chiếu", "Reference images")} tag="Image" assets={images} selected={config.reference_image_asset_ids ?? []} limit={refCap?.max_reference_images ?? 0} onChange={(ids) => change({ reference_image_asset_ids: ids })} />
-        <OrderedReferences label={t("Video tham chiếu", "Reference videos")} tag="Video" assets={assets.filter((item) => item.content_type.startsWith("video/"))} selected={config.reference_video_asset_ids ?? []} limit={refCap?.max_reference_videos ?? 0} onChange={(ids) => change({ reference_video_asset_ids: ids })} />
-        <OrderedReferences label={t("Âm thanh tham chiếu", "Reference audio")} tag="Audio" assets={assets.filter((item) => item.content_type.startsWith("audio/"))} selected={config.reference_audio_asset_ids ?? []} limit={refCap?.max_reference_audio ?? 0} onChange={(ids) => change({ reference_audio_asset_ids: ids })} />
+        {config.mode === "AUTO" && <p className="text-xs text-[#9ea5b0]">{t("Bạn có thể chọn tài nguyên tham chiếu trước; chế độ chạy sẽ được xác định theo đầu vào và khả năng đã xác minh.", "Choose references first if you like; the runnable mode is resolved from the inputs and qualified capabilities.")}</p>}
+        <OrderedReferences label={t("Ảnh tham chiếu", "Reference images")} tag="Image" assets={images} selected={config.reference_image_asset_ids ?? []} limit={referenceImageLimit} onChange={(ids) => change({ reference_image_asset_ids: ids })} />
+        <OrderedReferences label={t("Video tham chiếu", "Reference videos")} tag="Video" assets={assets.filter((item) => item.content_type.startsWith("video/"))} selected={config.reference_video_asset_ids ?? []} limit={referenceVideoLimit} onChange={(ids) => change({ reference_video_asset_ids: ids })} />
+        <OrderedReferences label={t("Âm thanh tham chiếu", "Reference audio")} tag="Audio" assets={assets.filter((item) => item.content_type.startsWith("audio/"))} selected={config.reference_audio_asset_ids ?? []} limit={referenceAudioLimit} onChange={(ids) => change({ reference_audio_asset_ids: ids })} />
       </div>}
       <details className="rounded-md border border-[#2c3038] p-3">
         <summary className="cursor-pointer text-sm font-medium rounded focus-visible:outline focus-visible:outline-2 focus-visible:outline-blue-400">{t("Thiết lập Director nâng cao", "Advanced Director settings")}</summary>
@@ -263,7 +336,7 @@ export function GenerationEditor({ scene, scenes, video, onClose, onSubmit, isLo
         </div>
       </details>
       {capsQuery.data?.source_capabilities && <p className="text-xs text-[#9ea5b0]">{t(`Nguồn hỗ trợ ${capsQuery.data.source_capabilities.tasks?.length ?? 0} tác vụ; hiện có ${qualified.length} tổ hợp được xác minh.`, `The source supports ${capsQuery.data.source_capabilities.tasks?.length ?? 0} tasks; ${qualified.length} combinations are currently verified.`)}</p>}
-      <p className="text-xs text-[#9ea5b0]">{t("Chế độ được xác định", "Resolved mode")}: {modeLabel(deriveMode(settings))}{settingsCap && t(` · ${settingsCap.resolved_width}×${settingsCap.resolved_height} dự kiến · ${settingsCap.fps} FPS · ${settingsCap.workflow_version}`, ` · Expected ${settingsCap.resolved_width}×${settingsCap.resolved_height} · ${settingsCap.fps} FPS · ${settingsCap.workflow_version}`)} · {t(`${scene.duration_seconds} giây`, `${scene.duration_seconds} seconds`)}</p>
+      <p className="text-xs text-[#9ea5b0]">{t("Chế độ yêu cầu", "Requested mode")}: {modeLabel(config.mode ?? "AUTO")} · {t("máy chủ sẽ xác nhận workflow, chất lượng và đầu ra trong phần xem trước.", "the server confirms the workflow, quality and output in the preview.")}</p>
       {(requiresAggregate ? settingsProblems : problems).length > 0 && <ul className="list-disc pl-5 text-xs text-amber-300" aria-live="polite">{(requiresAggregate ? settingsProblems : problems).map((item) => <li key={item}>{item}</li>)}</ul>}
       <div className="flex flex-wrap gap-2">
         <Button variant="secondary" isLoading={busy} disabled={isLoading || saveBlocked} onClick={() => run(saveConfig)}>{t("Lưu cấu hình cảnh", "Save scene settings")}</Button>
@@ -272,10 +345,12 @@ export function GenerationEditor({ scene, scenes, video, onClose, onSubmit, isLo
       {preview && <div className="space-y-3 border-t border-[#2c3038] pt-4">
         {!previewCurrent && <Alert>{t("Cảnh hoặc cấu hình đã đổi. Hãy xem trước prompt lại.", "The scene or settings changed. Preview the prompt again.")}</Alert>}
         <label className="block space-y-2 text-xs">{t("Prompt thực thi · chỉnh sửa trước khi chấp nhận", "Execution prompt · edit before accepting")}<textarea className={`${inputClass} min-h-36`} value={text} onChange={(event) => { setText(event.target.value); setAccepted(null); }} maxLength={60000} /></label>
+        <GenerationSettingsSummary configuration={preview.data.resolved_configuration} />
+        {previewCurrent && !previewRunnable && preview.data.resolved_configuration && <Alert variant="destructive">{t("Cấu hình preview không còn khớp capability hiện tại. Hãy tải lại capability và xem trước lần nữa.", "The preview no longer matches current capabilities. Refresh capabilities and preview again.")}</Alert>}
         {preview.data.warnings.map((warning, index) => <p key={index} className="text-xs text-amber-300">{warning}</p>)}
-        <Button variant="secondary" disabled={!previewCurrent || !!problems.length || busy || isLoading} onClick={() => run(async () => acceptPreview())}>{acceptedCurrent ? t("Đã chấp nhận prompt", "Prompt accepted") : t("Chấp nhận nguyên văn prompt", "Accept exact prompt")}</Button>
-        <Button disabled={requiresAggregate || !acceptedCurrent || !!problems.length || busy} isLoading={isLoading} onClick={() => run(async () => { if (!requiresAggregate && acceptedCurrent && !problems.length && accepted) await onSubmit(acceptedGenerationRequest(accepted, context)); })}>{t("Tạo video với prompt đã chấp nhận", "Generate video with accepted prompt")}</Button>
+        <Button variant="secondary" disabled={!previewCurrent || !previewRunnable || !!problems.length || busy || isLoading} onClick={() => run(async () => acceptPreview())}>{acceptedCurrent ? t("Đã chấp nhận prompt", "Prompt accepted") : t("Chấp nhận nguyên văn prompt", "Accept exact prompt")}</Button>
+        <Button disabled={requiresAggregate || !acceptedCurrent || !previewRunnable || !!problems.length || busy} isLoading={isLoading} onClick={() => run(submitAcceptedPrompt)}>{t("Tạo video với prompt đã chấp nhận", "Generate video with accepted prompt")}</Button>
       </div>}
-    </div>
+    </fieldset>
   </Dialog>;
 }

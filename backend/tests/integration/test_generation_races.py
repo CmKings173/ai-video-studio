@@ -58,10 +58,18 @@ class ProbeOnlyFFmpeg:
             "width": 480,
             "height": 864,
             "duration_seconds": 124 / 24,
+            "video_duration_seconds": 124 / 24,
+            "audio_duration_seconds": 124 / 24,
             "frames": 124,
+            "frame_count": 124,
             "fps": 24.0,
             "has_video": True,
             "has_audio": True,
+            "video_codec": "h264",
+            "audio_codec": "aac",
+            "audio_sample_rate": 48000,
+            "audio_channels": 2,
+            "container_format": "mov,mp4,m4a,3gp,3g2,mj2",
         }
 
 
@@ -73,9 +81,50 @@ class UncertainThenRecoverAdapter:
     async def object_info(self) -> dict:
         # Synthetic installed node contract; the real builder still validates its inputs.
         graph, _, _, _ = director_workflow_data()
+        output_types = {
+            "UNETLoader": ["MODEL"],
+            "CLIPLoader": ["CLIP"],
+            "VAELoader": ["VAE"],
+            "MiniMaxH3Director": [
+                "IMAGE", "AUDIO", "FLOAT", "INT", "IMAGE", "STRING", "IMAGE", "IMAGE"
+            ],
+            "StudioMiniMaxH3Director": [
+                "IMAGE", "AUDIO", "FLOAT", "INT", "IMAGE", "STRING", "IMAGE", "IMAGE"
+            ],
+            "CreateVideo": ["VIDEO"],
+            "SaveVideo": [],
+            "BasicScheduler": ["SIGMAS"],
+            "MiniMaxH3DirectorRefine": ["MMX_DIR_REFINE", "INT", "INT"],
+            "MiniMaxH3DirectorFaceRefine": ["MMX_DIR_FACE_REFINE"],
+        }
+        # Pinned nodes/director.py and director_refine.py, config_graph.py,
+        # and the registry's CreateVideo/SaveVideo graph define these destination
+        # sockets. Keep them independent of links so a wrong source is rejected.
+        director_inputs = {
+            "model": "MODEL",
+            "video_vae": "VAE",
+            "audio_vae": "VAE",
+            "clip": "CLIP",
+            "refine": "MMX_DIR_REFINE",
+            "face_refine": "MMX_DIR_FACE_REFINE",
+        }
+        linked_inputs = {
+            "MiniMaxH3Director": director_inputs,
+            "StudioMiniMaxH3Director": director_inputs,
+            "CreateVideo": {"images": "IMAGE", "audio": "AUDIO", "fps": "FLOAT"},
+            "SaveVideo": {"video": "VIDEO"},
+            "BasicScheduler": {"model": "MODEL"},
+            "MiniMaxH3DirectorRefine": {"refine_model": "MODEL", "sigmas": "SIGMAS"},
+        }
         result = {
             node["class_type"]: {
-                "input": {"required": {name: ["TEST_ONLY"] for name in node["inputs"]}}
+                "input": {
+                    "required": {
+                        name: [linked_inputs.get(node["class_type"], {}).get(name, "*"), {}]
+                        for name in node["inputs"]
+                    }
+                },
+                "output": output_types[node["class_type"]],
             }
             for node in graph.values()
         }
@@ -122,6 +171,34 @@ class UncertainThenRecoverAdapter:
 
     async def download(self, _output: dict) -> bytes:
         return b"generated-video"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "node_id,input_name,wrong_link",
+    [
+        ("6", "images", ["5", 1]),  # AUDIO cannot feed IMAGE.
+        ("6", "fps", ["5", 3]),  # INT frame count cannot feed FLOAT fps.
+        ("8", "model", ["2", 0]),  # CLIP cannot feed MODEL.
+        ("9", "sigmas", ["1", 0]),  # MODEL cannot feed SIGMAS.
+    ],
+)
+async def test_race_adapter_rejects_incompatible_linked_sockets(node_id, input_name, wrong_link):
+    from apps.api.app.providers.minimax_h3_director.workflow_builder import (
+        DirectorWorkflowError,
+        _validate_installed_graph,
+    )
+
+    graph, _, _, _ = director_workflow_data()
+    info = await UncertainThenRecoverAdapter().object_info()
+    _validate_installed_graph(
+        graph, info, require_required_inputs=True, validate_connections=True
+    )
+    graph[node_id]["inputs"][input_name] = wrong_link
+    with pytest.raises(DirectorWorkflowError, match="socket type mismatch"):
+        _validate_installed_graph(
+            graph, info, require_required_inputs=True, validate_connections=True
+        )
 
 
 class RejectingAdapter(UncertainThenRecoverAdapter):

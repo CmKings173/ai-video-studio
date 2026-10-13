@@ -3,6 +3,7 @@ import { paginationParams } from "./pagination";
 import { eligibleScenes } from "../generation/eligible-scenes";
 import type {
   BatchGenerationDTO,
+  BatchGenerationPreviewDTO,
   GenerateAllRequest,
   GenerationAttemptDTO,
   GenerationDTO,
@@ -97,6 +98,16 @@ export async function generateAll(
   return apiClient.post<BatchGenerationDTO>(`/api/v1/videos/${videoId}/generate-all`, payload, {
     idempotencyKey,
   });
+}
+
+export async function previewGenerateAll(
+  videoId: string,
+  payload: GenerateAllRequest,
+): Promise<BatchGenerationPreviewDTO> {
+  return apiClient.post<BatchGenerationPreviewDTO>(
+    `/api/v1/videos/${videoId}/generate-all/preview`,
+    payload,
+  );
 }
 
 export async function listSceneGenerations(

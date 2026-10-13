@@ -31,7 +31,9 @@ from apps.api.app.providers.minimax_h3_director.collector import (
     validate_artifact,
 )
 from apps.api.app.providers.minimax_h3_director.contracts import DirectorExecutionSpec
+from apps.api.app.providers.minimax_h3_director.output_canvas import resolve_director_output_canvas
 from apps.api.app.providers.minimax_h3_director.workflow_builder import DirectorWorkflowBuilder
+from apps.api.app.services.deletion_state import is_logically_deleted
 from apps.api.app.services.generation_freshness import (
     is_generation_fresh,
     lock_generation_dependencies,
@@ -42,7 +44,9 @@ from workers.common import (
     GENERATION_TERMINAL,
     lease_deadline,
     lock_scheduler,
-    oldest_pending_generation,
+    mark_unpublished_output_for_retention,
+    measured_output_metadata,
+    merge_frozen_media_expectations,
     refresh_video,
     save_output_file,
     service_loop,
@@ -93,6 +97,55 @@ class Dispatcher:
         self.settings = settings
         self.owner = worker_id("dispatcher")
 
+    async def _lock_generation_context(self, session, generation_id):
+        """Lock Video, dependencies, Scene, then Generation before a state change."""
+        refs = (
+            await session.execute(
+                select(SceneGeneration.video_id, SceneGeneration.scene_id).where(
+                    SceneGeneration.id == generation_id
+                )
+            )
+        ).one_or_none()
+        if refs is None:
+            return None, None, None, True
+        video_id, scene_id = refs
+        video = await session.scalar(
+            select(Video)
+            .where(Video.id == video_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if video is None:
+            return None, None, None, True
+        await lock_generation_dependencies(session, video)
+        scene = await session.scalar(
+            select(Scene)
+            .where(Scene.id == scene_id, Scene.video_id == video.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        generation = await session.scalar(
+            select(SceneGeneration)
+            .where(
+                SceneGeneration.id == generation_id,
+                SceneGeneration.video_id == video.id,
+                SceneGeneration.scene_id == scene_id,
+            )
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        deleted = (
+            scene is None
+            or generation is None
+            or await is_logically_deleted(session, "VIDEO", video.id)
+            or await is_logically_deleted(session, "SCENE", scene_id, video.id)
+            or await is_logically_deleted(session, "GENERATION", generation_id, video.id)
+        )
+        return video, scene, generation, deleted
+
+    async def _lock_dispatch_context(self, session, job_id):
+        return await self._lock_generation_context(session, job_id)
+
     async def claim(self) -> str | None:
         async with self.factory() as session, session.begin():
             await lock_scheduler(session, 971031)
@@ -108,15 +161,24 @@ class Dispatcher:
             )
             # Existing external work always consumes the sole admission slot,
             # including an uncertain submission awaiting operator resolution.
-            active = await session.scalar(
-                select(SceneGeneration)
-                .where(SceneGeneration.status.in_(GENERATION_ACTIVE), standalone)
-                .order_by(SceneGeneration.created_at, SceneGeneration.id)
-                .with_for_update()
-                .limit(1)
-            )
-            if active is not None:
+            active_ref = (
+                await session.execute(
+                    select(SceneGeneration.id, SceneGeneration.lease_expires_at)
+                    .where(SceneGeneration.status.in_(GENERATION_ACTIVE), standalone)
+                    .order_by(SceneGeneration.created_at, SceneGeneration.id)
+                    .limit(1)
+                )
+            ).first()
+            if active_ref is not None:
                 now = utcnow()
+                expiry = active_ref.lease_expires_at
+                if expiry is not None and expiry.tzinfo is None:
+                    expiry = expiry.replace(tzinfo=now.tzinfo)
+                if expiry is not None and expiry > now:
+                    return None
+                _, _, active, deleted = await self._lock_generation_context(session, active_ref.id)
+                if deleted or active is None or active.status not in GENERATION_ACTIVE:
+                    return None
                 expiry = active.lease_expires_at
                 if expiry is not None and expiry.tzinfo is None:
                     expiry = expiry.replace(tzinfo=now.tzinfo)
@@ -125,8 +187,42 @@ class Dispatcher:
                 active.claimed_by = self.owner
                 active.lease_expires_at = lease_deadline(self.settings)
                 return active.id
-            kind, generation = await oldest_pending_generation(session)
-            if kind != "standalone":
+
+            standalone_head = (
+                await session.execute(
+                    select(SceneGeneration.id, SceneGeneration.created_at)
+                    .where(SceneGeneration.status == "CREATED", standalone)
+                    .order_by(SceneGeneration.created_at, SceneGeneration.id)
+                    .limit(1)
+                )
+            ).first()
+            director_head = (
+                await session.execute(
+                    select(DirectorRun.id, DirectorRun.created_at)
+                    .where(DirectorRun.status == "CREATED")
+                    .order_by(DirectorRun.created_at, DirectorRun.id)
+                    .limit(1)
+                )
+            ).first()
+            if standalone_head is None or (
+                director_head is not None
+                and (director_head.created_at, director_head.id, "director")
+                < (standalone_head.created_at, standalone_head.id, "standalone")
+            ):
+                return None
+            _, _, generation, deleted = await self._lock_generation_context(
+                session, standalone_head.id
+            )
+            if (
+                deleted
+                or generation is None
+                or generation.status != "CREATED"
+                or await session.scalar(
+                    select(DirectorRunMember.id)
+                    .where(DirectorRunMember.scene_generation_id == generation.id)
+                    .limit(1)
+                )
+            ):
                 return None
             generation.status = "DISPATCHING"
             generation.phase = "PREPARING"
@@ -173,76 +269,104 @@ class Dispatcher:
             )
             return generation, attempt
 
-    async def _update(self, generation_id: str, **values) -> bool:
+    async def _generation_allows_output(self, generation_id: str) -> bool:
         async with self.factory() as session, session.begin():
-            generation = await session.get(self.job_model, generation_id, with_for_update=True)
+            _, _, generation, deleted = await self._lock_generation_context(session, generation_id)
+            return bool(
+                not deleted
+                and generation is not None
+                and generation.claimed_by == self.owner
+                and generation.status not in GENERATION_TERMINAL
+                and generation.status != "CANCEL_REQUESTED"
+            )
+
+    async def _update(self, generation_id: str, **values) -> bool:
+        cancel_for_deletion = False
+        async with self.factory() as session, session.begin():
+            _, _, generation, deleted = await self._lock_generation_context(session, generation_id)
             if (
                 generation is None
                 or generation.claimed_by != self.owner
                 or generation.status in GENERATION_TERMINAL
             ):
                 return False
-            desired_status = values.get("status")
-            if generation.status == "CANCEL_REQUESTED" and desired_status != "CANCELLED":
-                values.clear()
-            elif (
-                desired_status in GENERATION_FLOW_RANK
-                and generation.status in GENERATION_FLOW_RANK
-                and GENERATION_FLOW_RANK[desired_status] < GENERATION_FLOW_RANK[generation.status]
-            ):
-                values.clear()
-            changed = False
-            for key, value in values.items():
-                if key == "started_at" and generation.started_at is not None:
-                    continue
-                if getattr(generation, key) != value:
-                    setattr(generation, key, value)
-                    changed = True
-            generation.lease_expires_at = lease_deadline(self.settings)
-            if not changed:
-                return True
-            generation.revision += 1
-            generation.progress_updated_at = utcnow()
-            attempt = await session.scalar(
-                select(self.attempt_model)
-                .where(type(self).attempt_job_column == generation_id)
-                .order_by(self.attempt_model.attempt_no.desc())
-                .limit(1)
+            if deleted:
+                cancel_for_deletion = True
+            else:
+                desired_status = values.get("status")
+                if generation.status == "CANCEL_REQUESTED" and desired_status != "CANCELLED":
+                    values.clear()
+                elif (
+                    desired_status in GENERATION_FLOW_RANK
+                    and generation.status in GENERATION_FLOW_RANK
+                    and GENERATION_FLOW_RANK[desired_status]
+                    < GENERATION_FLOW_RANK[generation.status]
+                ):
+                    values.clear()
+                changed = False
+                for key, value in values.items():
+                    if key == "started_at" and generation.started_at is not None:
+                        continue
+                    if getattr(generation, key) != value:
+                        setattr(generation, key, value)
+                        changed = True
+                generation.lease_expires_at = lease_deadline(self.settings)
+                if changed:
+                    generation.revision += 1
+                    generation.progress_updated_at = utcnow()
+                    attempt = await session.scalar(
+                        select(self.attempt_model)
+                        .where(type(self).attempt_job_column == generation_id)
+                        .order_by(self.attempt_model.attempt_no.desc())
+                        .limit(1)
+                    )
+                    if (
+                        attempt
+                        and "status" in values
+                        and values.get("status") in {"RUNNING", "COLLECTING"}
+                    ):
+                        attempt.status = values["status"]
+                    await self._project_members(session, generation, values)
+        if cancel_for_deletion:
+            await self._retry_or_finish(
+                generation_id,
+                "RESOURCE_DELETED",
+                "Execution stopped because its source was logically deleted",
             )
-            if (
-                attempt
-                and "status" in values
-                and values.get("status")
-                in {
-                    "RUNNING",
-                    "COLLECTING",
-                }
-            ):
-                attempt.status = values["status"]
-            await self._project_members(session, generation, values)
-            return True
+            return False
+        return True
 
     async def _project_members(self, session, generation, values):
         """Standalone jobs have no aggregate members to project."""
 
     async def _hold(self, generation_id: str, code: str, message: str) -> None:
+        cancel_for_deletion = False
         async with self.factory() as session, session.begin():
-            generation = await session.get(self.job_model, generation_id, with_for_update=True)
+            _, _, generation, deleted = await self._lock_generation_context(session, generation_id)
             if (
                 generation
                 and generation.claimed_by == self.owner
                 and generation.status not in GENERATION_TERMINAL
             ):
-                generation.error_code = code
-                generation.error_message = message[:2000]
-                generation.phase = "RECONCILING"
-                generation.progress_updated_at = utcnow()
-                generation.revision += 1
-                # Backoff protects ComfyUI when history retention has removed a job.
-                generation.lease_expires_at = utcnow() + timedelta(
-                    seconds=max(15, self.settings.worker_poll_seconds * 5)
-                )
-                await self._project_members(session, generation, {})
+                if deleted:
+                    cancel_for_deletion = True
+                else:
+                    generation.error_code = code
+                    generation.error_message = message[:2000]
+                    generation.phase = "RECONCILING"
+                    generation.progress_updated_at = utcnow()
+                    generation.revision += 1
+                    # Backoff protects ComfyUI when history retention has removed a job.
+                    generation.lease_expires_at = utcnow() + timedelta(
+                        seconds=max(15, self.settings.worker_poll_seconds * 5)
+                    )
+                    await self._project_members(session, generation, {})
+        if cancel_for_deletion:
+            await self._retry_or_finish(
+                generation_id,
+                "RESOURCE_DELETED",
+                "Execution stopped because its source was logically deleted",
+            )
 
     async def _finish(
         self,
@@ -254,45 +378,29 @@ class Dispatcher:
         artifacts=None,
     ):
         async with self.factory() as session, session.begin():
-            generation_ref = (
-                await session.execute(
-                    select(SceneGeneration.video_id, SceneGeneration.scene_id).where(
-                        SceneGeneration.id == generation_id
-                    )
-                )
-            ).one_or_none()
-            if generation_ref is None:
-                return
-            video_id, scene_id = generation_ref
-            video = await session.scalar(
-                select(Video)
-                .where(Video.id == video_id)
-                .with_for_update()
-                .execution_options(populate_existing=True)
+            video, scene, generation, deleted = await self._lock_generation_context(
+                session, generation_id
             )
-            if video is None:
+            if video is None or generation is None:
+                if asset_id is not None:
+                    await mark_unpublished_output_for_retention(session, asset_id)
                 return
-            await lock_generation_dependencies(session, video)
-            scene = await session.scalar(
-                select(Scene)
-                .where(Scene.id == scene_id)
-                .with_for_update()
-                .execution_options(populate_existing=True)
-            )
-            generation = await session.scalar(
-                select(SceneGeneration)
-                .where(SceneGeneration.id == generation_id)
-                .with_for_update()
-                .execution_options(populate_existing=True)
-            )
-            if (
-                generation is None
-                or generation.claimed_by != self.owner
-                or generation.status in GENERATION_TERMINAL
-            ):
+            if generation.claimed_by != self.owner or generation.status in GENERATION_TERMINAL:
+                if asset_id is not None:
+                    await mark_unpublished_output_for_retention(session, asset_id)
                 return
-            if generation.status == "CANCEL_REQUESTED":
-                status, asset_id = "CANCELLED", None
+            video_deleted = await is_logically_deleted(session, "VIDEO", video.id)
+            if deleted and status in {"COMPLETED", "CANCELLED"}:
+                status = "CANCELLED"
+                code = "RESOURCE_DELETED"
+                message = "Output was discarded because its source was logically deleted"
+                # Retain the hidden parent pointer so deletion cleanup can find
+                # the already-persisted Asset; owner_scope prevents publication.
+            if generation.status == "CANCEL_REQUESTED" and not deleted:
+                status = "CANCELLED"
+                if asset_id is not None:
+                    await mark_unpublished_output_for_retention(session, asset_id)
+                    asset_id = None
             if status == "COMPLETED" and asset_id:
                 output_asset = await session.scalar(
                     select(Asset)
@@ -306,9 +414,22 @@ class Dispatcher:
                     message = "Generated output was deleted or not committed"
                     asset_id = None
                 else:
-                    measured = copy.deepcopy(output_asset.media_metadata or {})
-                    measured["size_bytes"] = output_asset.size_bytes
-                    measured["checksum"] = output_asset.checksum
+                    collected_measurements = next(
+                        (
+                            item.get("measured")
+                            for item in artifacts or []
+                            if isinstance(item, dict)
+                            and item.get("role") == "final"
+                            and item.get("asset_id") == asset_id
+                            and isinstance(item.get("measured"), dict)
+                        ),
+                        None,
+                    )
+                    measured = copy.deepcopy(
+                        collected_measurements or output_asset.media_metadata or {}
+                    )
+                    measured.setdefault("size_bytes", output_asset.size_bytes)
+                    measured.setdefault("checksum", output_asset.checksum)
                     frozen = generation.input_snapshot or {}
                     director = frozen.get("director_execution") or {}
                     measured_duration = measured.get(
@@ -392,26 +513,13 @@ class Dispatcher:
                     scene.selected_generation_id = generation.id
                     scene.revision += 1
                     video.revision += 1
-            await refresh_video(session, generation.video_id)
+            if not deleted and not video_deleted:
+                await refresh_video(session, generation.video_id)
 
     async def _retry_or_finish(self, generation_id: str, code: str, message: str) -> None:
         async with self.factory() as session, session.begin():
-            video_id = await session.scalar(
-                select(SceneGeneration.video_id).where(SceneGeneration.id == generation_id)
-            )
-            if video_id is None:
-                return
-            video = await session.scalar(
-                select(Video)
-                .where(Video.id == video_id)
-                .with_for_update()
-                .execution_options(populate_existing=True)
-            )
-            generation = await session.scalar(
-                select(SceneGeneration)
-                .where(SceneGeneration.id == generation_id)
-                .with_for_update()
-                .execution_options(populate_existing=True)
+            video, _, generation, deleted = await self._lock_generation_context(
+                session, generation_id
             )
             if (
                 generation is None
@@ -426,13 +534,13 @@ class Dispatcher:
                 .order_by(GenerationAttempt.attempt_no.desc())
                 .limit(1)
             )
+            cancelled = deleted or generation.status == "CANCEL_REQUESTED"
             if attempt:
-                cancelled = generation.status == "CANCEL_REQUESTED"
                 attempt.status = "CANCELLED" if cancelled else "FAILED"
                 attempt.error_code = None if cancelled else code
                 attempt.error_message = None if cancelled else message[:2000]
                 attempt.finished_at = utcnow()
-            if generation.status == "CANCEL_REQUESTED":
+            if cancelled:
                 generation.status = "CANCELLED"
                 generation.phase = "CANCELLED"
                 generation.finished_at = utcnow()
@@ -456,7 +564,8 @@ class Dispatcher:
                 generation.lease_expires_at = None
             generation.progress_updated_at = utcnow()
             generation.revision += 1
-            await refresh_video(session, video.id)
+            if not deleted:
+                await refresh_video(session, video.id)
 
     async def _progress_listener(self, generation_id: str, client_id: str, prompt_id: str) -> None:
         try:
@@ -610,37 +719,66 @@ class Dispatcher:
                 await self._finish(generation.id, "CANCELLED")
                 return None
             workflow = await self._prepare_workflow(generation.input_snapshot)
+            rejected = False
             async with self.factory() as session, session.begin():
-                current = await session.get(self.job_model, generation.id, with_for_update=True)
-                if current.claimed_by != self.owner or current.status != "DISPATCHING":
+                _, _, current, deleted = await self._lock_dispatch_context(session, generation.id)
+                if (
+                    current is None
+                    or current.claimed_by != self.owner
+                    or current.status != "DISPATCHING"
+                ):
                     return None
-                durable_attempt = await session.get(self.attempt_model, attempt.id)
-                durable_attempt.status = "DISPATCHING"
-                current.phase = "SUBMITTING"
-                current.lease_expires_at = lease_deadline(self.settings)
+                if deleted:
+                    rejected = True
+                else:
+                    durable_attempt = await session.get(self.attempt_model, attempt.id)
+                    durable_attempt.status = "DISPATCHING"
+                    current.phase = "SUBMITTING"
+                    current.lease_expires_at = lease_deadline(self.settings)
+            if rejected:
+                await self._finish(
+                    generation.id,
+                    "CANCELLED",
+                    code="RESOURCE_DELETED",
+                    message="External generation was not submitted because its source was deleted",
+                )
+                return None
             try:
                 prompt_id = await self.adapter.submit(workflow, attempt.client_id)
             except SubmissionUncertain as exc:
                 await self._hold(generation.id, "SUBMISSION_UNCERTAIN", str(exc))
                 return None
+        deleted_after_submit = False
         async with self.factory() as session, session.begin():
-            current = await session.get(self.job_model, generation.id, with_for_update=True)
+            _, _, current, deleted = await self._lock_dispatch_context(session, generation.id)
             durable_attempt = await session.get(self.attempt_model, attempt.id)
+            if current is None or durable_attempt is None:
+                return None
             # Preserve the external ID even if cancellation happened during submit.
             durable_attempt.comfy_prompt_id = prompt_id
             durable_attempt.status = "QUEUED"
             current.comfy_prompt_id = prompt_id
             if current.claimed_by != self.owner or current.status in GENERATION_TERMINAL:
                 return None
-            if current.status != "CANCEL_REQUESTED":
+            if deleted:
+                deleted_after_submit = True
+            elif current.status != "CANCEL_REQUESTED":
                 current.status = "QUEUED"
                 current.phase = "QUEUED"
                 current.queued_at = current.queued_at or utcnow()
-            current.error_code = None
-            current.error_message = None
-            current.progress_updated_at = utcnow()
-            current.revision += 1
-            await self._project_members(session, current, {"status": current.status})
+            if not deleted:
+                current.error_code = None
+                current.error_message = None
+                current.progress_updated_at = utcnow()
+                current.revision += 1
+                await self._project_members(session, current, {"status": current.status})
+        if deleted_after_submit:
+            await self._retry_or_finish(
+                generation.id,
+                "RESOURCE_DELETED",
+                "External execution was not published because its source was deleted",
+            )
+            return None
         return prompt_id
 
     async def _collect(self, generation, history: dict):
@@ -670,27 +808,61 @@ class Dispatcher:
                     comfy_kind=artifact.locator["kind"],
                     metadata=metadata,
                 )
-                expected = artifact.expected
-                if artifact.role == "final" and not spec.refine.get("enabled"):
-                    frozen_expected = {
-                        "width": spec.canvas.width,
-                        "height": spec.canvas.height,
-                        "fps": spec.fps,
-                        "frames": spec.frames,
-                        "has_audio": spec.audio_policy.get("mode", "generate") != "mute",
-                    }
-                    if any(
-                        key in expected and expected[key] != value
-                        for key, value in frozen_expected.items()
+                expected_frames = spec.frames
+                if artifact.member_index is not None:
+                    if (
+                        type(artifact.member_index) is not int
+                        or artifact.member_index < 0
+                        or artifact.member_index >= len(spec.timeline)
                     ):
-                        raise ValueError("DIRECTOR_ARTIFACT_EXPECTATIONS_CONFLICT_WITH_EXECUTION")
-                    expected = {**expected, **frozen_expected}
-                elif artifact.role == "final":
-                    if not {"width", "height", "fps", "frames", "has_audio"} <= set(expected):
-                        raise ValueError("DIRECTOR_REFINED_OUTPUT_CONTRACT_REQUIRED")
-                    if expected["fps"] != spec.fps or expected["frames"] != spec.frames:
-                        raise ValueError("DIRECTOR_REFINED_OUTPUT_CONTRACT_CONFLICT")
+                        raise ValueError("DIRECTOR_ARTIFACT_MEMBER_INVALID")
+                    expected_frames = spec.timeline[artifact.member_index].frame_count
+                frozen_expected = {
+                    "fps": spec.fps,
+                    "frames": expected_frames,
+                    "has_audio": spec.audio_policy.get("mode", "generate") != "mute",
+                    "has_video": True,
+                    "duration_seconds": expected_frames / spec.fps,
+                }
+                if artifact.role == "final":
+                    width, height = resolve_director_output_canvas(
+                        (spec.canvas.width, spec.canvas.height), spec.refine, task=spec.task
+                    )
+                    frozen_expected.update(width=width, height=height)
+                elif artifact.role == "segment":
+                    if spec.refine.get("enabled"):
+                        if not {"width", "height"} <= set(artifact.expected):
+                            raise ValueError("DIRECTOR_REFINED_OUTPUT_CONTRACT_REQUIRED")
+                    else:
+                        frozen_expected.update(
+                            width=spec.canvas.width,
+                            height=spec.canvas.height,
+                        )
+                elif artifact.role == "pre-refine":
+                    frozen_expected.update(
+                        width=spec.canvas.width,
+                        height=spec.canvas.height,
+                    )
+                elif artifact.role == "pre-face":
+                    width, height = resolve_director_output_canvas(
+                        (spec.canvas.width, spec.canvas.height), spec.refine, task=spec.task
+                    )
+                    frozen_expected.update(width=width, height=height)
+                expected = merge_frozen_media_expectations(
+                    dict(artifact.expected),
+                    frozen_expected,
+                    conflict_code="DIRECTOR_ARTIFACT_EXPECTATIONS_CONFLICT_WITH_EXECUTION",
+                )
                 validate_artifact(metadata, expected)
+                metadata = measured_output_metadata(
+                    metadata,
+                    expected,
+                    checksum=actual["checksum"],
+                    size_bytes=actual["size"],
+                )
+                if not await self._generation_allows_output(generation.id):
+                    await self._finish(generation.id, "CANCELLED")
+                    return
                 owner_id = (
                     generation.id
                     if artifact.role == "final"
@@ -707,6 +879,7 @@ class Dispatcher:
                     owner_id=owner_id,
                     role="GENERATED_VIDEO",
                     project_id=video.project_id,
+                    video_id=video.id,
                     created_by=generation.created_by,
                     path=path,
                     expected_checksum=actual["checksum"],
@@ -721,29 +894,94 @@ class Dispatcher:
                 final_asset_id = asset_id
             # Preserve lifecycle reachability for every accepted comparison/segment
             # artifact, including collection that is interrupted and reconciled.
+            rejected = False
+            immutable_conflict = False
             async with self.factory() as session, session.begin():
-                current = await session.get(SceneGeneration, generation.id, with_for_update=True)
-                if current is None or current.claimed_by != self.owner:
+                _, _, current, deleted = await self._lock_generation_context(session, generation.id)
+                if (
+                    current is None
+                    or current.claimed_by != self.owner
+                    or current.status in GENERATION_TERMINAL
+                ):
+                    await mark_unpublished_output_for_retention(session, asset_id)
                     return
-                existing = await session.scalar(
-                    select(GenerationAsset).where(
-                        GenerationAsset.generation_id == generation.id,
-                        GenerationAsset.role
-                        == f"DIRECTOR_{artifact.role.upper().replace('-', '_')}",
-                        GenerationAsset.order_index == len(manifest),
+                if deleted:
+                    output_asset = await session.scalar(
+                        select(Asset)
+                        .where(Asset.id == asset_id)
+                        .with_for_update()
+                        .execution_options(populate_existing=True)
                     )
-                )
-                if existing is None:
-                    session.add(
-                        GenerationAsset(
-                            generation_id=generation.id,
-                            asset_id=asset_id,
-                            role=f"DIRECTOR_{artifact.role.upper().replace('-', '_')}",
-                            order_index=len(manifest),
+                    if output_asset is not None:
+                        role = f"DIRECTOR_{artifact.role.upper().replace('-', '_')}"
+                        existing = await session.scalar(
+                            select(GenerationAsset).where(
+                                GenerationAsset.generation_id == generation.id,
+                                GenerationAsset.role == role,
+                                GenerationAsset.order_index == len(manifest),
+                            )
+                        )
+                        if existing is None:
+                            session.add(
+                                GenerationAsset(
+                                    generation_id=generation.id,
+                                    asset_id=asset_id,
+                                    role=role,
+                                    order_index=len(manifest),
+                                )
+                            )
+                        elif existing.asset_id != asset_id:
+                            await mark_unpublished_output_for_retention(session, asset_id)
+                            immutable_conflict = True
+                            rejected = True
+                    rejected = True
+                elif current.status == "CANCEL_REQUESTED":
+                    await mark_unpublished_output_for_retention(session, asset_id)
+                    rejected = True
+                else:
+                    output_asset = await session.scalar(
+                        select(Asset)
+                        .where(Asset.id == asset_id)
+                        .with_for_update()
+                        .execution_options(populate_existing=True)
+                    )
+                    if output_asset is None or output_asset.status != "READY":
+                        raise ValueError("OUTPUT_ASSET_NOT_READY")
+                    existing = await session.scalar(
+                        select(GenerationAsset).where(
+                            GenerationAsset.generation_id == generation.id,
+                            GenerationAsset.role
+                            == f"DIRECTOR_{artifact.role.upper().replace('-', '_')}",
+                            GenerationAsset.order_index == len(manifest),
                         )
                     )
-                elif existing.asset_id != asset_id:
-                    raise ValueError("IMMUTABLE_OUTPUT_CONFLICT")
+                    if existing is None:
+                        session.add(
+                            GenerationAsset(
+                                generation_id=generation.id,
+                                asset_id=asset_id,
+                                role=f"DIRECTOR_{artifact.role.upper().replace('-', '_')}",
+                                order_index=len(manifest),
+                            )
+                        )
+                    elif existing.asset_id != asset_id:
+                        await mark_unpublished_output_for_retention(session, asset_id)
+                        immutable_conflict = True
+                        rejected = True
+            if immutable_conflict:
+                raise ValueError("IMMUTABLE_OUTPUT_CONFLICT")
+            if rejected:
+                await self._finish(
+                    generation.id,
+                    "CANCELLED",
+                    code="RESOURCE_DELETED" if deleted else None,
+                    message=(
+                        "Generated artifact was not linked because its source was deleted"
+                        if deleted
+                        else None
+                    ),
+                )
+                return
             manifest.append(
                 {
                     "role": artifact.role,
@@ -870,7 +1108,12 @@ class Dispatcher:
                     generation_id, "FAILED", getattr(exc, "code", "COMFY_ERROR"), str(exc)
                 )
         except (ValueError, KeyError) as exc:
-            await self._finish(generation_id, "FAILED", "GENERATION_INPUT_INVALID", str(exc))
+            code = (
+                "IMMUTABLE_OUTPUT_CONFLICT"
+                if isinstance(exc, ValueError) and str(exc) == "IMMUTABLE_OUTPUT_CONFLICT"
+                else "GENERATION_INPUT_INVALID"
+            )
+            await self._finish(generation_id, "FAILED", code, str(exc))
         except AppError as exc:
             await self._finish(generation_id, "FAILED", exc.code, exc.message)
         except asyncio.CancelledError:

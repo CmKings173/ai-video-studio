@@ -8,6 +8,21 @@ from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+def is_valid_jwt_signing_secret(value: str) -> bool:
+    if (
+        not value.isascii()
+        or len(value) < 32
+        or len(set(value)) < 8
+        or value.lower().startswith("replace-with")
+        or value.lower() in {"secret", "change-me", "changeme", "password"}
+    ):
+        return False
+
+    # Reject repeated blocks without claiming to measure a secret's entropy.
+    normalized = value.lower()
+    return normalized not in (normalized + normalized)[1:-1]
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore", case_sensitive=False)
 
@@ -23,7 +38,10 @@ class Settings(BaseSettings):
     workspace_root: Path = Path("/data/studio")
     workflow_dir: Path = Path("workflows/h3")
     cookie_secure: bool = False
-    session_hours: int = Field(default=24, ge=1, le=720)
+    jwt_secret: str = ""
+    jwt_issuer: str = "ai-video-studio"
+    jwt_audience: str = "ai-video-studio-api"
+    jwt_expiration_seconds: int = Field(default=2_592_000, ge=1, le=2_592_000)
     worker_poll_seconds: float = Field(default=2.0, ge=0.1, le=60)
     lease_seconds: int = Field(default=120, ge=10)
     comfy_timeout_seconds: int = Field(default=3600, ge=30)
@@ -45,7 +63,7 @@ class Settings(BaseSettings):
     allowed_origins: list[str] = Field(default_factory=lambda: ["http://localhost:3000"])
     bootstrap_admin_email: str = ""
     bootstrap_admin_password: str = ""
-    session_cookie_name: str = "studio_session"
+    auth_cookie_name: str = "studio_session"
     csrf_header_name: str = "X-CSRF-Token"
     idempotency_hours: int = Field(default=24, ge=1, le=168)
     ffmpeg_binary: str = "ffmpeg"
@@ -76,6 +94,24 @@ class Settings(BaseSettings):
         if value and (len(value) < 32 or not value.isascii() or value.startswith("replace-with")):
             raise ValueError("Internal proxy token must be at least 32 ASCII characters")
         return value
+
+    @field_validator("jwt_secret")
+    @classmethod
+    def jwt_signing_secret(cls, value: str) -> str:
+        if value and not is_valid_jwt_signing_secret(value):
+            raise ValueError(
+                "JWT_SECRET must be at least 32 ASCII characters, not a placeholder "
+                "or simple repetition"
+            )
+        return value
+
+    @field_validator("jwt_issuer", "jwt_audience")
+    @classmethod
+    def jwt_identity(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("JWT issuer and audience must not be empty")
+        return cleaned
 
     @field_validator("database_url")
     @classmethod

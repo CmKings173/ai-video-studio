@@ -55,7 +55,8 @@ def workflow_data():
 
 
 def director_workflow_data(
-    *, mode="t2v", quality="STANDARD", steps=12, execution_scope="single_scene"
+    *, mode="t2v", quality="STANDARD", steps=12, execution_scope="single_scene",
+    aspect_ratio="9:16",
 ):
     """Real pinned single-scene graph with synthetic evidence for isolated tests only."""
     directory = Path(__file__).resolve().parents[2] / "workflows/h3"
@@ -83,14 +84,23 @@ def director_workflow_data(
     profile.update(
         quality_profile=quality,
         steps=steps,
+        studio_revision="1" * 40,
+        comfyui_version="0.3.50-test",
+        execution_spec_hash=baseline["execution_evidence"]["execution_spec_hash"],
         resolution=baseline["resolution"],
         dependency_versions={n["class_type"]: "synthetic-test-only" for n in graph.values()},
         weight_hashes={w: "a" * 64 for w in collect_executable_weights(graph)},
     )
     evidence = baseline["execution_evidence"]
+    canvas = baseline["resolution"]["canvases"][aspect_ratio]
+    evidence["output"].update(width=canvas[0], height=canvas[1])
     evidence.update(
         workflow_hash=approved.workflow_hash,
         slot_map_hash=approved.slot_map_hash,
+        studio_revision=profile["studio_revision"],
+        director_repository=profile["provider_source"]["repository"],
+        director_commit=profile["provider_source"]["commit"],
+        comfyui_version=profile["comfyui_version"],
         profile_hash=profile_hash(profile),
         dependency_versions=profile["dependency_versions"],
         weight_hashes=profile["weight_hashes"],

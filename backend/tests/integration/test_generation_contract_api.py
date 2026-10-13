@@ -14,6 +14,7 @@ from apps.api.app.api.generations import (
     create_variation,
     generate_all,
     generation_capabilities,
+    preview_generate_all,
     preview_prompt,
 )
 from apps.api.app.api.scenes import patch_scene
@@ -46,7 +47,7 @@ async def test_frontend_history_reuse_payload_accepts_current_duration(
 ):
     """Run the actual TypeScript reuse/editor request builders through the service."""
     user_id, scene_id = await seed(session_factory)
-    async with session_factory() as session, session.begin():
+    async with session_factory() as session:
         service = GenerationService(settings(tmp_path))
         parent = await service.create(
             session,
@@ -74,16 +75,32 @@ const before = JSON.stringify(data.parent);
 const config = reuseGenerationSettings(data.parent);
 const draft = {mode:'AUTO', quality_profile:'STANDARD', seed_policy:'RANDOM', ...config,
   aspect_ratio:config.aspect_ratio ?? data.video.aspect_ratio,
-  seed:config.seed_policy === 'FIXED' ? config.seed : null, workflow_id:data.workflow};
+  seed:config.seed_policy === 'FIXED' ? config.seed : null, workflow_id:data.workflow,
+  width:data.canvas.native_width,height:data.canvas.native_height};
+if (!data.preview) {
+  if (JSON.stringify(data.parent) !== before) throw new Error('history mutated');
+  process.stdout.write(JSON.stringify({config,draft}));
+  process.exit(0);
+}
+const configuration = data.preview.resolved_configuration;
+draft.width = configuration.native_width;
+draft.height = configuration.native_height;
 const context = createPromptContext(
-  data.scene.id,data.scene.revision,data.video.id,data.video.revision,draft);
-const accepted = acceptPrompt(context,{
-  scene_revision:data.scene.revision,video_revision:data.video.revision
-},'Accepted integration prompt');
+  data.scene.id,data.scene.revision,data.video.id,data.video.revision,draft,
+  configuration.configuration_hash);
+const accepted = acceptPrompt(context,data.preview,'Accepted integration prompt');
 if (JSON.stringify(data.parent) !== before) throw new Error('history mutated');
 process.stdout.write(JSON.stringify({config,request:acceptedGenerationRequest(accepted,context)}));
 """
+        caps = await generation_capabilities(user=await session.get(User, user_id), session=session)
+        choice = next(
+            item
+            for item in caps.combinations
+            if item["workflow_id"] == parent.workflow_id
+            and item["aspect_ratio"] == video.aspect_ratio
+        )
         data = {
+            "canvas": choice["resolved_configuration"],
             "parent": {"mode": parent.mode, "input_snapshot": frozen},
             "scene": {"id": scene.id, "revision": scene.revision},
             "video": {
@@ -103,11 +120,38 @@ process.stdout.write(JSON.stringify({config,request:acceptedGenerationRequest(ac
             timeout=15,
             cwd=REPOSITORY_ROOT,
         )
+        intent = json.loads(result.stdout)
+        scene.generation_config = intent["config"]
+        await session.commit()
+        async with session_factory() as preview_session:
+            preview = await preview_prompt(
+                scene_id,
+                payload=PromptPreviewRequest.model_validate(intent["draft"]),
+                user=await preview_session.get(User, user_id),
+                session=preview_session,
+                settings=settings(tmp_path),
+            )
+        data["preview"] = preview.model_dump(mode="json")
+        result = await asyncio.to_thread(
+            subprocess.run,
+            ["node", "-e", bridge],
+            input=json.dumps(data),
+            text=True,
+            capture_output=True,
+            check=True,
+            timeout=15,
+            cwd=REPOSITORY_ROOT,
+        )
         payload = json.loads(result.stdout)
         for field in ("width", "height", "frames", "cfg", "fps", "steps", "runtime_profile"):
             assert field not in payload["config"]
+        for field in ("frames", "cfg", "fps", "steps", "runtime_profile"):
             assert field not in payload["request"]
-        scene.generation_config = payload["config"]
+        assert payload["request"]["width"] == preview.resolved_configuration.native_width
+        assert payload["request"]["height"] == preview.resolved_configuration.native_height
+        assert payload["request"]["preview_configuration_hash"] == (
+            preview.resolved_configuration.configuration_hash
+        )
         request = GenerationRequest.model_validate(payload["request"])
         # Backend must retain strict frame validation; reuse fixes the request.
         with pytest.raises(AppError) as caught:
@@ -127,6 +171,7 @@ process.stdout.write(JSON.stringify({config,request:acceptedGenerationRequest(ac
             request_id=None,
         )
         assert generation.input_snapshot["frames"] == 192
+        assert generation.input_snapshot["duration_seconds"] == 8
         assert generation.input_snapshot["seed_policy"] == seed_policy
         if seed_policy == "FIXED":
             assert generation.input_snapshot["seed"] == 42
@@ -138,7 +183,7 @@ process.stdout.write(JSON.stringify({config,request:acceptedGenerationRequest(ac
 @pytest.mark.asyncio
 async def test_scene_config_batch_and_exact_prompt(session_factory, tmp_path):
     user_id, scene_id = await seed(session_factory)
-    async with session_factory() as session, session.begin():
+    async with session_factory() as session:
         user = await session.get(User, user_id)
         scene = await session.get(Scene, scene_id)
         video = await session.get(Video, scene.video_id)
@@ -153,9 +198,20 @@ async def test_scene_config_batch_and_exact_prompt(session_factory, tmp_path):
             session=session,
         )
         assert scene.revision == 2 and video.revision == before + 1
+        await session.commit()
+        async with session_factory() as preview_session:
+            manifest = await preview_generate_all(
+                video.id,
+                GenerateAll(),
+                user=await preview_session.get(User, user_id),
+                session=preview_session,
+                settings=settings(tmp_path),
+            )
         dto = await generate_all(
             video.id,
-            GenerateAll(),
+            GenerateAll(settings={
+                "preview_configuration_hash": manifest["preview_configuration_hash"]
+            }),
             request=SimpleNamespace(state=SimpleNamespace()),
             key="config",
             user=user,
@@ -166,12 +222,23 @@ async def test_scene_config_batch_and_exact_prompt(session_factory, tmp_path):
         assert frozen["seed"] == 42
         assert frozen["requested_aspect_ratio"] == "1:1"
         assert frozen["width"] == frozen["resolved_width"] == 640
+        assert frozen["height"] == frozen["resolved_height"] == 640
+        await session.commit()
+        async with session_factory() as preview_session:
+            preview = await preview_prompt(
+                scene_id,
+                payload=PromptPreviewRequest(),
+                user=await preview_session.get(User, user_id),
+                session=preview_session,
+                settings=settings(tmp_path),
+            )
         prompt = "  exactly accepted\nno additions  "
         generation = await GenerationService(settings(tmp_path)).create(
             session,
             scene_id=scene_id,
             request=GenerationRequest(
                 execution_prompt=prompt,
+                preview_configuration_hash=preview.resolved_configuration.configuration_hash,
                 source_scene_revision=scene.revision,
                 source_video_revision=video.revision,
             ),
@@ -356,6 +423,7 @@ async def test_preview_constraints_once_and_stale_acceptance(session_factory, tm
     async with session_factory() as session, session.begin():
         request = GenerationRequest(
             execution_prompt=result.execution_prompt,
+            preview_configuration_hash=result.resolved_configuration.configuration_hash,
             source_scene_revision=result.scene_revision,
             source_video_revision=result.video_revision,
         )

@@ -9,23 +9,26 @@ from typing import Any
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from apps.api.app.api.ownership import get_owned, get_video_output_asset, owner_scope
 from apps.api.app.core.errors import AppError
+from apps.api.app.db.locking import lock_revisioned_row
 from apps.api.app.db.models import (
     Asset,
     FinalVideo,
     FinalVideoScene,
-    Product,
-    Project,
     Scene,
     SceneGeneration,
     Video,
 )
 from apps.api.app.schemas.api import AssemblyRequest
 from apps.api.app.services.delivery_presets import resolve_delivery
-from apps.api.app.services.domain_guards import require_active_brand
 from apps.api.app.services.generation_freshness import (
     is_generation_fresh,
     is_selected_execution_group_fresh,
+)
+from apps.api.app.services.video_dependency_guard import (
+    lock_video_dependencies,
+    read_video_dependencies,
 )
 
 
@@ -37,6 +40,78 @@ def manifest_hash(value: dict[str, Any]) -> str:
 
 
 class AssemblyService:
+    async def authorize_inputs(
+        self,
+        session: AsyncSession,
+        *,
+        video_id: str,
+        request: AssemblyRequest,
+        user_id: str,
+        is_admin: bool = False,
+    ) -> None:
+        """Validate ownership of every referenced input before route side effects.
+
+        ``create`` repeats these checks while holding the established locks. This
+        preflight lets callers reject cross-owner references before claiming an
+        idempotency key, while the locked checks remain authoritative for writes.
+        """
+        video = await get_owned(
+            session,
+            Video,
+            video_id,
+            user_id,
+            error_code="VIDEO_NOT_FOUND",
+            message="Video was not found",
+            allow_all=is_admin,
+        )
+        await read_video_dependencies(session, video, user_id=user_id, is_admin=is_admin)
+        scenes = list(
+            (
+                await session.scalars(
+                    select(Scene).where(
+                        Scene.video_id == video.id,
+                        Scene.enabled.is_(True),
+                        owner_scope(Scene, user_id, allow_all=is_admin),
+                    )
+                )
+            ).all()
+        )
+        for scene in scenes:
+            if not scene.selected_generation_id:
+                continue
+            generation = await get_owned(
+                session,
+                SceneGeneration,
+                scene.selected_generation_id,
+                user_id,
+                error_code="GENERATION_NOT_FOUND",
+                message="Generation was not found",
+                allow_all=is_admin,
+            )
+            if generation.scene_id != scene.id:
+                raise AppError("GENERATION_NOT_FOUND", "Generation was not found", 404)
+            if generation.output_asset_id:
+                await get_video_output_asset(
+                    session,
+                    video,
+                    generation.output_asset_id,
+                    user_id,
+                    role="GENERATED_VIDEO",
+                    generation_id=generation.id,
+                    allow_all=is_admin,
+                )
+
+        if request.background_audio_asset_id:
+            await get_owned(
+                session,
+                Asset,
+                str(request.background_audio_asset_id),
+                user_id,
+                error_code="ASSET_NOT_FOUND",
+                message="Asset was not found",
+                allow_all=is_admin,
+            )
+
     async def create(
         self,
         session: AsyncSession,
@@ -46,10 +121,17 @@ class AssemblyService:
         expected_revision: int,
         user_id: str,
         request_id: str | None,
+        is_admin: bool = False,
     ) -> FinalVideo:
-        video = await session.get(Video, video_id, with_for_update=True)
-        if video is None:
-            raise AppError("VIDEO_NOT_FOUND", "Video was not found", 404)
+        with session.no_autoflush:
+            video = await get_owned(
+                session, Video, video_id, user_id,
+                error_code="VIDEO_NOT_FOUND", message="Video was not found", allow_all=is_admin,
+            )
+        dependencies = await lock_video_dependencies(
+            session, video, user_id=user_id, is_admin=is_admin
+        )
+        video = dependencies.video
         if video.revision != expected_revision:
             raise AppError(
                 "REVISION_CONFLICT",
@@ -57,14 +139,6 @@ class AssemblyService:
                 412,
                 {"expected": expected_revision, "actual": video.revision},
             )
-        project = await session.get(Project, video.project_id)
-        if project is None or project.archived:
-            raise AppError("PROJECT_NOT_ACTIVE", "Project is missing or archived", 409)
-        product = await session.get(Product, video.product_id) if video.product_id else None
-        if product is not None and product.archived:
-            raise AppError("PRODUCT_NOT_ACTIVE", "Product is archived", 409)
-        brand_id = video.brand_id or (product.brand_id if product else None)
-        await require_active_brand(session, brand_id)
         active = await session.scalar(
             select(FinalVideo.id)
             .where(
@@ -72,6 +146,7 @@ class AssemblyService:
                 FinalVideo.status.in_({"QUEUED", "ASSEMBLING", "CANCEL_REQUESTED"}),
             )
             .limit(1)
+            .execution_options(autoflush=False)
         )
         if active:
             raise AppError(
@@ -83,14 +158,25 @@ class AssemblyService:
             (
                 await session.scalars(
                     select(Scene)
-                    .where(Scene.video_id == video.id, Scene.enabled.is_(True))
+                    .where(
+                        Scene.video_id == video.id,
+                        Scene.enabled.is_(True),
+                        owner_scope(Scene, user_id, allow_all=is_admin),
+                    )
                     .order_by(Scene.scene_order, Scene.id)
                     .with_for_update()
+                    .execution_options(autoflush=False)
                 )
             ).all()
         )
         if not scenes:
             raise AppError("ASSEMBLY_EMPTY", "Video has no enabled scenes", 409)
+        # All Scene locks precede Generation/Asset locks. Refresh through the
+        # revision guard so compatible pending edits retain their history.
+        scenes = [
+            await lock_revisioned_row(session, Scene, scene.id, immutable_fields=("video_id",))
+            for scene in scenes
+        ]
 
         scene_entries: list[dict[str, Any]] = []
         rows: list[tuple[Scene, SceneGeneration, Asset]] = []
@@ -102,32 +188,50 @@ class AssemblyService:
                     409,
                     {"scene_id": scene.id},
                 )
-            generation = await session.get(SceneGeneration, scene.selected_generation_id)
-            if (
-                generation is None
-                or generation.scene_id != scene.id
-                or generation.status != "COMPLETED"
-                or not generation.output_asset_id
-            ):
+            generation = await session.scalar(
+                select(SceneGeneration).where(
+                    SceneGeneration.id == scene.selected_generation_id,
+                    owner_scope(SceneGeneration, user_id, allow_all=is_admin),
+                ).execution_options(autoflush=False)
+            )
+            if generation is not None:
+                generation = await lock_revisioned_row(
+                    session, SceneGeneration, generation.id,
+                    immutable_fields=("video_id", "scene_id"),
+                )
+            if generation is None or generation.scene_id != scene.id:
+                raise AppError("GENERATION_NOT_FOUND", "Generation was not found", 404)
+            if generation.status != "COMPLETED" or not generation.output_asset_id:
                 raise AppError(
                     "SCENE_GENERATION_NOT_READY",
                     "A selected scene generation is not complete",
                     409,
                     {"scene_id": scene.id},
                 )
-            if not await is_generation_fresh(
-                session, scene, video, generation
-            ) or not await is_selected_execution_group_fresh(session, scene, video, generation):
+            with session.no_autoflush:
+                fresh = await is_generation_fresh(
+                    session, scene, video, generation
+                ) and await is_selected_execution_group_fresh(session, scene, video, generation)
+            if not fresh:
                 raise AppError(
                     "SCENE_SELECTION_STALE",
                     "A selected generation no longer matches current scene inputs",
                     409,
                     {"scene_id": scene.id, "generation_id": generation.id},
                 )
-            asset = await session.get(Asset, generation.output_asset_id, with_for_update=True)
+            with session.no_autoflush:
+                asset = await get_video_output_asset(
+                    session,
+                    video,
+                    generation.output_asset_id,
+                    user_id,
+                    role="GENERATED_VIDEO",
+                    generation_id=generation.id,
+                    for_update=True,
+                    allow_all=is_admin,
+                )
             if (
-                asset is None
-                or asset.status != "READY"
+                asset.status != "READY"
                 or not asset.checksum
                 or asset.deleted_at is not None
             ):
@@ -162,8 +266,14 @@ class AssemblyService:
 
         background = None
         if request.background_audio_asset_id:
-            asset = await session.get(
-                Asset, str(request.background_audio_asset_id), with_for_update=True
+            asset = await session.scalar(
+                select(Asset)
+                .where(
+                    Asset.id == str(request.background_audio_asset_id),
+                    owner_scope(Asset, user_id, allow_all=is_admin),
+                )
+                .with_for_update()
+                .execution_options(populate_existing=True, autoflush=False)
             )
             if (
                 asset is None
@@ -196,6 +306,7 @@ class AssemblyService:
         version_no = (
             await session.scalar(
                 select(func.max(FinalVideo.version_no)).where(FinalVideo.video_id == video.id)
+                .execution_options(autoflush=False)
             )
             or 0
         ) + 1

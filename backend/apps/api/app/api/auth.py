@@ -1,17 +1,23 @@
-from datetime import timedelta
-
 from fastapi import APIRouter, Depends, Request, Response
-from sqlalchemy import delete, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from apps.api.app.api.deps import AuthContext, auth_context, current_user, require_csrf
+from apps.api.app.api.deps import (
+    AuthPrincipal,
+    current_user,
+    principal_from_token,
+    validate_csrf_token,
+)
 from apps.api.app.core.client_identity import login_client_host
 from apps.api.app.core.config import Settings, get_settings
 from apps.api.app.core.errors import AppError
 from apps.api.app.core.login_throttle import login_throttle
-from apps.api.app.core.security import hash_token, new_token, verify_password
-from apps.api.app.db.models import Session as AuthSession
-from apps.api.app.db.models import User, utcnow
+from apps.api.app.core.security import (
+    AccessTokenConfigurationError,
+    create_access_token,
+    verify_password,
+)
+from apps.api.app.db.models import User
 from apps.api.app.db.session import get_session
 from apps.api.app.schemas.api import Login, LoginDTO, UserDTO
 
@@ -26,7 +32,6 @@ async def login(
     session: AsyncSession = Depends(get_session),
     settings: Settings = Depends(get_settings),
 ) -> LoginDTO:
-    await session.execute(delete(AuthSession).where(AuthSession.expires_at <= utcnow()))
     email = payload.email.strip().lower()
     client_host = login_client_host(request, settings)
     throttle_keys = (
@@ -54,22 +59,19 @@ async def login(
         identity_key=f"identity:{email}",
         attempt_key=f"attempt:{client_host}:{email}",
     )
-    token, csrf = new_token(), new_token()
-    session.add(
-        AuthSession(
-            id=hash_token(token),
-            user_id=user.id,
-            csrf_hash=hash_token(csrf),
-            expires_at=utcnow() + timedelta(hours=settings.session_hours),
+    try:
+        token, csrf = create_access_token(
+            user.id, user.role, settings, auth_version=user.auth_version
         )
-    )
+    except AccessTokenConfigurationError as exc:
+        raise AppError("AUTH_UNAVAILABLE", "Authentication is not configured", 503) from exc
     response.set_cookie(
-        settings.session_cookie_name,
+        settings.auth_cookie_name,
         token,
         httponly=True,
         secure=settings.cookie_secure,
         samesite="strict",
-        max_age=settings.session_hours * 3600,
+        max_age=settings.jwt_expiration_seconds,
         path="/",
     )
     return LoginDTO(user=UserDTO.model_validate(user), csrf_token=csrf)
@@ -77,16 +79,35 @@ async def login(
 
 @router.post("/logout", status_code=204)
 async def logout(
+    request: Request,
     response: Response,
-    context: AuthContext = Depends(auth_context),
-    csrf_user: User = Depends(require_csrf),
-    session: AsyncSession = Depends(get_session),
     settings: Settings = Depends(get_settings),
 ) -> None:
-    await session.delete(context.session)
-    response.delete_cookie(settings.session_cookie_name, path="/")
+    token = request.cookies.get(settings.auth_cookie_name)
+    if token:
+        try:
+            principal = principal_from_token(token, settings)
+        except AppError as exc:
+            if exc.status_code not in {401, 503}:
+                raise
+        else:
+            validate_csrf_token(request, principal, settings)
+
+    response.delete_cookie(
+        settings.auth_cookie_name,
+        path="/",
+        secure=settings.cookie_secure,
+        httponly=True,
+        samesite="strict",
+    )
 
 
 @router.get("/me", response_model=UserDTO)
-async def me(user: User = Depends(current_user)) -> UserDTO:
+async def me(
+    principal: AuthPrincipal = Depends(current_user),
+    session: AsyncSession = Depends(get_session),
+) -> UserDTO:
+    user = await session.get(User, principal.id)
+    if user is None:
+        raise AppError("AUTH_REQUIRED", "Authenticated account no longer exists", 401)
     return UserDTO.model_validate(user)

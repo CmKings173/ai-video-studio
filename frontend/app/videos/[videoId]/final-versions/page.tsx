@@ -23,6 +23,7 @@ import { Progress } from "@/components/ui/progress";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Alert } from "@/components/ui/alert";
 import { VideoPreview } from "@/components/ui/video-preview";
+import { DeletionControl } from "@/components/deletion/deletion-control";
 import { closePresignedDownloadTab, navigatePresignedDownload, reservePresignedDownloadTab } from "@/lib/utils/presigned-download";
 
 function configString(config: Record<string, unknown>, key: string, fallback: string): string {
@@ -174,7 +175,7 @@ export default function VersionHistoryPage({
                     </p>
                   </div>
 
-                  <div className="flex items-center gap-3">
+                  <div className="flex flex-wrap items-center gap-3">
                     {isRunning && (
                       <Button
                         size="sm"
@@ -198,6 +199,16 @@ export default function VersionHistoryPage({
                         <span>{t("Tải tệp MP4", "Download MP4")}</span>
                       </Button>
                     )}
+                    <DeletionControl
+                      resource={{ type: "final-version", id: version.id, name: t(`Phiên bản #${version.version_no}`, `Version #${version.version_no}`) }}
+                      invalidationKeys={[
+                        queryKeys.videos.finalVersions(videoId),
+                        queryKeys.videos.detail(videoId),
+                        queryKeys.finalVersions.detail(version.id),
+                        queryKeys.dashboard.summary,
+                        ...(version.output_asset_id ? [queryKeys.assets.detail(version.output_asset_id), queryKeys.assets.download(version.output_asset_id)] : []),
+                      ]}
+                    />
                   </div>
                 </div>
 

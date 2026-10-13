@@ -8,7 +8,11 @@ from types import SimpleNamespace
 import pytest
 from sqlalchemy import func, select
 
-from apps.api.app.api.generations import generate_all, generation_capabilities
+from apps.api.app.api.generations import (
+    generate_all,
+    generation_capabilities,
+    preview_generate_all,
+)
 from apps.api.app.core.config import Settings
 from apps.api.app.core.errors import AppError
 from apps.api.app.db.models import (
@@ -37,7 +41,7 @@ DIRECTORY = Path(__file__).resolve().parents[2] / "workflows" / "h3"
 
 
 async def prepared_members(
-    factory, tmp_path, count, *, persist=True, boundaries=None, motion_enabled=False
+    factory, tmp_path, count, *, persist=False, boundaries=None, motion_enabled=False
 ):
     user_id, scene_id = await seed(factory)
     directory = DIRECTORY
@@ -58,10 +62,13 @@ async def prepared_members(
         workflow = await session.scalar(select(WorkflowRecord))
         evidence = copy.deepcopy(workflow.profile["execution_evidence"])
         profile = copy.deepcopy(entry["profile"])
+        profile["studio_revision"] = evidence["studio_revision"]
+        profile["comfyui_version"] = evidence["comfyui_version"]
         profile["dependency_versions"] = {
             node["class_type"]: "synthetic-test-only" for node in graph.values()
         }
         profile["weight_hashes"] = {value: "a" * 64 for value in collect_executable_weights(graph)}
+        profile["execution_spec_hash"] = evidence["execution_spec_hash"]
         evidence.update(
             workflow_hash=approved.workflow_hash,
             slot_map_hash=approved.slot_map_hash,
@@ -191,9 +198,10 @@ async def test_studio_service_freezes_dynamic_run_and_persists_preflight_exactly
 ):
     from apps.api.app.db.models import SceneGeneration
 
-    user_id, video_id, scene_ids, ids = await prepared_members(session_factory, tmp_path, count)
+    user_id, video_id, scene_ids, generations = await prepared_members(
+        session_factory, tmp_path, count, persist=False
+    )
     async with session_factory() as session, session.begin():
-        generations = [await session.get(SceneGeneration, key) for key in ids]
         scenes = [await session.get(Scene, key) for key in scene_ids]
         video = await session.get(Video, video_id)
         for generation in generations:
@@ -202,18 +210,23 @@ async def test_studio_service_freezes_dynamic_run_and_persists_preflight_exactly
             assert (
                 generation.input_snapshot["director_execution"]["provider"] == "minimax_h3_director"
             )
+        await qualify_run(session, generations, scenes, video, user_id, monkeypatch)
         capabilities = await generation_capabilities(
             user=await session.get(User, user_id), session=session
         )
-        assert capabilities.combinations
-        assert all(case["provider"] == "minimax_h3_director" for case in capabilities.combinations)
-        await qualify_run(session, generations, scenes, video, user_id, monkeypatch)
+        # The global capabilities endpoint has no concrete video continuity list.
+        # It must fail closed; the video-scoped Generate All preview resolves the
+        # exact aggregate settings after it has that input.
+        assert not capabilities.combinations
+        assert not capabilities.available
         run = await runs.create_director_run(
             session, generations, scenes, video=video, user_id=user_id, persist=False
         )
-        assert not session.new
-        assert await session.scalar(select(func.count()).select_from(DirectorRun)) == 0
-        assert await session.scalar(select(func.count()).select_from(DirectorRunMember)) == 0
+        GenerationService.finalize_aggregate_member_configurations(generations, run)
+        for generation in generations:
+            GenerationService.bind_batch_preview_configuration_hash(
+                generation, "c" * 64, run=run
+            )
         frozen = copy.deepcopy(run.input_snapshot)
         spec = DirectorExecutionSpec.model_validate(frozen["director_execution"])
         assert spec.member_count == count
@@ -251,36 +264,64 @@ async def test_studio_service_freezes_dynamic_run_and_persists_preflight_exactly
         from tests.integration.test_director_dispatcher import worker
 
         async def object_info():
+            output_types = {
+                "UNETLoader": ["MODEL"],
+                "CLIPLoader": ["CLIP"],
+                "VAELoader": ["VAE"],
+                "MiniMaxH3Director": [
+                    "IMAGE", "AUDIO", "FLOAT", "IMAGE", "IMAGE", "STRING", "IMAGE", "IMAGE"
+                ],
+                "StudioMiniMaxH3Director": [
+                    "IMAGE", "AUDIO", "FLOAT", "IMAGE", "IMAGE", "STRING", "IMAGE", "IMAGE"
+                ],
+                "CreateVideo": ["VIDEO"],
+                "SaveVideo": [],
+                "BasicScheduler": ["SIGMAS"],
+                "MiniMaxH3DirectorRefine": ["MMX_DIR_REFINE", "INT", "INT"],
+                "MiniMaxH3DirectorFaceRefine": ["MMX_DIR_FACE_REFINE"],
+            }
             return {
                 node["class_type"]: {
-                    "input": {"required": {name: ["ANY"] for name in node["inputs"]}}
+                    "input": {"required": {name: ["*", {}] for name in node["inputs"]}},
+                    "output": output_types[node["class_type"]],
                 }
                 for node in frozen["base_workflow"].values()
             }
 
-        dispatched = await worker(
-            session_factory, tmp_path, SimpleNamespace(object_info=object_info)
-        )._prepare_workflow(frozen)
-        dispatched_director = next(
-            node for node in dispatched.values() if node["class_type"] == "StudioMiniMaxH3Director"
-        )
-        assert len(json.loads(dispatched_director["inputs"]["timeline_data"])["segments"]) == count
-        if count == 3:
-            for field in ("frames", "duration_seconds", "member_count", "base_workflow", "members"):
-                changed = copy.deepcopy(frozen)
-                if field == "base_workflow":
-                    changed[field]["5"]["inputs"]["steps"] = 26
-                elif field == "members":
-                    changed[field][1]["member_index"] = 0
-                else:
-                    changed[field] += 1
-                changed["semantic_hash"] = stable_hash(
-                    {key: value for key, value in changed.items() if key != "semantic_hash"}
-                )
-                with pytest.raises(AppError):
-                    await worker(
-                        session_factory, tmp_path, SimpleNamespace(object_info=object_info)
-                    )._prepare_workflow(changed)
+    dispatched = await worker(
+        session_factory, tmp_path, SimpleNamespace(object_info=object_info)
+    )._prepare_workflow(frozen)
+    dispatched_director = next(
+        node for node in dispatched.values() if node["class_type"] == "StudioMiniMaxH3Director"
+    )
+    assert len(json.loads(dispatched_director["inputs"]["timeline_data"])["segments"]) == count
+    if count == 3:
+        for field in ("frames", "duration_seconds", "member_count", "base_workflow", "members"):
+            changed = copy.deepcopy(frozen)
+            if field == "base_workflow":
+                changed[field]["5"]["inputs"]["steps"] = 26
+            elif field == "members":
+                changed[field][1]["member_index"] = 0
+            else:
+                changed[field] += 1
+            changed["semantic_hash"] = stable_hash(
+                {key: value for key, value in changed.items() if key != "semantic_hash"}
+            )
+            with pytest.raises(AppError):
+                await worker(
+                    session_factory, tmp_path, SimpleNamespace(object_info=object_info)
+                )._prepare_workflow(changed)
+
+    async with session_factory() as session, session.begin():
+        video = await session.get(Video, video_id)
+        for generation in generations:
+            await GenerationService.persist_prepared(
+                session, generation, video, director_run=run
+            )
+        assert not session.new
+        assert await session.scalar(select(func.count()).select_from(SceneGeneration)) == count
+        assert await session.scalar(select(func.count()).select_from(DirectorRun)) == 0
+        assert await session.scalar(select(func.count()).select_from(DirectorRunMember)) == 0
         await runs.persist_prepared_director_run(session, run)
         assert run.input_snapshot == frozen
         assert await session.scalar(select(func.count()).select_from(DirectorRunMember)) == count
@@ -288,11 +329,10 @@ async def test_studio_service_freezes_dynamic_run_and_persists_preflight_exactly
 
 
 async def test_dynamic_graph_does_not_qualify_unexecuted_count(session_factory, tmp_path):
-    from apps.api.app.db.models import SceneGeneration
-
-    user_id, video_id, scene_ids, ids = await prepared_members(session_factory, tmp_path, 3)
+    user_id, video_id, scene_ids, generations = await prepared_members(
+        session_factory, tmp_path, 3, persist=False
+    )
     async with session_factory() as session, session.begin():
-        generations = [await session.get(SceneGeneration, key) for key in ids]
         scenes = [await session.get(Scene, key) for key in scene_ids]
         with pytest.raises(AppError) as error:
             await runs.create_director_run(
@@ -320,7 +360,7 @@ async def test_new_run_rejects_historical_static_binding(session_factory, tmp_pa
         binding.pop("coverage")
         binding.update(member_index=0, count=2)
         workflow.profile = profile
-        with pytest.raises(AppError, match="dynamic"):
+        with pytest.raises(AppError) as rejected:
             await runs.create_director_run(
                 session,
                 generations,
@@ -329,6 +369,8 @@ async def test_new_run_rejects_historical_static_binding(session_factory, tmp_pa
                 user_id=user_id,
                 persist=False,
             )
+        assert rejected.value.code == "DIRECTOR_AGGREGATE_NOT_QUALIFIED"
+        assert rejected.value.status_code == 409
         assert not session.new
 
 
@@ -367,15 +409,33 @@ async def qualified_batch_state(
 
 
 async def submit_batch(factory, tmp_path, user_id, video_id):
+    settings = Settings(_env_file=None, workspace_root=tmp_path, min_free_disk_bytes=0)
+    payload = GenerateAll(settings=GenerationRequest(quality_profile="BASE", seed=42))
+    async with factory() as preview_session:
+        user = await preview_session.get(User, user_id)
+        manifest = await preview_generate_all(
+            video_id=video_id,
+            payload=payload,
+            user=user,
+            session=preview_session,
+            settings=settings,
+        )
+    payload = payload.model_copy(
+        update={
+            "settings": payload.settings.model_copy(
+                update={"preview_configuration_hash": manifest["preview_configuration_hash"]}
+            )
+        }
+    )
     async with factory() as session, session.begin():
         return await generate_all(
             video_id=video_id,
-            payload=GenerateAll(settings=GenerationRequest(quality_profile="BASE", seed=42)),
+            payload=payload,
             request=SimpleNamespace(state=SimpleNamespace(request_id="dynamic-batch")),
             key="dynamic-batch",
             user=await session.get(User, user_id),
             session=session,
-            settings=Settings(_env_file=None, workspace_root=tmp_path, min_free_disk_bytes=0),
+            settings=settings,
         )
 
 
@@ -451,6 +511,9 @@ async def test_generate_all_native_chain_and_reference_scene_are_separate(
         }
         evidence = copy.deepcopy(aggregate.profile["execution_evidence"])
         evidence.pop("director_aggregate_cases", None)
+        profile["studio_revision"] = evidence["studio_revision"]
+        profile["comfyui_version"] = evidence["comfyui_version"]
+        profile["execution_spec_hash"] = evidence["execution_spec_hash"]
         evidence.update(
             workflow_hash=approved.workflow_hash,
             slot_map_hash=approved.slot_map_hash,

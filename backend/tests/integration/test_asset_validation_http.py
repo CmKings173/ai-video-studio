@@ -172,7 +172,7 @@ async def test_http_only_creator_can_complete(session_factory, tmp_path):
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as client:
         response = await client.post(f"/assets/{asset_id}/complete", json={})
-    assert response.status_code == 403
+    assert response.status_code == 404
     assert (await read(session_factory, asset_id)).status == "PENDING_UPLOAD"
 
 

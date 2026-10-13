@@ -1,25 +1,64 @@
 const assert = require("node:assert/strict");
 const test = require("node:test");
+const { createHash } = require("node:crypto");
 const React = require("react");
 const { loadTypeScript } = require("./load-typescript.cjs");
+
+const hash = (value) => createHash("sha256").update(value).digest("hex");
 
 function setup(options = {}) {
   const states = []; let cursor = 0; const sent = []; const previews = []; const saved = [];
   const scene = { id: "scene", enabled: true, spec: { continuity: "CUT" }, revision: 2, scene_order: 0, duration_seconds: 5, generation_config: options.sceneConfig ?? {} };
   const video = { id: "video", revision: 4, aspect_ratio: "9:16", project_id: "project", scenes: [scene] };
-  const cap = { workflow_id: "synthetic-test-only", execution_scope: "single_scene", mode: "t2v", quality_profile: "STANDARD", aspect_ratio: "9:16", required_asset_slots: [], max_reference_images: 0, max_reference_videos: 0, max_reference_audio: 0, max_total_reference_files: 0 };
+  const cap = { workflow_id: "synthetic-test-only", workflow_version: "test-v1", workflow_hash: "workflow-test-hash",
+    execution_scope: "single_scene", mode: "t2v", quality_profile: "STANDARD", aspect_ratio: "9:16",
+    resolved_width: 480, resolved_height: 864, required_asset_slots: [], max_reference_images: 0,
+    max_reference_videos: 0, max_reference_audio: 0, max_total_reference_files: 0 };
+  const combinations = (options.combinations ?? [cap, { ...cap, quality_profile: "HIGH" }]).map((item) => {
+    const qualified = { ...item, workflow_version: item.workflow_version ?? "test-v1",
+      workflow_hash: item.workflow_hash ?? "workflow-test-hash", resolved_width: item.resolved_width ?? 480,
+      resolved_height: item.resolved_height ?? 864 };
+    return { ...qualified, resolved_configuration: {
+      runnable: true, qualification_status: "QUALIFIED", requested_mode: "AUTO", resolved_mode: qualified.mode,
+      workflow_id: qualified.workflow_id, workflow_version: qualified.workflow_version,
+      workflow_hash: qualified.workflow_hash, profile_hash: `profile-${qualified.workflow_id}`,
+      configuration_hash: hash(`discovery-${qualified.workflow_id}`), execution_scope: qualified.execution_scope,
+      quality_profile: qualified.quality_profile, aspect_ratio: qualified.aspect_ratio,
+      native_width: qualified.resolved_width, native_height: qualified.resolved_height,
+      seed_policy: "RANDOM", fixed_seed_or_null: null,
+    } };
+  });
+  const capabilities = options.capabilities ?? { available: true, combinations };
   const editor = loadTypeScript("components/generation/generation-editor.tsx", {
     react: { ...React, useState: (initial) => { const index = cursor++; if (!(index in states)) states[index] = typeof initial === "function" ? initial() : initial; return [states[index], (value) => { states[index] = typeof value === "function" ? value(states[index]) : value; }]; } },
-    "@tanstack/react-query": { useQueryClient: () => ({ invalidateQueries: async () => {} }), useQueries: ({ queries }) => queries.map((query) => ({ data: (options.hydratedAssets ?? []).find((asset) => asset.id === query.queryKey.at(-1)) })), useInfiniteQuery: () => ({ data: { pages: [{ items: options.pageAssets ?? [], total: (options.pageAssets ?? []).length, page: 1, page_size: 50 }] }, hasNextPage: false, isFetchingNextPage: false, fetchNextPage: async () => {} }), useQuery: () => ({ data: options.capabilities ?? { available: true, combinations: options.combinations ?? [cap, { ...cap, quality_profile: "HIGH" }] } }) },
+    "@tanstack/react-query": { useQueryClient: () => ({ fetchQuery: async ({ queryFn }) => queryFn ? queryFn() : capabilities, invalidateQueries: async () => {} }), useQueries: ({ queries }) => queries.map((query) => ({ data: (options.hydratedAssets ?? []).find((asset) => asset.id === query.queryKey.at(-1)) })), useInfiniteQuery: () => ({ data: { pages: [{ items: options.pageAssets ?? [], total: (options.pageAssets ?? []).length, page: 1, page_size: 50 }] }, hasNextPage: false, isFetchingNextPage: false, fetchNextPage: async () => {} }), useQuery: () => ({ data: capabilities }) },
     "@/lib/api/scenes": { patchScene: async (...args) => saved.push(args) },
-    "@/lib/api/generations": { generationCapabilities: async () => {}, previewPrompt: (id, payload) => new Promise((resolve) => previews.push({ id, payload, resolve })) },
+    "@/lib/api/generations": { generationCapabilities: async () => capabilities, previewPrompt: (id, payload) => new Promise((resolve) => previews.push({ id, payload, resolve })) },
   }).GenerationEditor;
   let tree;
   const render = () => { cursor = 0; tree = editor({ scene, scenes: video.scenes, video, isLoading: false, onClose: () => {}, onSubmit: async (payload) => sent.push(payload) }); return tree; };
   function nodes(node) { if (!node || typeof node !== "object") return []; return [node, ...React.Children.toArray(node.props?.children).flatMap(nodes)]; }
   const button = (label) => { const found = nodes(tree).find((node) => node.props?.children === label); assert.ok(found, label); return found; };
   const changeSelect = (value, next) => { const found = nodes(tree).find((node) => node.type === "select" && node.props.value === value); assert.ok(found); found.props.onChange({ target: { value: next } }); render(); };
-  const resolvePreview = async (pending) => { previews.at(-1).resolve({ raw_prompt: "raw", execution_prompt: "  composed\n  ", scene_revision: 2, video_revision: 4, warnings: [], enhanced: false }); await pending; render(); };
+  const resolvePreview = async (pending) => {
+    await new Promise((resolve) => setImmediate(resolve));
+    const previewRequest = previews.at(-1);
+    assert.ok(previewRequest, `preview API was not called; error=${states[6] ?? "none"}; tree text: ${JSON.stringify(nodes(tree).map((node) => node.props?.children).filter((value) => typeof value === "string"))}`);
+    const request = previewRequest.payload;
+    const capability = combinations.find((item) => item.workflow_id === request.workflow_id
+      && item.quality_profile === (request.quality_profile ?? "STANDARD")
+      && item.aspect_ratio === request.aspect_ratio
+      && (request.width == null || item.resolved_width === request.width)
+      && (request.height == null || item.resolved_height === request.height));
+    const resolved = capability?.resolved_configuration;
+    previewRequest.resolve({ raw_prompt: "raw", execution_prompt: "  composed\n  ", scene_revision: 2,
+      video_revision: 4, warnings: [], enhanced: false,
+      resolved_configuration: resolved ? { ...resolved, requested_mode: request.mode ?? "AUTO",
+        configuration_hash: hash(`preview-${capability.workflow_id}-${JSON.stringify(request)}`),
+        seed_policy: request.seed_policy ?? "RANDOM",
+        fixed_seed_or_null: request.seed_policy === "FIXED" ? request.seed : null } : null });
+    await pending; render();
+  };
   render(); return { render, scene, video, sent, saved, previews, button, changeSelect, resolvePreview,
     edit: (text) => { nodes(tree).find((node) => node.type === "textarea").props.onChange({ target: { value: text } }); render(); } };
 }
@@ -289,7 +328,7 @@ async function reuseViaPage(parent) {
     "@tanstack/react-query": { useQuery: () => ({ data: undefined }) },
   }).GenerationHistoryDetails;
   const tree = History({ generation: parent, scene, scenes: video.scenes, busy: false,
-    onRegenerate: () => {}, onVariation: () => {}, onReuse: () => reuse.mutationFn(parent) });
+    onRegenerate: () => {}, onVariation: () => {}, onReuse: () => reuse.mutationFn({ parent }) });
   const reuseButton = nodes(tree).find(node => node.props?.children === "Dùng lại cấu hình cho cảnh");
   assert.ok(reuseButton);
   assert.equal(reuseButton.props.disabled, false);

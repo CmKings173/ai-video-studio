@@ -20,8 +20,22 @@ def synthetic_evidence(entry):
         workflow=entry["workflow"],
         slots={name: tuple(binding) for name, binding in entry["slots"].items()},
     )
+    provider_source = entry["profile"].get(
+        "provider_source",
+        {
+            "repository": "test/Director",
+            "commit": "a" * 40,
+        },
+    )
     return {
         "poc_verified": True,
+        "studio_revision": "1" * 40,
+        "comfyui_version": "0.3.50-test",
+        "provider_source": {
+            "repository": provider_source["repository"],
+            "commit": provider_source["commit"],
+        },
+        "execution_spec_hash": "2" * 64,
         "execution_evidence": {
             "executed": True,
             "workflow_hash": graph.workflow_hash,
@@ -31,14 +45,29 @@ def synthetic_evidence(entry):
             "model_hash": "c" * 64,
             "lora_hashes": {},
             "comfyui_commit": "d" * 40,
+            "studio_revision": "1" * 40,
+            "director_repository": provider_source["repository"],
+            "director_commit": provider_source["commit"],
+            "comfyui_version": "0.3.50-test",
+            "execution_spec_hash": "2" * 64,
+            "gpu_model": "synthetic-test-only",
+            "gpu_count": 1,
+            "driver_version": "synthetic-test-only",
+            "cuda_runtime": "synthetic-test-only",
             "custom_node_versions": {},
             "output": {
                 "width": 864,
                 "height": 480,
                 "fps": 24,
                 "duration_seconds": 5,
+                "frame_count": 120,
+                "video_codec": "h264",
+                "container": "mp4",
                 "has_video": True,
                 "has_audio": True,
+                "audio_sample_rate": 48000,
+                "audio_channels": 2,
+                "audio_codec": "aac",
                 "checksum": "f" * 64,
                 "size_bytes": 1000,
             },

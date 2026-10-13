@@ -227,8 +227,11 @@ async def is_selected_execution_group_fresh(
     scene_ids = [member.id for member in chain]
     if binding is None:
         assigned = await session.scalar(
-            select(DirectorRunMember.id).where(
-                DirectorRunMember.scene_generation_id == generation.id
+            select(DirectorRunMember.id)
+            .join(DirectorRun, DirectorRun.id == DirectorRunMember.director_run_id)
+            .where(
+                DirectorRunMember.scene_generation_id == generation.id,
+                DirectorRun.video_id == video.id,
             )
         )
         return len(chain) == 1 and assigned is None
@@ -244,7 +247,12 @@ async def is_selected_execution_group_fresh(
     selected_ids = [member.selected_generation_id for member in chain]
     if selected_ids != binding["generation_ids"] or scene.selected_generation_id != generation.id:
         return False
-    run = await session.get(DirectorRun, binding["run_id"])
+    run = await session.scalar(
+        select(DirectorRun).where(
+            DirectorRun.id == binding["run_id"],
+            DirectorRun.video_id == video.id,
+        )
+    )
     if (
         run is None
         or run.video_id != video.id
@@ -256,7 +264,11 @@ async def is_selected_execution_group_fresh(
         (
             await session.scalars(
                 select(DirectorRunMember)
-                .where(DirectorRunMember.director_run_id == run.id)
+                .join(DirectorRun, DirectorRun.id == DirectorRunMember.director_run_id)
+                .where(
+                    DirectorRunMember.director_run_id == run.id,
+                    DirectorRun.video_id == video.id,
+                )
                 .order_by(DirectorRunMember.member_index)
             )
         ).all()
@@ -266,7 +278,13 @@ async def is_selected_execution_group_fresh(
     ] != selected_ids:
         return False
     for member in members:
-        selected = await session.get(SceneGeneration, member.scene_generation_id)
+        selected = await session.scalar(
+            select(SceneGeneration).where(
+                SceneGeneration.id == member.scene_generation_id,
+                SceneGeneration.scene_id == member.scene_id,
+                SceneGeneration.video_id == video.id,
+            )
+        )
         if (
             selected is None
             or selected.status != "COMPLETED"
@@ -284,7 +302,12 @@ async def restore_video_after_assembly(session, video, attempted_manifest, fallb
     if video.status == "DIRTY" or video.revision != attempted_manifest.get("video_revision"):
         video.status = "DIRTY"
     elif video.current_final_video_id:
-        previous = await session.get(FinalVideo, video.current_final_video_id)
+        previous = await session.scalar(
+            select(FinalVideo).where(
+                FinalVideo.id == video.current_final_video_id,
+                FinalVideo.video_id == video.id,
+            )
+        )
         video.status = (
             "READY"
             if previous
@@ -304,7 +327,13 @@ async def is_selected_generation_fresh(
     """Selected output is current only when fresh, completed and still available."""
     if not scene.selected_generation_id:
         return False
-    generation = await session.get(SceneGeneration, scene.selected_generation_id)
+    generation = await session.scalar(
+        select(SceneGeneration).where(
+            SceneGeneration.id == scene.selected_generation_id,
+            SceneGeneration.scene_id == scene.id,
+            SceneGeneration.video_id == video.id,
+        )
+    )
     if (
         generation is None
         or generation.status != "COMPLETED"
@@ -313,7 +342,13 @@ async def is_selected_generation_fresh(
         or not await is_selected_execution_group_fresh(session, scene, video, generation)
     ):
         return False
-    asset = await session.get(Asset, generation.output_asset_id)
+    asset = await session.scalar(
+        select(Asset).where(
+            Asset.id == generation.output_asset_id,
+            Asset.project_id == video.project_id,
+            Asset.role == "GENERATED_VIDEO",
+        )
+    )
     return bool(asset and asset.status == "READY" and asset.checksum and asset.deleted_at is None)
 
 
@@ -360,10 +395,14 @@ async def is_assembly_source_current(
         ) or scene.scene_order != entry.get("scene_order"):
             return False
         generation = (
-            await session.get(
-                SceneGeneration,
-                scene.selected_generation_id,
-                with_for_update=True,
+            await session.scalar(
+                select(SceneGeneration)
+                .where(
+                    SceneGeneration.id == scene.selected_generation_id,
+                    SceneGeneration.scene_id == scene.id,
+                    SceneGeneration.video_id == video.id,
+                )
+                .with_for_update()
             )
             if scene.selected_generation_id
             else None
@@ -376,7 +415,15 @@ async def is_assembly_source_current(
             or not await is_selected_execution_group_fresh(session, scene, video, generation)
         ):
             return False
-        asset = await session.get(Asset, generation.output_asset_id, with_for_update=True)
+        asset = await session.scalar(
+            select(Asset)
+            .where(
+                Asset.id == generation.output_asset_id,
+                Asset.project_id == video.project_id,
+                Asset.role == "GENERATED_VIDEO",
+            )
+            .with_for_update()
+        )
         if (
             asset is None
             or asset.status != "READY"

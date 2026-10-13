@@ -1,5 +1,7 @@
 """Actual mutation/completion paths preserve history and reject stale promotion."""
 
+from uuid import NAMESPACE_URL, uuid5
+
 import pytest
 
 from apps.api.app.api.brands import patch_brand
@@ -74,15 +76,20 @@ async def edit_dependency(factory, user_id, product_id, brand_id, dependency, va
             )
 
 
-async def ready_asset(session, user_id, key="scene"):
+async def ready_asset(session, user_id, video, owner_id, key="scene", role="GENERATED_VIDEO"):
     asset = Asset(
+        id=str(uuid5(NAMESPACE_URL, f"ai-video-studio:{role}:{owner_id}")),
+        project_id=video.project_id,
         kind="VIDEO",
+        role=role,
         filename="clip.mp4",
         content_type="video/mp4",
         object_key=key,
         status="READY",
         checksum="a" * 64,
         size_bytes=4,
+        resource_owner_id=video.created_by,
+        ownership_provenance="VIDEO_PARENT",
         created_by=user_id,
     )
     session.add(asset)
@@ -102,7 +109,8 @@ async def test_dependency_edit_during_standalone_completion(session_factory, tmp
     async with session_factory() as session, session.begin():
         generation = await session.get(SceneGeneration, generation_id)
         generation.claimed_by, generation.status = worker.owner, "RUNNING"
-        output = await ready_asset(session, user)
+        video = await session.get(Video, video_id)
+        output = await ready_asset(session, user, video, generation.id)
         output_id = output.id
     await edit_dependency(session_factory, user, product, brand, dependency)
     await worker._finish(generation_id, "COMPLETED", asset_id=output_id)
@@ -123,7 +131,8 @@ async def test_edit_after_promoted_final_retains_history(session_factory, tmp_pa
     )
     async with session_factory() as session, session.begin():
         generation = await session.get(SceneGeneration, generation_id)
-        asset = await ready_asset(session, user)
+        video = await session.get(Video, video_id)
+        asset = await ready_asset(session, user, video, generation.id)
         generation.status, generation.output_asset_id = "COMPLETED", asset.id
         scene = await session.get(Scene, scene_id)
         scene.selected_generation_id = generation_id
@@ -139,7 +148,9 @@ async def test_edit_after_promoted_final_retains_history(session_factory, tmp_pa
         )
         final_id = final.id
         final.claimed_by, final.status = "test-assembler", "ASSEMBLING"
-        output = await ready_asset(session, user, "final")
+        output = await ready_asset(
+            session, user, video, final.id, "final", role="FINAL_VIDEO"
+        )
         output_id = output.id
     worker = Assembler(session_factory, MemoryStore(), CapturingFFmpeg(), worker_settings(tmp_path))
     worker.owner = "test-assembler"
@@ -222,7 +233,7 @@ async def test_delayed_stale_job_does_not_dirty_a_new_fresh_final(session_factor
             user_id=user,
             request_id=None,
         )
-        output = await ready_asset(session, user, "fresh-scene")
+        output = await ready_asset(session, user, video, current.id, "fresh-scene")
         current.status, current.output_asset_id = "COMPLETED", output.id
         scene = await session.get(Scene, scene_id)
         scene.selected_generation_id = current.id
@@ -236,8 +247,10 @@ async def test_delayed_stale_job_does_not_dirty_a_new_fresh_final(session_factor
             request_id=None,
         )
         final.claimed_by, final.status = "new-final-owner", "ASSEMBLING"
-        final_output = await ready_asset(session, user, "fresh-final")
-        stale_output = await ready_asset(session, user, "stale-scene")
+        final_output = await ready_asset(
+            session, user, video, final.id, "fresh-final", role="FINAL_VIDEO"
+        )
+        stale_output = await ready_asset(session, user, video, old_id, "stale-scene")
         current_id, final_id, output_id, stale_id = (
             current.id,
             final.id,

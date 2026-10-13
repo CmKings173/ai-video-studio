@@ -43,6 +43,9 @@ export const queryKeys = {
   finalVersions: {
     detail: (id: string) => ["final-versions", "detail", id] as const,
   },
+  deletions: {
+    operation: (id: string) => ["deletion-operations", id] as const,
+  },
   assets: {
     all: ["assets"] as const,
     list: (filters?: Record<string, unknown>) => ["assets", "list", filters] as const,

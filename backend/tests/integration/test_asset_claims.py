@@ -435,6 +435,59 @@ async def test_output_collection_rejects_existing_asset_identity_conflict(
         assert row.operation_claim_id is None
 
 
+@pytest.mark.asyncio
+async def test_legacy_output_replay_fails_closed_without_backfilling_provenance(
+    session_factory,
+):
+    user_id, project_id = await seed_asset_owner(session_factory)
+    store = MemoryStore()
+    data = b"legacy-output-bytes"
+    checksum = hashlib.sha256(data).hexdigest()
+    owner_id = "legacy-generation"
+    role = "GENERATED_VIDEO"
+    asset_id = str(uuid5(NAMESPACE_URL, f"ai-video-studio:{role}:{owner_id}"))
+    object_key = f"outputs/{role.lower()}/{owner_id}/{checksum}.mp4"
+    store.objects[object_key] = (data, "video/mp4")
+    async with session_factory() as session, session.begin():
+        session.add(
+            Asset(
+                id=asset_id,
+                project_id=project_id,
+                kind="VIDEO",
+                role=role,
+                filename=f"{owner_id}.mp4",
+                content_type="video/mp4",
+                object_key=object_key,
+                status="READY",
+                checksum=checksum,
+                size_bytes=len(data),
+                resource_owner_id=None,
+                ownership_provenance=None,
+                created_by=user_id,
+            )
+        )
+
+    with pytest.raises(ValueError, match="IMMUTABLE_OUTPUT_CONFLICT"):
+        await save_output(
+            session_factory,
+            store,
+            owner_id=owner_id,
+            role=role,
+            project_id=project_id,
+            created_by=user_id,
+            data=data,
+            metadata={"kind": "VIDEO", "has_video": True},
+        )
+
+    assert store.put_count == 0
+    async with session_factory() as session:
+        row = await session.get(Asset, asset_id)
+        assert row is not None
+        assert row.resource_owner_id is None
+        assert row.ownership_provenance is None
+        assert row.status == "READY"
+
+
 async def seed_asset_owner(session_factory):
     async with session_factory() as session, session.begin():
         user = User(

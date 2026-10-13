@@ -252,6 +252,7 @@ def test_real_compose_interpolation_uses_synthetic_env_outside_cwd(tmp_path):
     shutil.copy(REPO / "infra" / "compose.yaml", compose)
     values = {
         "POSTGRES_PASSWORD": "synthetic-db-password",
+        "JWT_SECRET": "synthetic-integration-signing-secret-with-at-least-32-bytes",
         "MINIO_PUBLIC_ENDPOINT": "http://synthetic.invalid:9000",
         "MINIO_ACCESS_KEY": "synthetic-access", "MINIO_SECRET_KEY": "synthetic-secret",
         "COOKIE_SECURE": "false", "BOOTSTRAP_ADMIN_EMAIL": "synthetic@example.test",

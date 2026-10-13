@@ -52,13 +52,18 @@ async def test_legacy_auto_explicit_capability_approval_and_frozen_gates(session
         record = await session.scalar(select(WorkflowRecord))
         # Keep this graph explicitly historical even when the shared seed becomes Director.
         record.workflow = {"1": {"class_type": "HistoricalH3", "inputs": {}}}
-        for explicit, code in ((None, "WORKFLOW_NOT_CONFIGURED"), (record.id, "WORKFLOW_RETIRED")):
+        for explicit in (None, record.id):
             with pytest.raises(AppError) as caught:
-                await service._workflow(session, "t2v", explicit)
-            assert caught.value.code == code
+                await service._workflow(
+                    session, "t2v", explicit, ratio="9:16",
+                    duration_seconds=5, seed_policy="RANDOM", seed=None,
+                )
+            assert caught.value.code == "WORKFLOW_NOT_QUALIFIED"
+            assert "Director" in caught.value.message
         user = await session.get(User, user_id)
         caps = await generation_capabilities(user=user, session=session)
-        assert not caps.available and not caps.combinations and not caps.disabled
+        assert not caps.available and not caps.combinations
+        assert caps.disabled[0]["code"] == "WORKFLOW_RETIRED"
         with pytest.raises(AppError) as caught:
             await approve_workflow(
                 record.id, WorkflowApproval(enabled=True), admin=user, session=session
@@ -136,6 +141,9 @@ async def test_legacy_parent_derivative_cannot_replan_even_with_director_overrid
                         parent_generation_id=parent.id,
                         mode="t2v",
                         workflow_id=workflow.id,
+                        aspect_ratio=frozen["requested_aspect_ratio"],
+                        width=frozen["width"],
+                        height=frozen["height"],
                     ),
                     user_id=user,
                     request_id=None,

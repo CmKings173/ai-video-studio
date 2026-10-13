@@ -1,6 +1,5 @@
 """Add indexes for bounded live SSE snapshots."""
 
-import sqlalchemy as sa
 from alembic import op
 
 

@@ -12,7 +12,7 @@ from sqlalchemy import and_, case, func, or_, select
 from apps.api.app.db.models import Asset, utcnow
 from apps.api.app.integrations.minio import AssetObjectMissingError, AssetStoreError
 from apps.api.app.services.asset_claims import claim_available_expression, clear_claim
-from apps.api.app.services.asset_service import asset_reference_exists
+from apps.api.app.services.asset_service import asset_retention_reference_exists
 from apps.api.app.services.retention import RetentionPolicy
 
 logger = logging.getLogger(__name__)
@@ -49,6 +49,7 @@ class AssetRetentionService:
 
     def _eligibility(self, now: datetime):
         pending_cutoff = now - timedelta(hours=self.policy.pending_hours)
+        unreferenced_output_cutoff = pending_cutoff
         failed_cutoff = now - timedelta(hours=self.policy.failed_hours)
         deleted_cutoff = now - timedelta(hours=self.policy.deleted_hours)
         deleting_cutoff = now - timedelta(hours=self.policy.deleting_retry_hours)
@@ -68,6 +69,18 @@ class AssetRetentionService:
                 Asset.status == "FAILED",
                 Asset.failed_at.is_not(None),
                 Asset.failed_at < failed_cutoff,
+            ),
+            # A worker can lose its lease after an immutable output reaches
+            # READY but before it commits the canonical resource reference.
+            # Retire only well-scoped generated video outputs after a grace
+            # window; claim_batch rechecks references under the Asset lock.
+            and_(
+                Asset.status == "READY",
+                Asset.kind == "VIDEO",
+                Asset.role.in_({"GENERATED_VIDEO", "FINAL_VIDEO"}),
+                Asset.ownership_provenance == "VIDEO_PARENT",
+                Asset.resource_owner_id.is_not(None),
+                Asset.created_at < unreferenced_output_cutoff,
             ),
             and_(
                 Asset.status == "DELETED",
@@ -99,7 +112,7 @@ class AssetRetentionService:
 
     async def preview(self, *, now: datetime | None = None) -> RetentionCleanupResult:
         now = now or utcnow()
-        referenced = asset_reference_exists(Asset.id).label("referenced")
+        referenced = asset_retention_reference_exists(Asset.id).label("referenced")
         async with self.factory() as session:
             rows = (
                 await session.execute(
@@ -128,7 +141,10 @@ class AssetRetentionService:
             rows = (
                 await session.scalars(
                     select(Asset)
-                    .where(self._eligibility(now), ~asset_reference_exists(Asset.id))
+                    .where(
+                        self._eligibility(now),
+                        ~asset_retention_reference_exists(Asset.id),
+                    )
                     .order_by(self._order_timestamp(), Asset.id)
                     .limit(self.batch_size)
                     .with_for_update(skip_locked=True)
@@ -143,7 +159,8 @@ class AssetRetentionService:
                 (
                     await session.scalars(
                         select(Asset.id).where(
-                            Asset.id.in_(locked_ids), ~asset_reference_exists(Asset.id)
+                            Asset.id.in_(locked_ids),
+                            ~asset_retention_reference_exists(Asset.id),
                         )
                     )
                 ).all()
@@ -193,7 +210,9 @@ class AssetRetentionService:
                 return False
             object_key = asset.object_key
             is_referenced = await session.scalar(
-                select(asset_reference_exists(Asset.id)).where(Asset.id == asset_id)
+                select(asset_retention_reference_exists(Asset.id)).where(
+                    Asset.id == asset_id
+                )
             )
             if is_referenced:
                 return False
@@ -263,7 +282,7 @@ class AssetRetentionService:
                     select(Asset.id)
                     .where(
                         self._eligibility(now),
-                        ~asset_reference_exists(Asset.id),
+                        ~asset_retention_reference_exists(Asset.id),
                         ~Asset.id.in_([c.asset_id for c in claims]),
                     )
                     .limit(1)

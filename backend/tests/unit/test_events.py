@@ -1,4 +1,5 @@
 from datetime import timedelta
+from types import SimpleNamespace
 
 import pytest
 
@@ -53,10 +54,15 @@ async def test_snapshot_bounds_terminal_history_and_pages_new_rows(session_facto
     now = utcnow()
     history_at = now - timedelta(days=30)
     scan_from = now - timedelta(seconds=1)
-    user_id, video_id, scene_id, workflow_id = "user-events", "video-events", "scene-events", "workflow-events"
+    user_id = "user-events"
+    video_id = "video-events"
+    scene_id = "scene-events"
+    workflow_id = "workflow-events"
 
     async with session_factory() as session:
         session.add(User(id=user_id, email="events@example.test", password_hash="test"))
+        # Flush the FK parent explicitly; these models use scalar FKs without ORM relationships.
+        await session.flush()
         project = Project(name="events", created_by=user_id)
         session.add(project)
         await session.flush()
@@ -71,6 +77,7 @@ async def test_snapshot_bounds_terminal_history_and_pages_new_rows(session_facto
                 created_by=user_id,
             )
         )
+        await session.flush()
         session.add(Scene(id=scene_id, video_id=video_id, scene_order=0))
         session.add(
             WorkflowRecord(
@@ -164,6 +171,7 @@ async def test_snapshot_bounds_terminal_history_and_pages_new_rows(session_facto
     snapshot = await _snapshot(
         session_factory,
         video_id,
+        principal=SimpleNamespace(id=user_id, role="EDITOR", auth_version=1),
         generation_cursor=(scan_from, ""),
         final_cursor=(scan_from, ""),
         active_generation_ids=set(),
@@ -185,6 +193,7 @@ async def test_snapshot_bounds_terminal_history_and_pages_new_rows(session_facto
     next_snapshot = await _snapshot(
         session_factory,
         video_id,
+        principal=SimpleNamespace(id=user_id, role="EDITOR", auth_version=1),
         generation_cursor=snapshot.generation_cursor,
         final_cursor=snapshot.final_cursor,
         active_generation_ids=snapshot.active_generation_ids,
@@ -197,24 +206,32 @@ async def test_snapshot_bounds_terminal_history_and_pages_new_rows(session_facto
 @pytest.mark.asyncio
 async def test_snapshot_keeps_tracking_an_active_item_until_terminal_transition(session_factory):
     now = utcnow()
-    user_id, video_id, scene_id, workflow_id = "user-live", "video-live", "scene-live", "workflow-live"
+    user_id = "user-live"
+    video_id = "video-live"
+    scene_id = "scene-live"
+    workflow_id = "workflow-live"
 
     async with session_factory() as session:
         session.add(User(id=user_id, email="live@example.test", password_hash="test"))
+        # Flush the FK parent explicitly; these models use scalar FKs without ORM relationships.
+        await session.flush()
         project = Project(name="live", created_by=user_id)
         session.add(project)
         await session.flush()
+        session.add(
+            Video(
+                id=video_id,
+                project_id=project.id,
+                title="live",
+                kind="QUICK_CLIP",
+                target_duration=5,
+                aspect_ratio="16:9",
+                created_by=user_id,
+            )
+        )
+        await session.flush()
         session.add_all(
             [
-                Video(
-                    id=video_id,
-                    project_id=project.id,
-                    title="live",
-                    kind="QUICK_CLIP",
-                    target_duration=5,
-                    aspect_ratio="16:9",
-                    created_by=user_id,
-                ),
                 Scene(id=scene_id, video_id=video_id, scene_order=0),
                 WorkflowRecord(
                     id=workflow_id,
@@ -252,6 +269,7 @@ async def test_snapshot_keeps_tracking_an_active_item_until_terminal_transition(
     first = await _snapshot(
         session_factory,
         video_id,
+        principal=SimpleNamespace(id=user_id, role="EDITOR", auth_version=1),
         generation_cursor=(now, ""),
         final_cursor=(now, ""),
         active_generation_ids=set(),
@@ -270,12 +288,15 @@ async def test_snapshot_keeps_tracking_an_active_item_until_terminal_transition(
     terminal = await _snapshot(
         session_factory,
         video_id,
+        principal=SimpleNamespace(id=user_id, role="EDITOR", auth_version=1),
         generation_cursor=first.generation_cursor,
         final_cursor=first.final_cursor,
         active_generation_ids=first.active_generation_ids,
         active_final_ids=first.active_final_ids,
     )
-    generation_event = next(event for event in terminal.events if event[0] == "generation:generation-live")
+    generation_event = next(
+        event for event in terminal.events if event[0] == "generation:generation-live"
+    )
     assert generation_event[3]["status"] == "FAILED"
     assert generation_event[3]["current"] == 4
     assert terminal.active_generation_ids == set()

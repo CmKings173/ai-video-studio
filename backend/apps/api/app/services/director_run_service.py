@@ -47,6 +47,7 @@ from apps.api.app.services.generation_intent import (
     stable_hash,
 )
 from apps.api.app.services.qualification_binding import optional_weights_bound, provenance_matches
+from apps.api.app.services.video_dependency_guard import read_video_dependencies
 from apps.api.app.services.workflow_contracts import (
     approved_record,
     profile_hash,
@@ -336,6 +337,7 @@ async def create_director_run(
     *,
     video: Video,
     user_id: str,
+    is_admin: bool = False,
     request_id: str | None = None,
     persist: bool = True,
 ) -> DirectorRun:
@@ -353,8 +355,17 @@ async def create_director_run(
     """
     if not session.in_transaction():
         raise _invalid("Director run creation requires the batch transaction")
+    if not is_admin and video.created_by != user_id:
+        raise AppError("VIDEO_NOT_FOUND", "Video was not found", 404)
+    # Generation preparation owns authoritative dependency locks before children.
+    # Direct callers must still prove a valid active graph without late locks.
+    await read_video_dependencies(session, video, user_id=user_id, is_admin=is_admin)
     if not generations or len(generations) != len(scenes):
         raise _invalid("An ordered generation and scene pair is required for every member")
+    if any(member.video_id != video.id for member in generations):
+        raise AppError("GENERATION_NOT_FOUND", "Generation was not found", 404)
+    if any(scene.video_id != video.id for scene in scenes):
+        raise AppError("SCENE_NOT_FOUND", "Scene was not found", 404)
     if any(
         not isinstance(member.input_snapshot, dict)
         or member.input_snapshot.get("provider") != "minimax_h3_director"
@@ -368,10 +379,20 @@ async def create_director_run(
     if (
         len({member.id for member in generations}) != len(generations)
         or len({scene.id for scene in scenes}) != len(scenes)
-        or any(not member.id or member.created_by != user_id for member in generations)
+        or any(not member.id for member in generations)
     ):
-        raise _invalid("Run members must be distinct and belong to the requesting user")
-    workflow = await session.get(WorkflowRecord, generations[0].workflow_id, with_for_update=True)
+        raise _invalid("Run members must be distinct and belong to the selected video")
+    # WorkflowRecord has no revision. A locked column snapshot observes current
+    # approval without overwriting any pending ORM workflow edits.
+    with session.no_autoflush:
+        values = (
+            await session.execute(
+                select(*WorkflowRecord.__table__.c)
+                .where(WorkflowRecord.id == generations[0].workflow_id)
+                .with_for_update()
+            )
+        ).mappings().one_or_none()
+    workflow = WorkflowRecord(**copy.deepcopy(dict(values))) if values is not None else None
     if workflow is None or not workflow.enabled:
         raise AppError("WORKFLOW_NOT_QUALIFIED", "Aggregate workflow is missing or disabled", 409)
     if workflow.execution_scope != "aggregate":

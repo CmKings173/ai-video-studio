@@ -15,11 +15,35 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    event,
+    inspect,
+    select,
     text,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .base import Base, JSONType, UTCDateTime, new_id, utcnow
+
+DELETION_RESOURCE_TYPES = ("VIDEO", "SCENE", "GENERATION", "FINAL_VIDEO")
+DELETION_OPERATION_STATUSES = (
+    "DELETE_REQUESTED",
+    "WAITING_FOR_DEPENDENCIES",
+    "LOGICALLY_DELETED",
+    "CLEANUP_PENDING",
+    "CLEANUP_COMPLETE",
+    "CLEANUP_FAILED",
+    "CLEANUP_BLOCKED",
+)
+DELETION_HIDDEN_STATUSES = (
+    "WAITING_FOR_DEPENDENCIES",
+    "LOGICALLY_DELETED",
+    "CLEANUP_PENDING",
+    "CLEANUP_COMPLETE",
+    "CLEANUP_FAILED",
+    "CLEANUP_BLOCKED",
+)
+_DELETION_RESOURCE_TYPE_SQL = ",".join(f"'{value}'" for value in DELETION_RESOURCE_TYPES)
+_DELETION_OPERATION_STATUS_SQL = ",".join(f"'{value}'" for value in DELETION_OPERATION_STATUSES)
 
 
 class Identity:
@@ -30,12 +54,30 @@ class Identity:
 
 class User(Identity, Base):
     __tablename__ = "users"
-    __table_args__ = (CheckConstraint("role IN ('ADMIN','EDITOR')", name="role"),)
+    __table_args__ = (
+        CheckConstraint("role IN ('ADMIN','EDITOR')", name="role"),
+        CheckConstraint("auth_version >= 1", name="auth_version_positive"),
+    )
     email: Mapped[str] = mapped_column(String(320), unique=True)
     name: Mapped[str] = mapped_column(String(255), default="")
     password_hash: Mapped[str] = mapped_column(String(255))
     role: Mapped[str] = mapped_column(String(16), default="EDITOR")
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    auth_version: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+
+
+@event.listens_for(User, "before_update")
+def revoke_tokens_for_account_change(_mapper, connection, account: User) -> None:
+    """Keep ORM mutations consistent with the migration's database revocation trigger."""
+    state = inspect(account)
+    if any(
+        state.attrs[name].history.has_changes()
+        for name in ("role", "is_active", "password_hash")
+    ):
+        previous_version = connection.scalar(
+            select(User.auth_version).where(User.id == account.id)
+        )
+        account.auth_version = max((previous_version or 1) + 1, account.auth_version or 1)
 
 
 class Session(Base):
@@ -107,6 +149,11 @@ class Asset(Identity, Base):
         ),
         CheckConstraint("project_id IS NULL OR product_id IS NULL", name="single_business_scope"),
         CheckConstraint(
+            "ownership_provenance IS NULL OR ownership_provenance IN "
+            "('OWNER','ADMIN_ASSIGNMENT','VIDEO_PARENT')",
+            name="ownership_provenance",
+        ),
+        CheckConstraint(
             "operation_claim_type IS NULL OR operation_claim_type IN ('REPAIR','OUTPUT_WRITE')",
             name="operation_claim_type",
         ),
@@ -122,6 +169,12 @@ class Asset(Identity, Base):
     product_id: Mapped[str | None] = mapped_column(
         ForeignKey("products.id", ondelete="RESTRICT"), index=True
     )
+    # Nullable for historical rows; new scoped/output assets store an immutable
+    # business owner and the trusted path that granted that ownership.
+    resource_owner_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="RESTRICT"), index=True
+    )
+    ownership_provenance: Mapped[str | None] = mapped_column(String(32))
     kind: Mapped[str] = mapped_column(String(16))
     role: Mapped[str] = mapped_column(String(64), default="REFERENCE")
     filename: Mapped[str] = mapped_column(String(255))
@@ -182,6 +235,11 @@ class Video(Identity, Base):
     revision: Mapped[int] = mapped_column(Integer, default=1)
     current_final_video_id: Mapped[str | None] = mapped_column(String(36))
     created_by: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"))
+    # Business ownership belongs to created_by; delegation preserves its actor
+    # independently. Historical creation actors are unknown and remain NULL.
+    created_actor_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="RESTRICT"), nullable=True
+    )
 
 
 class Scene(Identity, Base):
@@ -570,3 +628,75 @@ class IdempotencyKey(Identity, Base):
     response: Mapped[dict[str, Any]] = mapped_column(JSONType, default=dict)
     status_code: Mapped[int] = mapped_column(Integer, default=202)
     expires_at: Mapped[datetime] = mapped_column(UTCDateTime(), index=True)
+
+
+class DeletionOperation(Identity, Base):
+    """Durable deletion intent and cleanup progress for one business resource.
+
+    ``resource_id`` is intentionally polymorphic and has no foreign key. The
+    denormalized ``video_id`` is also retained without a foreign key so this
+    audit/outbox row can survive physical removal of the owning video. Neither
+    relationship is cascade-deleted. Actor and business-owner references use
+    RESTRICT so attribution cannot silently disappear.
+    """
+
+    __tablename__ = "deletion_operations"
+    __table_args__ = (
+        UniqueConstraint("resource_type", "resource_id", name="uq_deletion_operations_resource"),
+        CheckConstraint(
+            f"resource_type IN ({_DELETION_RESOURCE_TYPE_SQL})",
+            name="resource_type",
+        ),
+        CheckConstraint(
+            f"status IN ({_DELETION_OPERATION_STATUS_SQL})",
+            name="status",
+        ),
+        CheckConstraint("expected_revision >= 1", name="expected_revision_positive"),
+        CheckConstraint("retry_count >= 0", name="retry_count_nonnegative"),
+        CheckConstraint(
+            "(status = 'DELETE_REQUESTED' AND logically_deleted_at IS NULL) OR "
+            "(status <> 'DELETE_REQUESTED' AND logically_deleted_at IS NOT NULL)",
+            name="logical_timestamp_matches_status",
+        ),
+        Index(
+            "ix_deletion_operations_status_next_attempt",
+            "status",
+            "next_attempt_at",
+            "id",
+        ),
+        Index("ix_deletion_operations_video_status", "video_id", "status"),
+        Index(
+            "ix_deletion_operations_owner_requested_at",
+            "resource_owner_id",
+            "requested_at",
+        ),
+        Index(
+            "ix_deletion_operations_actor_requested_at",
+            "requested_by_id",
+            "requested_at",
+        ),
+    )
+
+    resource_type: Mapped[str] = mapped_column(String(16))
+    resource_id: Mapped[str] = mapped_column(String(36))
+    video_id: Mapped[str] = mapped_column(String(36))
+    resource_owner_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"))
+    requested_by_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"))
+    # An accepted operation is hidden atomically when this initial state and
+    # logically_deleted_at are committed. DELETE_REQUESTED is reserved for a
+    # pre-acceptance intent and is not emitted by domain services.
+    status: Mapped[str] = mapped_column(String(32), default="LOGICALLY_DELETED")
+    expected_revision: Mapped[int] = mapped_column(Integer)
+    preview_snapshot: Mapped[dict[str, Any]] = mapped_column(JSONType, default=dict)
+    dependency_snapshot: Mapped[dict[str, Any]] = mapped_column(JSONType, default=dict)
+    requested_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utcnow)
+    logically_deleted_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), default=utcnow)
+    cleanup_started_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    cleanup_completed_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    next_attempt_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    retry_count: Mapped[int] = mapped_column(Integer, default=0)
+    # Store only allowlisted error codes and sanitized summaries; never persist
+    # exception reprs, tracebacks, credentials, or object-store URLs here.
+    last_error_code: Mapped[str | None] = mapped_column(String(64))
+    last_error_message: Mapped[str | None] = mapped_column(String(500))
+    last_error_at: Mapped[datetime | None] = mapped_column(UTCDateTime())

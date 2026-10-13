@@ -75,5 +75,6 @@ async def test_deferred_motion_keeps_normal_workflow_validation(session_factory,
                 persist=False,
             )
         # This seed has no aggregate workflow: deferral must preserve scope routing.
-        assert error.value.code == "WORKFLOW_NOT_CONFIGURED"
+        assert error.value.code == "WORKFLOW_NOT_QUALIFIED"
+        assert "aggregate" in error.value.message
         assert await session.scalar(select(func.count()).select_from(SceneGeneration)) == 0

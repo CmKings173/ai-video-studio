@@ -3,6 +3,7 @@
 import { useI18n } from "@/lib/i18n";
 import React, { use, useState, useRef, useMemo, useEffect } from "react";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
@@ -37,6 +38,8 @@ import {
   createGeneration,
   createVariation,
   generateAll,
+  previewGenerateAll,
+  prepareGenerateAll,
   listSceneGenerations,
   getGeneration,
   cancelGeneration,
@@ -61,6 +64,8 @@ import { Progress } from "@/components/ui/progress";
 import { VideoPreview } from "@/components/ui/video-preview";
 import { GenerationEditor } from "@/components/generation/generation-editor";
 import { GenerationHistoryDetails } from "@/components/generation/history-details";
+import { BatchGenerationPreview } from "@/components/generation/batch-generation-preview";
+import { DeletionControl } from "@/components/deletion/deletion-control";
 import { reuseGenerationSettings } from "@/lib/generation/history-settings";
 import { directGenerationRequiresAggregate, historyGenerationRequiresAggregate, eligibleScenes } from "@/lib/generation/eligible-scenes";
 import { selectionState, loadSelectedGeneration, executionGroups, editSceneSpec } from "@/lib/generation/workspace-state";
@@ -70,6 +75,9 @@ import type {
   SceneDTO,
   StoryboardPreviewDTO,
   GenerationRequest,
+  GenerateAllRequest,
+  BatchGenerationPreviewDTO,
+  VideoDetail,
   VariationRequest,
 } from "@/lib/api/types";
 
@@ -83,6 +91,85 @@ const GENERATION_ACTIVE_STATUSES = new Set([
 ]);
 
 const GENERATION_TERMINAL_STATUSES = new Set(["COMPLETED", "FAILED", "CANCELLED"]);
+
+interface PinnedBatchPreview {
+  payload: GenerateAllRequest;
+  key: string;
+  preview: BatchGenerationPreviewDTO;
+  inputSignature: string;
+}
+
+function generateAllInputSignature(video: VideoDetail): string {
+  const prepared = prepareGenerateAll(video);
+  return JSON.stringify({
+    editorInputs: prepared.editorInputs,
+    videoRevision: video.revision,
+    expectedSceneRevisions: prepared.payload.expected_scene_revisions,
+  });
+}
+
+function previewMatchesPayload(
+  preview: BatchGenerationPreviewDTO,
+  videoId: string,
+  payload: GenerateAllRequest,
+): boolean {
+  const sceneIds = payload.scene_ids ?? [];
+  const expectedRevisions = payload.expected_scene_revisions ?? {};
+  if (preview.contract_version !== 1 || !preview.preview_configuration_hash || preview.video_id !== videoId
+    || preview.video_revision !== payload.expected_video_revision
+    || preview.scene_ids.length !== sceneIds.length
+    || preview.scene_ids.some((sceneId, index) => sceneId !== sceneIds[index])
+    || preview.anchor_scene_id !== sceneIds[0]
+    || preview.anchor_scene_revision !== expectedRevisions[preview.anchor_scene_id]) return false;
+
+  if (preview.scenes.length !== sceneIds.length) return false;
+  for (const scene of preview.scenes) {
+    const configuration = scene.resolved_configuration;
+    if (!sceneIds.includes(scene.scene_id)
+      || scene.scene_revision !== expectedRevisions[scene.scene_id]
+      || !scene.workflow_id || !scene.configuration_hash
+      || (configuration.workflow_id && configuration.workflow_id !== scene.workflow_id)
+      || (configuration.execution_scope && configuration.execution_scope !== scene.execution_scope)
+      || (configuration.configuration_hash && configuration.configuration_hash !== scene.configuration_hash)) return false;
+  }
+
+  const sceneById = new Map(preview.scenes.map((scene) => [scene.scene_id, scene]));
+  const groupedIds: string[] = [];
+  for (const group of preview.execution_groups) {
+    if (group.scene_ids.length !== group.generation_configuration_hashes.length) return false;
+    if (group.scene_ids.some((sceneId, index) => {
+      const scene = sceneById.get(sceneId);
+      return !scene || scene.execution_scope !== group.execution_scope
+        || scene.configuration_hash !== group.generation_configuration_hashes[index];
+    })) return false;
+    groupedIds.push(...group.scene_ids);
+  }
+  const expectedSorted = [...sceneIds].sort();
+  const groupedSorted = [...groupedIds].sort();
+  return groupedSorted.length === expectedSorted.length
+    && groupedSorted.every((sceneId, index) => sceneId === expectedSorted[index]);
+}
+
+function stableJson(value: unknown): string {
+  const normalize = (item: unknown): unknown => {
+    if (Array.isArray(item)) return item.map(normalize);
+    if (item && typeof item === "object") {
+      return Object.fromEntries(
+        Object.entries(item).sort(([left], [right]) => left.localeCompare(right))
+          .map(([key, nested]) => [key, normalize(nested)]),
+      );
+    }
+    return item;
+  };
+  return JSON.stringify(normalize(value));
+}
+
+function sameBatchPreviewIdentity(
+  previous: BatchGenerationPreviewDTO,
+  current: BatchGenerationPreviewDTO,
+): boolean {
+  return stableJson(previous) === stableJson(current);
+}
 
 function isActiveGenerationStatus(status: string): boolean {
   return GENERATION_ACTIVE_STATUSES.has(status);
@@ -117,6 +204,7 @@ export default function VideoWorkspacePage({
       ? t("Dữ liệu đã thay đổi. Vui lòng tải lại và thử lại.", "The data has changed. Reload and try again.")
       : getErrorMessage(error, fallback);
   const { videoId } = use(params);
+  const router = useRouter();
   const queryClient = useQueryClient();
 
   // Active Scene & Modals
@@ -127,6 +215,14 @@ export default function VideoWorkspacePage({
   const [isHistoryOpen, setIsHistoryOpen] = useState(false);
   const [isAddSceneOpen, setIsAddSceneOpen] = useState(false);
   const [serverError, setServerError] = useState<string | null>(null);
+  const [isBatchPreviewOpen, setIsBatchPreviewOpen] = useState(false);
+  const [batchPreview, setBatchPreview] = useState<PinnedBatchPreview | null>(null);
+  const [isBatchPreviewLoading, setIsBatchPreviewLoading] = useState(false);
+  const [isBatchPreviewRevalidating, setIsBatchPreviewRevalidating] = useState(false);
+  const [batchPreviewError, setBatchPreviewError] = useState<string | null>(null);
+  const [batchPreviewNotice, setBatchPreviewNotice] = useState<string | null>(null);
+  const [batchPreviewServerStale, setBatchPreviewServerStale] = useState(false);
+  const batchPreviewRequestId = useRef(0);
 
   // Idempotency trackers
   const genAction = useIdempotentAction<{ sceneId: string; payload: GenerationRequest }>();
@@ -314,10 +410,18 @@ export default function VideoWorkspacePage({
 
   const reuseSettingsMutation = useMutation({
     onMutate: () => setServerError(null),
-    mutationFn: (parent: GenerationDTO) => {
+    mutationFn: ({ parent, fixedSeed }: { parent: GenerationDTO; fixedSeed?: number }) => {
       const scene = scenes.find((item) => item.id === parent.scene_id);
       if (!scene) throw new Error(t("Chưa tải được cảnh", "Scene not loaded"));
-      return patchScene(scene.id, { generation_config: reuseGenerationSettings(parent) }, scene.revision);
+      const generationConfig = reuseGenerationSettings(parent);
+      if (fixedSeed !== undefined) {
+        if (!Number.isSafeInteger(fixedSeed) || fixedSeed < 0) {
+          throw new Error(t("Seed phải là số nguyên hợp lệ", "Seed must be a valid integer"));
+        }
+        generationConfig.seed_policy = "FIXED";
+        generationConfig.seed = fixedSeed;
+      }
+      return patchScene(scene.id, { generation_config: generationConfig }, scene.revision);
     },
     onSuccess: () => {
       setServerError(null);
@@ -347,32 +451,176 @@ export default function VideoWorkspacePage({
 
   const generateAllMutation = useMutation({
     onMutate: () => setServerError(null),
-    mutationFn: async () => {
-      if (!video) throw new Error(t("Chưa tải được video", "Video not loaded"));
-      const { payload, key } = await generateAllAction.prepare(video, async () => {
-        const refreshed = await refetchVideo();
-        if (refreshed.error) throw refreshed.error;
-        if (!refreshed.data) throw new Error(t("Chưa tải được video", "Video not loaded"));
-        return refreshed.data;
-      });
+    mutationFn: async ({ payload, key }: { payload: GenerateAllRequest; key: string }) => {
       return generateAll(videoId, payload, key);
     },
     onSuccess: () => {
       setServerError(null);
       generateAllAction.reset();
+      setBatchPreview(null);
+      setBatchPreviewError(null);
+      setBatchPreviewNotice(null);
+      setBatchPreviewServerStale(false);
+      setIsBatchPreviewOpen(false);
       queryClient.invalidateQueries({ queryKey: queryKeys.videos.detail(videoId) });
     },
     onError: (err) => {
       if (
         err instanceof ApiClientError &&
         (err.status === 409 || err.status === 412) &&
-        (err.code === "IDEMPOTENCY_KEY_REUSED" || err.code === "REVISION_CONFLICT")
+        (err.code === "IDEMPOTENCY_KEY_REUSED" || err.code === "REVISION_CONFLICT"
+          || err.code === "PREVIEW_CONFIGURATION_STALE" || err.code === "PROMPT_PREVIEW_STALE"
+          || err.code === "WORKFLOW_CONFIGURATION_STALE" || err.code === "WORKFLOW_NOT_QUALIFIED"
+          || err.code === "NO_SCENES_TO_GENERATE")
       ) {
         generateAllAction.retire();
+        setBatchPreviewServerStale(true);
+        setBatchPreviewError(t(
+          "Bản xem trước không còn khớp với dữ liệu hiện tại. Hãy xem trước lại trước khi tạo.",
+          "This preview no longer matches the current data. Review it again before generating.",
+        ));
       }
       setServerError(uiError(err));
     },
   });
+
+  const requestBatchPreview = async () => {
+    if (!video || eligibleCount === 0) return;
+    const requestId = ++batchPreviewRequestId.current;
+    setIsBatchPreviewOpen(true);
+    setIsBatchPreviewLoading(true);
+    setIsBatchPreviewRevalidating(false);
+    setBatchPreview(null);
+    setBatchPreviewError(null);
+    setBatchPreviewNotice(null);
+    setBatchPreviewServerStale(false);
+    generateAllMutation.reset();
+
+    try {
+      const { payload, key } = await generateAllAction.prepare(video, async () => {
+        const refreshed = await refetchVideo();
+        if (refreshed.error) throw refreshed.error;
+        if (!refreshed.data) throw new Error(t("Chưa tải được video", "Video not loaded"));
+        return refreshed.data;
+      });
+      const preparedVideo = queryClient.getQueryData<VideoDetail>(queryKeys.videos.detail(videoId)) ?? video;
+      const inputSignature = generateAllInputSignature(preparedVideo);
+      const resolvedPreview = await previewGenerateAll(videoId, payload);
+      if (batchPreviewRequestId.current !== requestId) return;
+      if (!previewMatchesPayload(resolvedPreview, videoId, payload)) {
+        throw new Error(t(
+          "Máy chủ trả về bản xem trước không khớp với cảnh hoặc phiên bản đã chọn. Hãy thử lại.",
+          "The server preview did not match the selected scenes or revisions. Please retry.",
+        ));
+      }
+      setBatchPreview({ payload, key, preview: resolvedPreview, inputSignature });
+    } catch (err) {
+      if (batchPreviewRequestId.current === requestId) {
+        const apiError = err instanceof ApiClientError ? err : null;
+        const isStalePreview = Boolean(apiError && [
+          "REVISION_CONFLICT",
+          "PREVIEW_CONFIGURATION_STALE",
+          "PROMPT_PREVIEW_STALE",
+          "WORKFLOW_CONFIGURATION_STALE",
+          "WORKFLOW_NOT_QUALIFIED",
+          "NO_SCENES_TO_GENERATE",
+        ].includes(apiError.code));
+        if (apiError && (apiError.status === 409 || apiError.status === 412)) {
+          generateAllAction.retire();
+        }
+        if (isStalePreview) setBatchPreviewServerStale(true);
+        const message = isStalePreview
+          ? t("Video hoặc cấu hình đã thay đổi. Hãy tải bản xem trước mới.", "The video or configuration changed. Refresh the preview.")
+          : uiError(err, t("Không thể tải cấu hình xem trước", "Could not load the generation preview"));
+        setBatchPreviewError(message);
+      }
+    } finally {
+      if (batchPreviewRequestId.current === requestId) setIsBatchPreviewLoading(false);
+    }
+  };
+
+  const closeBatchPreview = () => {
+    batchPreviewRequestId.current += 1;
+    setIsBatchPreviewLoading(false);
+    setIsBatchPreviewRevalidating(false);
+    setBatchPreviewNotice(null);
+    setIsBatchPreviewOpen(false);
+  };
+
+  const liveBatchInputSignature = useMemo(
+    () => video ? generateAllInputSignature(video) : null,
+    [video],
+  );
+  const batchPreviewIsStale = batchPreviewServerStale || Boolean(batchPreview && (
+    !liveBatchInputSignature
+    || batchPreview.inputSignature !== liveBatchInputSignature
+    || batchPreview.preview.video_id !== videoId
+  ));
+  const batchDialogError = batchPreviewError
+    ?? (generateAllMutation.isError ? uiError(generateAllMutation.error) : null);
+
+  const confirmGenerateAll = async () => {
+    const pinned = batchPreview;
+    if (!pinned || batchPreviewIsStale || isBatchPreviewRevalidating
+      || !pinned.preview.scenes.length
+      || !pinned.preview.scenes.every((scene) => scene.resolved_configuration.runnable)) return;
+
+    const requestId = ++batchPreviewRequestId.current;
+    setIsBatchPreviewRevalidating(true);
+    setBatchPreviewError(null);
+    setBatchPreviewNotice(null);
+    generateAllMutation.reset();
+    try {
+      const latestPreview = await previewGenerateAll(videoId, pinned.payload);
+      if (batchPreviewRequestId.current !== requestId) return;
+      if (!previewMatchesPayload(latestPreview, videoId, pinned.payload)) {
+        throw new Error(t(
+          "Máy chủ trả về bản xem trước không khớp với cảnh hoặc phiên bản đã chọn. Hãy tải lại bản xem trước.",
+          "The refreshed server preview did not match the pinned scenes or revisions. Refresh the preview.",
+        ));
+      }
+
+      if (!sameBatchPreviewIdentity(pinned.preview, latestPreview)) {
+        setBatchPreview({ ...pinned, preview: latestPreview });
+        setBatchPreviewServerStale(false);
+        setBatchPreviewNotice(t(
+          "Cấu hình hoặc trạng thái qualification đã thay đổi. Bản xem trước mới đã được tải; hãy kiểm tra và xác nhận lại.",
+          "The resolved configuration or qualification status changed. A fresh preview is shown; review it and confirm again.",
+        ));
+        return;
+      }
+
+      const payload: GenerateAllRequest = {
+        ...pinned.payload,
+        settings: {
+          ...(pinned.payload.settings ?? {}),
+          preview_configuration_hash: latestPreview.preview_configuration_hash,
+        },
+      };
+      generateAllMutation.mutate({ payload, key: pinned.key });
+    } catch (err) {
+      if (batchPreviewRequestId.current === requestId) {
+        const apiError = err instanceof ApiClientError ? err : null;
+        const isStalePreview = Boolean(apiError && [
+          "REVISION_CONFLICT",
+          "PREVIEW_CONFIGURATION_STALE",
+          "PROMPT_PREVIEW_STALE",
+          "WORKFLOW_CONFIGURATION_STALE",
+          "WORKFLOW_NOT_QUALIFIED",
+          "NO_SCENES_TO_GENERATE",
+        ].includes(apiError.code));
+        if (apiError && (apiError.status === 409 || apiError.status === 412)) {
+          generateAllAction.retire();
+        }
+        if (isStalePreview) setBatchPreviewServerStale(true);
+        setBatchPreviewError(isStalePreview
+          ? t("Dữ liệu hoặc qualification đã thay đổi. Hãy tải bản xem trước mới.", "The data or qualification changed. Refresh the preview.")
+          : uiError(err, t("Không thể kiểm tra lại cấu hình. Chưa có tác vụ nào được gửi.", "Could not revalidate the configuration. Nothing was dispatched.")));
+      }
+    } finally {
+      if (batchPreviewRequestId.current === requestId) setIsBatchPreviewRevalidating(false);
+    }
+  };
 
   // Reorder handlers
   const handleMove = (index: number, direction: "up" | "down") => {
@@ -440,12 +688,15 @@ export default function VideoWorkspacePage({
               <Button
                 variant={eligibleCount > 0 ? "primary" : "secondary"}
                 size="sm"
-                onClick={() => generateAllMutation.mutate()}
+                onClick={() => {
+                  if (batchPreview && !batchPreviewIsStale) setIsBatchPreviewOpen(true);
+                  else void requestBatchPreview();
+                }}
                 disabled={eligibleCount === 0}
-                isLoading={generateAllMutation.isPending}
+                isLoading={isBatchPreviewLoading || generateAllMutation.isPending}
               >
                 <Sparkles className="w-4 h-4 text-blue-400" />
-                <span>{eligibleCount > 0 ? t(`Tạo ${eligibleCount} cảnh`, `Generate ${eligibleCount} scenes`) : t("Tất cả cảnh đã cập nhật.", "All scenes are up to date.")}</span>
+                <span>{eligibleCount > 0 ? t(`Xem cấu hình ${eligibleCount} cảnh`, `Review ${eligibleCount} scenes`) : t("Tất cả cảnh đã cập nhật.", "All scenes are up to date.")}</span>
               </Button>
             )}
 
@@ -456,9 +707,34 @@ export default function VideoWorkspacePage({
               <Film className="w-4 h-4" />
               <span>{t("Ghép & xuất video", "Assemble & export video")}</span>
             </Link>
+            <DeletionControl
+              resource={{ type: "video", id: video.id, name: video.title }}
+              invalidationKeys={[queryKeys.videos.all, queryKeys.videos.detail(videoId), queryKeys.videos.scenes(videoId), queryKeys.videos.finalVersions(videoId), queryKeys.dashboard.summary]}
+              onComplete={() => router.push("/videos")}
+            />
           </div>
         </PageHeader>
       </div>
+
+      <BatchGenerationPreview
+        isOpen={isBatchPreviewOpen}
+        onClose={closeBatchPreview}
+        preview={batchPreview?.preview ?? null}
+        sceneLabels={Object.fromEntries(scenes.map((scene) => [
+          scene.id,
+          scene.spec?.title
+            ? `${t("Cảnh", "Scene")} ${scene.scene_order + 1}: ${scene.spec.title}`
+            : `${t("Cảnh", "Scene")} ${scene.scene_order + 1}`,
+        ]))}
+        isLoading={isBatchPreviewLoading}
+        isRevalidating={isBatchPreviewRevalidating}
+        isConfirming={generateAllMutation.isPending}
+        error={batchDialogError}
+        notice={batchPreviewNotice}
+        isStale={batchPreviewIsStale}
+        onPreviewAgain={() => void requestBatchPreview()}
+        onConfirm={confirmGenerateAll}
+      />
 
       <BatchSummary video={video} />
 
@@ -709,6 +985,10 @@ export default function VideoWorkspacePage({
                         >
                           {scene.enabled ? t("Tắt", "Disable") : t("Bật", "Enable")}
                         </button>
+                        <DeletionControl
+                          resource={{ type: "scene", id: scene.id, name: scene.spec?.title || t(`Cảnh ${idx + 1}`, `Scene ${idx + 1}`) }}
+                          invalidationKeys={[queryKeys.videos.detail(videoId), queryKeys.videos.scenes(videoId), queryKeys.scenes.detail(scene.id), queryKeys.scenes.generations(scene.id)]}
+                        />
                       </div>
                     </div>
                   </div>
@@ -875,6 +1155,15 @@ export default function VideoWorkspacePage({
                       </div>
 
                       <div className="flex min-w-0 flex-wrap items-center gap-2 shrink-0">
+                        <DeletionControl
+                          resource={{ type: "generation", id: gen.id, name: t(`Biến thể #${gen.generation_no}`, `Variant #${gen.generation_no}`) }}
+                          invalidationKeys={[
+                            queryKeys.videos.detail(videoId),
+                            queryKeys.scenes.generations(gen.scene_id),
+                            queryKeys.generations.detail(gen.id),
+                            ...(gen.output_asset_id ? [queryKeys.assets.detail(gen.output_asset_id), queryKeys.assets.download(gen.output_asset_id)] : []),
+                          ]}
+                        />
                         {isRunning && (
                           <Button
                             size="sm"
@@ -913,7 +1202,8 @@ export default function VideoWorkspacePage({
                       scene={scenes.find((scene) => scene.id === gen.scene_id)} scenes={scenes}
                       onRegenerate={() => regenerateMutation.mutate(gen)}
                       onVariation={() => variationMutation.mutate(gen)}
-                      onReuse={() => reuseSettingsMutation.mutate(gen)}
+                      onReuse={() => reuseSettingsMutation.mutate({ parent: gen })}
+                      onReuseSeed={(seed) => reuseSettingsMutation.mutate({ parent: gen, fixedSeed: seed })}
                       busy={regenerateMutation.isPending || reuseSettingsMutation.isPending || variationMutation.isPending} />
 
                     {/* Media Preview for Completed Variant */}

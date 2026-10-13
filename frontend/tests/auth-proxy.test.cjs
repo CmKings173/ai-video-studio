@@ -455,6 +455,7 @@ async function withSlowClientProxy(run, options = {}) {
   const previousClearTimeout = global.clearTimeout;
   const timers = new Set();
   const delays = [];
+  const manualDeadlines = new Map();
   const sources = [];
   const pending = [];
   for (const [key, value] of Object.entries(environment)) {
@@ -464,6 +465,12 @@ async function withSlowClientProxy(run, options = {}) {
   const handlers = loadTypeScript("app/api/[...path]/route.ts");
   global.setTimeout = (callback, delay, ...args) => {
     delays.push(delay);
+    if (options.manualBodyDeadline && delay === Number(timeout)) {
+      const timer = {};
+      manualDeadlines.set(timer, () => callback(...args));
+      timers.add(timer);
+      return timer;
+    }
     let timer;
     timer = previousSetTimeout(() => {
       timers.delete(timer);
@@ -474,11 +481,19 @@ async function withSlowClientProxy(run, options = {}) {
   };
   global.clearTimeout = (timer) => {
     timers.delete(timer);
+    if (manualDeadlines.delete(timer)) return;
     return previousClearTimeout(timer);
   };
   const harness = {
     timers,
     delays,
+    expireBodyDeadline() {
+      assert.equal(manualDeadlines.size, 1, "one absolute body deadline remains armed");
+      const [timer, callback] = manualDeadlines.entries().next().value;
+      manualDeadlines.delete(timer);
+      timers.delete(timer);
+      callback();
+    },
     openBody(cancel = () => {}) {
       let controller;
       const body = new ReadableStream({
@@ -511,7 +526,9 @@ async function withSlowClientProxy(run, options = {}) {
   } finally {
     for (const source of sources) source.close();
     await withinBodyDeadline(Promise.allSettled(pending)).catch(() => {});
-    for (const timer of timers) previousClearTimeout(timer);
+    for (const timer of timers) {
+      if (!manualDeadlines.has(timer)) previousClearTimeout(timer);
+    }
     global.setTimeout = previousSetTimeout;
     global.clearTimeout = previousClearTimeout;
     global.fetch = previousFetch;
@@ -555,20 +572,25 @@ test("slow-client total deadline expires despite continuous small chunks", async
     const source = h.openBody(() => { sourceCancelled = true; });
     const request = proxyRequest("POST", source.body);
     const listeners = observeAbortListeners(request.signal);
-    const trickle = setInterval(() => {
-      try { source.enqueue(); chunks += 1; } catch { /* Deadline cancelled the source. */ }
-    }, 5);
-    try {
-      await assertProxyFailure(await withinBodyDeadline(h.call(request)), 408, "REQUEST_BODY_TIMEOUT");
-      assert.ok(chunks >= 2, "several chunks arrived without an idle gap");
-      assert.equal(sourceCancelled, true);
-      assert.equal(source.body.locked, false);
-      assert.equal(upstreamSignal.aborted, true);
-      assert.equal(listeners.size, 0);
-    } finally {
-      clearInterval(trickle);
+    const pending = h.call(request);
+    // Advance input independently of wall-clock scheduling under full-suite load.
+    // The real deadline callback is fired only after several drain turns, and
+    // the timer-count assertion detects a deadline incorrectly reset by chunks.
+    for (let index = 0; index < 3; index += 1) {
+      await new Promise((resolve) => setImmediate(resolve));
+      source.enqueue();
+      chunks += 1;
     }
-  }, { fetch: async (_url, options) => { upstreamSignal = options.signal; return new Response("early"); } });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(h.delays.filter((delay) => delay === 40).length, 1);
+    h.expireBodyDeadline();
+    await assertProxyFailure(await withinBodyDeadline(pending), 408, "REQUEST_BODY_TIMEOUT");
+    assert.ok(chunks >= 2, "several chunks arrived without an idle gap");
+    assert.equal(sourceCancelled, true);
+    assert.equal(source.body.locked, false);
+    assert.equal(upstreamSignal.aborted, true);
+    assert.equal(listeners.size, 0);
+  }, { manualBodyDeadline: true, fetch: async (_url, options) => { upstreamSignal = options.signal; return new Response("early"); } });
 });
 
 for (const when of ["already aborted", "during drain"]) {

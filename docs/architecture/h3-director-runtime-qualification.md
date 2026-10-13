@@ -15,6 +15,10 @@ Record for every run:
 - dependency fingerprint, including FaceRefine detector when used;
 - exact DirectorExecutionSpec hash.
 
+Store the expected `execution_spec_hash` as a top-level profile pin and require it to
+match `execution_evidence.execution_spec_hash`. A well-formed evidence hash alone does
+not qualify a run when it is not bound to the declared target.
+
 ## Core matrix
 
 | Case | Required variants | Status before execution |

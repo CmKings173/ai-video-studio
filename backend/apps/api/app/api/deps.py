@@ -1,51 +1,88 @@
 import hmac
-from dataclasses import dataclass
 
 from fastapi import Depends, Header, Request
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from apps.api.app.core.config import Settings, get_settings
 from apps.api.app.core.errors import AppError
-from apps.api.app.core.security import hash_token
-from apps.api.app.db.models import Session as AuthSession
-from apps.api.app.db.models import User, utcnow
+from apps.api.app.core.security import (
+    AccessTokenConfigurationError,
+    AccessTokenError,
+    AccessTokenExpiredError,
+    AccessTokenPrincipal,
+    verify_access_token,
+)
+from apps.api.app.db.models import User
 from apps.api.app.db.session import get_session
 
+AuthPrincipal = AccessTokenPrincipal
 
-@dataclass(frozen=True)
-class AuthContext:
-    user: User
-    session: AuthSession
+
+async def validate_current_principal(
+    session: AsyncSession, principal: AuthPrincipal
+) -> AuthPrincipal:
+    """Read authoritative account state, bypassing an ORM identity-map snapshot."""
+    account = (
+        await session.execute(
+            select(User.role, User.is_active, User.auth_version).where(User.id == principal.id)
+        )
+    ).one_or_none()
+    if (
+        account is None
+        or not account.is_active
+        or account.role != principal.role
+        or account.auth_version != principal.auth_version
+    ):
+        raise AppError("AUTH_REQUIRED", "Authentication has been revoked; sign in again", 401)
+    return principal
+
+
+def principal_from_token(token: str, settings: Settings) -> AuthPrincipal:
+    try:
+        return verify_access_token(token, settings)
+    except AccessTokenConfigurationError as exc:
+        raise AppError("AUTH_UNAVAILABLE", "Authentication is not configured", 503) from exc
+    except AccessTokenExpiredError as exc:
+        raise AppError("SESSION_EXPIRED", "Access token expired", 401) from exc
+    except AccessTokenError as exc:
+        raise AppError("AUTH_REQUIRED", "Authentication required", 401) from exc
 
 
 async def auth_context(
     request: Request,
-    session: AsyncSession = Depends(get_session),
     settings: Settings = Depends(get_settings),
-) -> AuthContext:
-    token = request.cookies.get(settings.session_cookie_name)
+    session: AsyncSession = Depends(get_session),
+) -> AuthPrincipal:
+    token = request.cookies.get(settings.auth_cookie_name)
     if not token:
         raise AppError("AUTH_REQUIRED", "Authentication required", 401)
-    auth_session = await session.get(AuthSession, hash_token(token))
-    if auth_session is None or auth_session.expires_at <= utcnow():
-        raise AppError("SESSION_EXPIRED", "Session expired", 401)
-    user = await session.get(User, auth_session.user_id)
-    if user is None or not user.is_active:
-        raise AppError("ACCOUNT_DISABLED", "Account is disabled", 403)
-    return AuthContext(user, auth_session)
+    principal = principal_from_token(token, settings)
+    try:
+        return await validate_current_principal(session, principal)
+    finally:
+        # Authorization runs before endpoint writes. Release its read transaction
+        # so streaming responses never retain a connection solely for authentication.
+        await session.rollback()
 
 
-async def current_user(context: AuthContext = Depends(auth_context)) -> User:
-    return context.user
+async def current_user(
+    context: AuthPrincipal = Depends(auth_context),
+) -> AccessTokenPrincipal:
+    return context
 
 
-async def require_editor(user: User = Depends(current_user)) -> User:
+async def require_editor(
+    user: AccessTokenPrincipal = Depends(current_user),
+) -> AccessTokenPrincipal:
     if user.role not in {"ADMIN", "EDITOR"}:
         raise AppError("FORBIDDEN", "Editor access required", 403)
     return user
 
 
-async def require_admin(user: User = Depends(current_user)) -> User:
+async def require_admin(
+    user: AccessTokenPrincipal = Depends(current_user),
+) -> AccessTokenPrincipal:
     if user.role != "ADMIN":
         raise AppError("FORBIDDEN", "Administrator access required", 403)
     return user
@@ -53,16 +90,30 @@ async def require_admin(user: User = Depends(current_user)) -> User:
 
 async def require_csrf(
     request: Request,
-    context: AuthContext = Depends(auth_context),
+    context: AccessTokenPrincipal = Depends(auth_context),
     settings: Settings = Depends(get_settings),
-) -> User:
+) -> AccessTokenPrincipal:
+    return validate_csrf_token(request, context, settings)
+
+
+def validate_csrf_token(
+    request: Request,
+    context: AccessTokenPrincipal,
+    settings: Settings,
+) -> AccessTokenPrincipal:
     supplied = request.headers.get(settings.csrf_header_name)
-    if not supplied or not hmac.compare_digest(hash_token(supplied), context.session.csrf_hash):
+    if (
+        not supplied
+        or not supplied.isascii()
+        or not hmac.compare_digest(supplied, context.csrf_token)
+    ):
         raise AppError("CSRF_INVALID", "Valid CSRF token required", 403)
-    return context.user
+    return context
 
 
-async def require_admin_csrf(user: User = Depends(require_csrf)) -> User:
+async def require_admin_csrf(
+    user: AuthPrincipal = Depends(require_csrf),
+) -> AuthPrincipal:
     """Require both a valid CSRF token and administrator role."""
     if user.role != "ADMIN":
         raise AppError("FORBIDDEN", "Administrator access required", 403)

@@ -17,6 +17,7 @@ dependencies = [
   "pillow>=11.2,<13",
   "psycopg[binary]>=3.2,<4",
   "pydantic-settings>=2.10,<3",
+  "pyjwt>=2.15,<3",
   "python-multipart>=0.0.20,<1",
   "sqlalchemy[asyncio]>=2.0.41,<3",
   "uvicorn[standard]>=0.35,<1",

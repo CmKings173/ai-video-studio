@@ -17,6 +17,13 @@ function loadTypeScript(entry, mocks = {}) {
       if (Object.hasOwn(mocks, name)) return mocks[name];
       // Handler tests isolate locale; real switching is covered separately.
       if (name === "@/lib/i18n") return { useI18n: () => ({ locale: "vi", t: (vi) => vi, setLocale: () => {} }), translateText: vi => vi, getLocaleSnapshot: () => "vi" };
+      // Page tests call the exported component directly instead of mounting a
+      // Next router provider, so supply its navigation boundary by default.
+      if (name === "next/navigation") return {
+        useRouter: () => ({ push() {}, replace() {}, refresh() {}, back() {}, forward() {}, prefetch: async () => {} }),
+        usePathname: () => "/",
+        useSearchParams: () => new URLSearchParams(),
+      };
       if (name === "lucide-react" || name.startsWith("@/components/")) {
         return new Proxy({}, { get: () => () => null });
       }

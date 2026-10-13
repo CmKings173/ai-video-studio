@@ -8,16 +8,19 @@ from pathlib import Path
 
 from sqlalchemy import or_, select
 
-from apps.api.app.db.models import Asset, FinalVideo, Video, utcnow
+from apps.api.app.db.models import Asset, FinalVideo, Scene, SceneGeneration, Video, utcnow
 from apps.api.app.services.assembly_service import manifest_hash
+from apps.api.app.services.deletion_state import is_logically_deleted
 from apps.api.app.services.generation_freshness import (
     is_assembly_source_current,
+    lock_generation_dependencies,
     restore_video_after_assembly,
 )
 from workers.common import (
     check_checksum,
     lease_deadline,
     lock_scheduler,
+    mark_unpublished_output_for_retention,
     require_staging_space,
     save_output_file,
     service_loop,
@@ -37,6 +40,120 @@ class Assembler:
         self.settings = settings
         self.owner = worker_id("assembler")
 
+    async def _lock_final_context(self, session, final_id: str):
+        """Lock Video, dependencies, source rows, then FinalVideo for lifecycle checks."""
+        reference = (
+            await session.execute(
+                select(FinalVideo.video_id, FinalVideo.manifest).where(
+                    FinalVideo.id == final_id
+                )
+            )
+        ).one_or_none()
+        if reference is None:
+            return None, None, True
+        video_id, manifest = reference
+        video = await session.scalar(
+            select(Video)
+            .where(Video.id == video_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if video is None:
+            return None, None, True
+        await lock_generation_dependencies(session, video)
+
+        scenes_manifest = manifest.get("scenes") if isinstance(manifest, dict) else None
+        valid_manifest = isinstance(scenes_manifest, list) and bool(scenes_manifest)
+        scene_ids = []
+        generation_ids = []
+        if valid_manifest:
+            for entry in scenes_manifest:
+                if (
+                    not isinstance(entry, dict)
+                    or not isinstance(entry.get("scene_id"), str)
+                    or not isinstance(entry.get("generation_id"), str)
+                ):
+                    valid_manifest = False
+                    break
+                scene_ids.append(entry["scene_id"])
+                generation_ids.append(entry["generation_id"])
+        scene_ids = sorted(set(scene_ids))
+        generation_ids = sorted(set(generation_ids))
+        scenes = list(
+            (
+                await session.scalars(
+                    select(Scene)
+                    .where(Scene.id.in_(scene_ids), Scene.video_id == video.id)
+                    .order_by(Scene.id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).all()
+        ) if scene_ids else []
+        generations = list(
+            (
+                await session.scalars(
+                    select(SceneGeneration)
+                    .where(
+                        SceneGeneration.id.in_(generation_ids),
+                        SceneGeneration.video_id == video.id,
+                    )
+                    .order_by(SceneGeneration.id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).all()
+        ) if generation_ids else []
+        scene_by_id = {scene.id: scene for scene in scenes}
+        generation_by_id = {generation.id: generation for generation in generations}
+        final = await session.scalar(
+            select(FinalVideo)
+            .where(FinalVideo.id == final_id, FinalVideo.video_id == video.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        hidden = (
+            final is None
+            or not valid_manifest
+            or final.manifest != manifest
+            or len(scene_by_id) != len(scene_ids)
+            or len(generation_by_id) != len(generation_ids)
+            or await is_logically_deleted(session, "VIDEO", video.id)
+        )
+        if final is not None and valid_manifest:
+            for entry in scenes_manifest:
+                generation = generation_by_id.get(entry["generation_id"])
+                if (
+                    entry["scene_id"] not in scene_by_id
+                    or generation is None
+                    or generation.scene_id != entry["scene_id"]
+                ):
+                    hidden = True
+                    break
+                if await is_logically_deleted(
+                    session, "SCENE", entry["scene_id"], video.id
+                ) or await is_logically_deleted(
+                    session, "GENERATION", entry["generation_id"], video.id
+                ):
+                    hidden = True
+                    break
+        if final is not None and not hidden:
+            hidden = await is_logically_deleted(
+                session, "FINAL_VIDEO", final.id, video.id
+            )
+        return video, final, hidden
+
+    async def _final_allows_output(self, final_id: str) -> bool:
+        async with self.factory() as session, session.begin():
+            _, final, hidden = await self._lock_final_context(session, final_id)
+            return bool(
+                not hidden
+                and final is not None
+                and final.claimed_by == self.owner
+                and final.status not in FINAL_TERMINAL
+                and final.status != "CANCEL_REQUESTED"
+            )
+
     async def claim(self) -> str | None:
         """Claim a single queued final assembly.
 
@@ -49,25 +166,36 @@ class Assembler:
         async with self.factory() as session, session.begin():
             await lock_scheduler(session, 971032)
             now = utcnow()
-            final = await session.scalar(
-                select(FinalVideo)
-                .where(
-                    or_(
-                        FinalVideo.status == "QUEUED",
-                        (
-                            FinalVideo.status.in_({"ASSEMBLING", "CANCEL_REQUESTED"})
-                            & or_(
-                                FinalVideo.lease_expires_at.is_(None),
-                                FinalVideo.lease_expires_at <= now,
-                            )
-                        ),
+            candidate = (
+                await session.execute(
+                    select(FinalVideo.id, FinalVideo.status, FinalVideo.lease_expires_at)
+                    .where(
+                        or_(
+                            FinalVideo.status == "QUEUED",
+                            (
+                                FinalVideo.status.in_({"ASSEMBLING", "CANCEL_REQUESTED"})
+                                & or_(
+                                    FinalVideo.lease_expires_at.is_(None),
+                                    FinalVideo.lease_expires_at <= now,
+                                )
+                            ),
+                        )
                     )
+                    .order_by(FinalVideo.created_at, FinalVideo.id)
+                    .limit(1)
                 )
-                .order_by(FinalVideo.created_at, FinalVideo.id)
-                .with_for_update(skip_locked=True)
-                .limit(1)
-            )
-            if final is None:
+            ).first()
+            if candidate is None:
+                return None
+            video, final, hidden = await self._lock_final_context(session, candidate.id)
+            if video is None or final is None or hidden:
+                return None
+            expiry = final.lease_expires_at
+            if expiry is not None and expiry.tzinfo is None:
+                expiry = expiry.replace(tzinfo=now.tzinfo)
+            if final.status not in {"QUEUED", "ASSEMBLING", "CANCEL_REQUESTED"} or (
+                final.status != "QUEUED" and expiry is not None and expiry > now
+            ):
                 return None
             final.claimed_by = self.owner
             final.lease_expires_at = lease_deadline(self.settings)
@@ -88,8 +216,13 @@ class Assembler:
 
     async def _phase(self, final_id: str, phase: str, current: int) -> bool:
         async with self.factory() as session, session.begin():
-            final = await session.get(FinalVideo, final_id, with_for_update=True)
-            if final is None or final.claimed_by != self.owner or final.status in FINAL_TERMINAL:
+            _, final, hidden = await self._lock_final_context(session, final_id)
+            if (
+                final is None
+                or hidden
+                or final.claimed_by != self.owner
+                or final.status in FINAL_TERMINAL
+            ):
                 return False
             if final.status == "CANCEL_REQUESTED":
                 return False
@@ -104,9 +237,10 @@ class Assembler:
         while True:
             await asyncio.sleep(max(1, self.settings.lease_seconds / 3))
             async with self.factory() as session, session.begin():
-                final = await session.get(FinalVideo, final_id, with_for_update=True)
+                _, final, hidden = await self._lock_final_context(session, final_id)
                 if (
                     final is None
+                    or hidden
                     or final.claimed_by != self.owner
                     or final.status in FINAL_TERMINAL
                 ):
@@ -123,35 +257,35 @@ class Assembler:
         message: str | None = None,
     ) -> None:
         async with self.factory() as session, session.begin():
-            video_id = await session.scalar(
-                select(FinalVideo.video_id).where(FinalVideo.id == final_id)
-            )
-            if video_id is None:
-                return
-            video = await session.scalar(
-                select(Video)
-                .where(Video.id == video_id)
-                .with_for_update()
-                .execution_options(populate_existing=True)
-            )
-            final = await session.scalar(
-                select(FinalVideo)
-                .where(FinalVideo.id == final_id)
-                .with_for_update()
-                .execution_options(populate_existing=True)
-            )
+            video, final, hidden = await self._lock_final_context(session, final_id)
             if (
                 final is None
                 or video is None
                 or final.claimed_by != self.owner
                 or final.status in FINAL_TERMINAL
             ):
+                if asset_id is not None:
+                    await mark_unpublished_output_for_retention(session, asset_id)
                 return
-            if final.status == "CANCEL_REQUESTED":
-                status, asset_id = "CANCELLED", None
+            video_deleted = await is_logically_deleted(session, "VIDEO", video.id)
+            if hidden and status in {"READY", "CANCELLED"}:
+                status = "CANCELLED"
+                code = "RESOURCE_DELETED"
+                message = "Assembly output was discarded because its source was deleted"
+                # Keep the hidden output reference so cleanup can discover the
+                # Asset persisted before this final tombstone check.
+            if final.status == "CANCEL_REQUESTED" and not hidden:
+                status = "CANCELLED"
+                if asset_id is not None:
+                    await mark_unpublished_output_for_retention(session, asset_id)
+                    asset_id = None
             if status == "READY" and asset_id:
                 output_asset = await session.get(Asset, asset_id, with_for_update=True)
-                if output_asset is None or output_asset.status != "READY":
+                if (
+                    output_asset is None
+                    or output_asset.status != "READY"
+                    or output_asset.project_id != video.project_id
+                ):
                     status = "FAILED"
                     code = "OUTPUT_ASSET_NOT_READY"
                     message = "Assembled output was deleted or not committed"
@@ -175,7 +309,7 @@ class Assembler:
                     video.status = "READY"
                 else:
                     video.status = "DIRTY"
-            else:
+            elif not hidden and not video_deleted:
                 await restore_video_after_assembly(
                     session,
                     video,
@@ -189,23 +323,7 @@ class Assembler:
 
     async def _retry_or_finish(self, final_id: str, code: str, message: str) -> None:
         async with self.factory() as session, session.begin():
-            video_id = await session.scalar(
-                select(FinalVideo.video_id).where(FinalVideo.id == final_id)
-            )
-            if video_id is None:
-                return
-            video = await session.scalar(
-                select(Video)
-                .where(Video.id == video_id)
-                .with_for_update()
-                .execution_options(populate_existing=True)
-            )
-            final = await session.scalar(
-                select(FinalVideo)
-                .where(FinalVideo.id == final_id)
-                .with_for_update()
-                .execution_options(populate_existing=True)
-            )
+            video, final, hidden = await self._lock_final_context(session, final_id)
             if (
                 final is None
                 or video is None
@@ -214,7 +332,7 @@ class Assembler:
             ):
                 return
             now = utcnow()
-            if final.status == "CANCEL_REQUESTED":
+            if hidden or final.status == "CANCEL_REQUESTED":
                 final.status = "CANCELLED"
                 final.phase = "CANCELLED"
                 final.finished_at = now
@@ -231,7 +349,10 @@ class Assembler:
             final.claimed_by = None
             final.lease_expires_at = None
             final.revision += 1
-            if final.status == "FAILED":
+            if hidden:
+                final.error_code = "RESOURCE_DELETED"
+                final.error_message = "Assembly was stopped because its source was deleted"
+            elif final.status == "FAILED":
                 await restore_video_after_assembly(session, video, final.manifest, "FAILED")
             elif final.status == "CANCELLED":
                 await restore_video_after_assembly(session, video, final.manifest, "SCENES_READY")
@@ -354,6 +475,9 @@ class Assembler:
             if not await self._phase(final_id, "COMBINING", len(inputs) + 1):
                 await self._finish(final_id, "CANCELLED")
                 return
+            if not await self._final_allows_output(final_id):
+                await self._finish(final_id, "CANCELLED")
+                return
             await require_staging_space(directory, output_limit, reserve_bytes)
             output = directory / "final.mp4"
             metadata = await self.ffmpeg.assemble(inputs, output, config)
@@ -362,6 +486,9 @@ class Assembler:
                 return
             if (await asyncio.to_thread(output.stat)).st_size > output_limit:
                 raise ValueError("OUTPUT_TOO_LARGE")
+            if not await self._final_allows_output(final_id):
+                await self._finish(final_id, "CANCELLED")
+                return
             async with self.factory() as session:
                 video = await session.get(Video, final.video_id)
             asset_id = await save_output_file(
@@ -370,6 +497,7 @@ class Assembler:
                 owner_id=final.id,
                 role="FINAL_VIDEO",
                 project_id=video.project_id,
+                video_id=video.id,
                 created_by=final.created_by,
                 path=output,
                 metadata=metadata,
@@ -391,10 +519,15 @@ class Assembler:
             raise
         except (KeyError, ValueError) as exc:
             logger.exception("assembly_input_invalid", extra={"final_video_id": final_id})
+            code = (
+                "IMMUTABLE_OUTPUT_CONFLICT"
+                if isinstance(exc, ValueError) and str(exc) == "IMMUTABLE_OUTPUT_CONFLICT"
+                else "ASSEMBLY_INPUT_INVALID"
+            )
             await self._finish(
                 final_id,
                 "FAILED",
-                code="ASSEMBLY_INPUT_INVALID",
+                code=code,
                 message=str(exc),
             )
         except Exception as exc:

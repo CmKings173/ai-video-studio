@@ -208,6 +208,7 @@ async def _seed(factory, *, assembly):
         output = Asset(
             project_id=project.id,
             kind="VIDEO",
+            role="GENERATED_VIDEO",
             filename="output.mp4",
             content_type="video/mp4",
             object_key=f"dependency-race/{suffix}/output.mp4",
@@ -256,6 +257,7 @@ async def _seed(factory, *, assembly):
             completion_output = Asset(
                 project_id=project.id,
                 kind="VIDEO",
+                role="FINAL_VIDEO",
                 filename="final.mp4",
                 content_type="video/mp4",
                 object_key=f"dependency-race/{suffix}/final.mp4",

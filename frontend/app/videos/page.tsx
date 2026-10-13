@@ -16,6 +16,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { PaginationControls } from "@/components/list-pagination";
+import { DeletionControl } from "@/components/deletion/deletion-control";
 
 export default function VideosPage() {
   const { t } = useI18n();
@@ -263,6 +264,10 @@ export default function VideosPage() {
                     className="primary-action text-xs px-3 py-1.5"
                   >
                     {t("Ghép & xuất video", "Assemble & export video")}</Link>
+                  <DeletionControl
+                    resource={{ type: "video", id: video.id, name: video.title }}
+                    invalidationKeys={[queryKeys.videos.all, queryKeys.dashboard.summary]}
+                  />
                 </div>
               </div>
             );

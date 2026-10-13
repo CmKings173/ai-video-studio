@@ -6,20 +6,24 @@ from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
-from sqlalchemy import exists, or_, select
+from sqlalchemy import and_, exists, not_, or_, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from apps.api.app.api.ownership import owner_scope
 from apps.api.app.core.config import Settings
 from apps.api.app.core.errors import AppError
 from apps.api.app.db.models import (
     Asset,
+    DirectorRun,
+    DirectorRunMember,
     FinalVideo,
     FinalVideoScene,
     GenerationAsset,
     Product,
     Project,
     SceneGeneration,
+    Video,
     utcnow,
 )
 from apps.api.app.integrations.media import (
@@ -46,6 +50,7 @@ from apps.api.app.services.asset_claims import (
     release_claim,
     requeue_deletion_retry,
 )
+from apps.api.app.services.deletion_state import not_logically_deleted_predicate
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +98,7 @@ async def enqueue_asset_validation(
     payload: AssetComplete,
     *,
     user_id: str,
+    is_admin: bool = False,
 ) -> Asset:
     """Bind validation intent under a lock in the caller's request transaction.
 
@@ -100,11 +106,17 @@ async def enqueue_asset_validation(
     entry atomically; rollback publishes nothing. Null is also a bound checksum
     intent, so a duplicate cannot silently strengthen or weaken it.
     """
-    row = await session.get(Asset, asset.id, with_for_update=True, populate_existing=True)
+    row = await session.scalar(
+        select(Asset)
+        .where(
+            Asset.id == asset.id,
+            owner_scope(Asset, user_id, allow_all=is_admin),
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
     if row is None or row.deleted_at is not None:
         raise AppError("ASSET_NOT_FOUND", "Asset not found", 404)
-    if row.created_by != user_id:
-        raise AppError("ASSET_FORBIDDEN", "Only the uploader can complete this asset", 403)
     expected = payload.checksum_sha256.lower() if payload.checksum_sha256 else None
     envelope = (row.media_metadata or {}).get("validation")
     if row.status == "READY":
@@ -146,6 +158,8 @@ async def create_pending_asset(
     settings: Settings,
     payload: UploadRequest,
     user_id: str,
+    *,
+    is_admin: bool = False,
 ) -> tuple[Asset, dict]:
     if payload.size_bytes > settings.max_upload_bytes:
         raise AppError("UPLOAD_TOO_LARGE", "Upload exceeds configured size limit", 413)
@@ -163,12 +177,26 @@ async def create_pending_asset(
             422,
         )
     if payload.project_id:
-        owner = await session.get(Project, str(payload.project_id))
-        if owner is None or owner.archived:
+        owner = await session.scalar(
+            select(Project).where(
+                Project.id == str(payload.project_id),
+                owner_scope(Project, user_id, allow_all=is_admin),
+            )
+        )
+        if owner is None:
+            raise AppError("PROJECT_NOT_FOUND", "Project was not found", 404)
+        if owner.archived:
             raise AppError("PROJECT_NOT_ACTIVE", "Project is missing or archived", 409)
     else:
-        owner = await session.get(Product, str(payload.product_id))
-        if owner is None or owner.archived:
+        owner = await session.scalar(
+            select(Product).where(
+                Product.id == str(payload.product_id),
+                owner_scope(Product, user_id, allow_all=is_admin),
+            )
+        )
+        if owner is None:
+            raise AppError("PRODUCT_NOT_FOUND", "Product was not found", 404)
+        if owner.archived:
             raise AppError("PRODUCT_NOT_ACTIVE", "Product is missing or archived", 409)
     asset_id = str(uuid4())
     asset = Asset(
@@ -182,6 +210,8 @@ async def create_pending_asset(
         object_key=immutable_asset_key(payload, asset_id),
         status="PENDING_UPLOAD",
         size_bytes=payload.size_bytes,
+        resource_owner_id=owner.created_by,
+        ownership_provenance="ADMIN_ASSIGNMENT" if is_admin else "OWNER",
         created_by=user_id,
     )
     session.add(asset)
@@ -529,6 +559,11 @@ def asset_reference_exists(asset_id):
             .select_from(SceneGeneration)
             .where(SceneGeneration.output_asset_id == asset_id)
         ),
+        exists(
+            select(1)
+            .select_from(DirectorRunMember)
+            .where(DirectorRunMember.output_asset_id == asset_id)
+        ),
         exists(select(1).select_from(FinalVideo).where(FinalVideo.output_asset_id == asset_id)),
         exists(
             select(1)
@@ -536,6 +571,168 @@ def asset_reference_exists(asset_id):
             .where(FinalVideo.background_audio_asset_id == asset_id)
         ),
         exists(select(1).select_from(FinalVideoScene).where(FinalVideoScene.asset_id == asset_id)),
+    )
+
+
+def asset_live_reference_exists(asset_id):
+    """Return whether any visible generation, scene, or final video uses an asset."""
+    visible_generation = and_(
+        not_logically_deleted_predicate(
+            "GENERATION", SceneGeneration.id, SceneGeneration.video_id
+        ),
+        not_logically_deleted_predicate(
+            "SCENE", SceneGeneration.scene_id, SceneGeneration.video_id
+        ),
+    )
+
+    generation_asset_reference = exists(
+        select(1)
+        .select_from(GenerationAsset)
+        .join(SceneGeneration, GenerationAsset.generation_id == SceneGeneration.id)
+        .where(GenerationAsset.asset_id == asset_id, visible_generation)
+    )
+    generation_output_reference = exists(
+        select(1)
+        .select_from(SceneGeneration)
+        .where(SceneGeneration.output_asset_id == asset_id, visible_generation)
+    )
+    director_member_output_reference = exists(
+        select(1)
+        .select_from(DirectorRunMember)
+        .join(DirectorRun, DirectorRun.id == DirectorRunMember.director_run_id)
+        .join(
+            SceneGeneration,
+            and_(
+                SceneGeneration.id == DirectorRunMember.scene_generation_id,
+                SceneGeneration.scene_id == DirectorRunMember.scene_id,
+                SceneGeneration.video_id == DirectorRun.video_id,
+            ),
+        )
+        .where(
+            DirectorRunMember.output_asset_id == asset_id,
+            visible_generation,
+        )
+    )
+    final_video_visible = not_logically_deleted_predicate(
+        "FINAL_VIDEO", FinalVideo.id, FinalVideo.video_id
+    )
+    final_video_output_reference = exists(
+        select(1)
+        .select_from(FinalVideo)
+        .where(
+            FinalVideo.output_asset_id == asset_id,
+            final_video_visible,
+        )
+    )
+    final_video_audio_reference = exists(
+        select(1)
+        .select_from(FinalVideo)
+        .where(
+            FinalVideo.background_audio_asset_id == asset_id,
+            final_video_visible,
+        )
+    )
+    final_video_scene_reference = exists(
+        select(1)
+        .select_from(FinalVideoScene)
+        .join(FinalVideo, FinalVideo.id == FinalVideoScene.final_video_id)
+        .where(
+            FinalVideoScene.asset_id == asset_id,
+            final_video_visible,
+        )
+    )
+    return or_(
+        generation_asset_reference,
+        generation_output_reference,
+        director_member_output_reference,
+        final_video_output_reference,
+        final_video_audio_reference,
+        final_video_scene_reference,
+    )
+
+
+def asset_is_proven_generated_output(asset_id):
+    """Require canonical worker provenance and an output relation to a video."""
+    generation_output = exists(
+        select(1)
+        .select_from(SceneGeneration)
+        .join(Video, Video.id == SceneGeneration.video_id)
+        .where(
+            SceneGeneration.output_asset_id == asset_id,
+            Asset.id == asset_id,
+            Asset.role == "GENERATED_VIDEO",
+            Asset.project_id == Video.project_id,
+            Asset.resource_owner_id == Video.created_by,
+        )
+    )
+    director_output = exists(
+        select(1)
+        .select_from(GenerationAsset)
+        .join(SceneGeneration, SceneGeneration.id == GenerationAsset.generation_id)
+        .join(Video, Video.id == SceneGeneration.video_id)
+        .where(
+            GenerationAsset.asset_id == asset_id,
+            GenerationAsset.role.like("DIRECTOR!_%", escape="!"),
+            Asset.id == asset_id,
+            Asset.role == "GENERATED_VIDEO",
+            Asset.project_id == Video.project_id,
+            Asset.resource_owner_id == Video.created_by,
+        )
+    )
+    director_member_output = exists(
+        select(1)
+        .select_from(DirectorRunMember)
+        .join(DirectorRun, DirectorRun.id == DirectorRunMember.director_run_id)
+        .join(
+            SceneGeneration,
+            and_(
+                SceneGeneration.id == DirectorRunMember.scene_generation_id,
+                SceneGeneration.scene_id == DirectorRunMember.scene_id,
+                SceneGeneration.video_id == DirectorRun.video_id,
+            ),
+        )
+        .join(Video, Video.id == DirectorRun.video_id)
+        .where(
+            DirectorRunMember.output_asset_id == asset_id,
+            Asset.id == asset_id,
+            Asset.role == "GENERATED_VIDEO",
+            Asset.project_id == Video.project_id,
+            Asset.resource_owner_id == Video.created_by,
+        )
+    )
+    final_video_output = exists(
+        select(1)
+        .select_from(FinalVideo)
+        .join(Video, Video.id == FinalVideo.video_id)
+        .where(
+            FinalVideo.output_asset_id == asset_id,
+            Asset.id == asset_id,
+            Asset.role == "FINAL_VIDEO",
+            Asset.project_id == Video.project_id,
+            Asset.resource_owner_id == Video.created_by,
+        )
+    )
+    return and_(
+        Asset.id == asset_id,
+        Asset.kind == "VIDEO",
+        Asset.role.in_({"GENERATED_VIDEO", "FINAL_VIDEO"}),
+        Asset.ownership_provenance == "VIDEO_PARENT",
+        Asset.resource_owner_id.is_not(None),
+        or_(
+            generation_output,
+            director_output,
+            director_member_output,
+            final_video_output,
+        ),
+    )
+
+
+def asset_retention_reference_exists(asset_id):
+    """Use logical visibility only for proven outputs; preserve strict refs otherwise."""
+    proven_output = asset_is_proven_generated_output(asset_id)
+    return or_(
+        and_(proven_output, asset_live_reference_exists(asset_id)),
+        and_(not_(proven_output), asset_reference_exists(asset_id)),
     )
 
 

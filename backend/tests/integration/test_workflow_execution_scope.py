@@ -2,7 +2,7 @@ import json
 from dataclasses import replace
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 
 from apps.api.app.api.admin import approve_workflow, create_workflow
@@ -122,6 +122,10 @@ async def test_registry_ingest_preserves_explicit_scope_and_legacy_fallback(
     (tmp_path / "graph.json").write_text(json.dumps(item.pop("workflow")), encoding="utf-8")
     item["file"] = "graph.json"
     (tmp_path / "registry.json").write_text(json.dumps({"workflows": [item]}), encoding="utf-8")
+    if profile.get("export_mode") == "segments" and scope == "single_scene":
+        with pytest.raises(ValueError, match="invalid execution scope"):
+            await seed_workflows(session_factory, tmp_path, admin)
+        return
     assert await seed_workflows(session_factory, tmp_path, admin) == 1
     async with session_factory() as session:
         row = await session.scalar(select(WorkflowRecord))
@@ -155,7 +159,7 @@ def test_runtime_scope_validation_never_infers_missing_identity():
 
 @pytest.mark.parametrize("scope", ["single_scene", "aggregate"])
 @pytest.mark.asyncio
-async def test_seed_disables_scope_mismatch_despite_qualified_evidence(
+async def test_seed_rejects_scope_mismatch_despite_qualified_evidence(
     session_factory, tmp_path, scope
 ):
     admin = await admin_user(session_factory)
@@ -170,12 +174,10 @@ async def test_seed_disables_scope_mismatch_despite_qualified_evidence(
             item["execution_scope"] = "aggregate" if scope == "single_scene" else "single_scene"
         items.append(item)
     (tmp_path / "registry.json").write_text(json.dumps({"workflows": items}), encoding="utf-8")
-    assert await seed_workflows(session_factory, tmp_path, admin) == 2
+    with pytest.raises(ValueError, match="invalid execution scope"):
+        await seed_workflows(session_factory, tmp_path, admin)
     async with session_factory() as session:
-        rows = {row.code: row for row in (await session.scalars(select(WorkflowRecord))).all()}
-        mismatched = "single" if scope == "single_scene" else "aggregate"
-        assert rows[mismatched].enabled is False
-        assert rows["aggregate" if mismatched == "single" else "single"].enabled is True
+        assert await session.scalar(select(func.count()).select_from(WorkflowRecord)) == 0
 
 
 @pytest.mark.parametrize("aggregate,expected", [(False, "single_scene"), (True, "aggregate")])
@@ -269,18 +271,22 @@ async def test_selection_resolves_simultaneous_scopes_and_preserves_manifest_sco
         await session.flush()
         service = GenerationService(Settings(_env_file=None))
         for scope in ("single_scene", "aggregate"):
-            row, approved = await service._workflow(
-                session, "t2v", None, allow_aggregate=scope == "aggregate"
+            row, approved, configuration = await service._workflow(
+                session, "t2v", None, ratio="9:16", duration_seconds=5,
+                seed_policy="RANDOM", seed=None, allow_aggregate=scope == "aggregate",
             )
             assert row.id == ids[scope]
             assert approved.execution_scope == scope
             assert approved.manifest()["execution_scope"] == scope
+            assert configuration.execution_scope == scope
             opposite = "aggregate" if scope == "single_scene" else "single_scene"
             with pytest.raises(AppError) as error:
                 await service._workflow(
-                    session, "t2v", ids[opposite], allow_aggregate=scope == "aggregate"
+                    session, "t2v", ids[opposite], ratio="9:16", duration_seconds=5,
+                    seed_policy="RANDOM", seed=None, allow_aggregate=scope == "aggregate",
                 )
-            assert error.value.code == "WORKFLOW_EXECUTION_SCOPE_CONFLICT"
+            assert error.value.code == "WORKFLOW_NOT_QUALIFIED"
+            assert "scope" in error.value.message
 
 
 @pytest.mark.asyncio

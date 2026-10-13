@@ -23,6 +23,7 @@ from apps.api.app.api import (
     auth,
     brands,
     dashboard,
+    deletions,
     events,
     generations,
     health,
@@ -39,7 +40,7 @@ from apps.api.app.core.errors import AppError
 from apps.api.app.core.logging import configure_logging, request_id_context
 from apps.api.app.core.metrics import http_request_labels, metrics
 from apps.api.app.core.request_limits import RequestBodyLimitMiddleware
-from apps.api.app.core.security import hash_password
+from apps.api.app.core.security import hash_password, validate_jwt_signing_configuration
 from apps.api.app.db.models import User
 from apps.api.app.db.session import SessionFactory, engine
 from apps.api.app.integrations.minio import AssetStore
@@ -79,6 +80,8 @@ async def _bootstrap_admin() -> User | None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    if settings.app_env.lower() == "production":
+        validate_jwt_signing_configuration(settings)
     await asyncio.to_thread(Path(settings.workspace_root).mkdir, parents=True, exist_ok=True)
     try:
         await AssetStore(settings).ensure_bucket()
@@ -263,6 +266,7 @@ routers = (
     videos.router,
     scenes.router,
     generations.router,
+    deletions.router,
     assembly.router,
     events.router,
     metrics_api.router,
@@ -298,7 +302,7 @@ def public_openapi() -> dict:
     components.setdefault("securitySchemes", {})["StudioSession"] = {
         "type": "apiKey",
         "in": "cookie",
-        "name": settings.session_cookie_name,
+        "name": settings.auth_cookie_name,
     }
     error_responses = {
         "400": _error_response("Invalid request or business rule"),
