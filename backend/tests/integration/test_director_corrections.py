@@ -37,7 +37,9 @@ def settings(tmp_path):
 
 
 async def standalone_workflow(session, user):
-    graph, slots, profile, approved = director_workflow_data(quality="BASE")
+    graph, slots, profile, approved = director_workflow_data(
+        quality="BASE", aspect_ratio="16:9"
+    )
     workflow = WorkflowRecord(
         code="STANDALONE_OVERRIDE", mode="t2v", version="1", quality_profile="BASE", workflow=graph,
         slots=slots, required_slots=list(slots), profile=profile,
@@ -188,7 +190,13 @@ async def test_aggregate_parent_derivative_rejected_before_new_rows(
         baseline = await counts(session)
         values = {"parent_generation_id": parent.id}
         if override:
-            values.update(workflow_id=await standalone_workflow(session, user), mode="t2v")
+            values.update(
+                workflow_id=await standalone_workflow(session, user),
+                mode="t2v",
+                aspect_ratio="16:9",
+                width=864,
+                height=480,
+            )
         endpoint = create_variation if operation == "VARIATION" else create_regeneration
         payload_type = VariationRequest if operation == "VARIATION" else RegenerateRequest
         with pytest.raises(AppError) as error:

@@ -443,6 +443,14 @@ class AssetDTO(Output):
     created_at: datetime
 
 
+class AssetDeletionStatusDTO(Output):
+    asset_id: str
+    status: Literal["PENDING", "DELETING", "DELETED", "NOT_REQUESTED"]
+    cleanup_status: Literal["NOT_REQUESTED", "PENDING", "COMPLETE"]
+    deleted_at: datetime | None = None
+    purged_at: datetime | None = None
+
+
 class AssetComplete(Input):
     retry_validation: bool = False
     checksum_sha256: str | None = Field(default=None, pattern=r"^[a-fA-F0-9]{64}$")
@@ -455,6 +463,7 @@ class DownloadDTO(Output):
 
 class GenerationRequest(Input):
     workflow_id: UUID | None = None
+    preview_configuration_hash: str | None = Field(default=None, pattern=r"^[a-fA-F0-9]{64}$")
     mode: GenerationMode | Literal["AUTO"] | None = None
     operation: Literal["ORIGINAL", "REGENERATE", "VARIATION"] = "ORIGINAL"
     parent_generation_id: UUID | None = None
@@ -514,6 +523,7 @@ class GenerateAll(Input):
 class VariationRequest(Input):
     parent_generation_id: UUID
     workflow_id: UUID | None = None
+    preview_configuration_hash: str | None = Field(default=None, pattern=r"^[a-fA-F0-9]{64}$")
     mode: GenerationMode | Literal["AUTO"] | None = None
     first_frame_asset_id: UUID | None = None
     last_frame_asset_id: UUID | None = None
@@ -559,6 +569,46 @@ class PromptPreviewRequest(GenerationRequest):
     pass
 
 
+class ResolvedGenerationConfigurationDTO(Output):
+    """Server-derived settings used for preview, execution and history display."""
+
+    requested_mode: str | None = None
+    resolved_mode: str | None = None
+    execution_scope: Literal["single_scene", "aggregate"] | None = None
+    workflow_id: str | None = None
+    workflow_code: str | None = None
+    workflow_version: str | None = None
+    workflow_hash: str | None = None
+    profile_hash: str | None = None
+    quality_profile: QualityProfile | None = None
+    quality_label: str | None = None
+    quality_description: str | None = None
+    aspect_ratio: GenerationRatio | None = None
+    native_width: int | None = None
+    native_height: int | None = None
+    expected_output_width: int | None = None
+    expected_output_height: int | None = None
+    resolution_display_label: str | None = None
+    sampling_steps: int | None = None
+    cfg: float | None = None
+    sampler: str | None = None
+    scheduler: str | None = None
+    runtime_identity: str | None = None
+    model_identity: str | None = None
+    fps: float | None = None
+    frames: int | None = None
+    duration_seconds: float | None = None
+    seed_policy: Literal["RANDOM", "FIXED"] | None = None
+    fixed_seed_or_null: int | None = None
+    refine_enabled: bool | None = None
+    upscale_enabled: bool | None = None
+    refine_mode: str | None = None
+    qualification_status: str = "UNKNOWN"
+    runnable: bool = False
+    unavailable_reason: str | None = None
+    configuration_hash: str | None = None
+
+
 class PromptPreviewDTO(Output):
     raw_prompt: str
     execution_prompt: str
@@ -566,6 +616,7 @@ class PromptPreviewDTO(Output):
     warnings: list[str]
     scene_revision: int
     video_revision: int
+    resolved_configuration: ResolvedGenerationConfigurationDTO | None = None
 
 
 class ExecutionGroupDTO(Output):
@@ -586,8 +637,25 @@ class BatchGenerationDTO(Output):
     execution_groups: list[ExecutionGroupDTO] = Field(default_factory=list)
 
 
+class GenerationOutputMetadataDTO(Output):
+    model_config = ConfigDict(from_attributes=True, extra="allow")
+
+    measured_width: int | None = None
+    measured_height: int | None = None
+    measured_fps: float | None = None
+    measured_frame_count: int | None = None
+    measured_duration_seconds: float | None = None
+    measured_has_video: bool | None = None
+    measured_has_audio: bool | None = None
+    checksum: str | None = None
+    size_bytes: int | None = None
+
+
 class GenerationDTO(Output):
-    output_metadata: dict[str, Any] = Field(default_factory=dict)
+    output_metadata: GenerationOutputMetadataDTO = Field(
+        default_factory=GenerationOutputMetadataDTO
+    )
+    resolved_configuration: ResolvedGenerationConfigurationDTO | None = None
     id: str
     video_id: str
     scene_id: str

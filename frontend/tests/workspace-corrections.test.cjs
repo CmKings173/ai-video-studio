@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 const { loadTypeScript } = require('./load-typescript.cjs');
 const React = require('react');
 const { pageHarness } = require('./load-typescript.cjs');
+const prepareGenerateAll = loadTypeScript('lib/api/generations.ts').prepareGenerateAll;
 const state = () => loadTypeScript('lib/generation/workspace-state.ts');
 const scene = (n, fresh, continuity = 'CUT') => ({ id: `s${n}`, enabled: true, scene_order: n - 1, spec: { continuity }, selected_generation_id: fresh === null ? null : `g${n}`, selected_generation_fresh: fresh });
 
@@ -49,10 +50,14 @@ function workspace(scenes, withRunning = false) {
   let stateIndex = 0, historical;
   const h = pageHarness(video, {
     '@/lib/api/generations': {
+      prepareGenerateAll,
       listSceneGenerations: async (...args) => { requests.push(args); return { items: recent, total: 25 }; },
       getGeneration: async id => { requests.push(id); return { id, generation_no: 1, status: 'COMPLETED', output_asset_id: 'historical-asset' }; },
     },
     '@/lib/api/scenes': { patchScene: async (...args) => saves.push(args), createScene: async (...args) => saves.push(args) },
+    '@/components/ui/button': {
+      Button: props => React.createElement('button', props, props.children),
+    },
     'react-hook-form': { useForm: () => ({ register: name => ({ name }), handleSubmit: fn => fn, reset: () => {}, formState: { errors: {} } }) },
   });
   h.mocks.react.useEffect = () => {};
@@ -99,7 +104,7 @@ test('workspace disables zero-eligible Generate All and gives stale chain primar
   for (const fresh of [true, false]) {
     const h = workspace([scene(1, true), scene(2, fresh, 'CONTINUOUS'), scene(3, true, 'CONTINUOUS')]);
     const tree = h.render();
-    const action = nodes(tree).find(n => n.props?.onClick && React.Children.toArray(n.props.children).some(child => child.props?.children === (fresh ? 'Tất cả cảnh đã cập nhật.' : 'Tạo 3 cảnh')));
+    const action = nodes(tree).find(n => n.type === h.mocks['@/components/ui/button'].Button && n.props?.size === 'sm' && n.props?.onClick);
     assert.ok(action);
     assert.equal(action.props.disabled, fresh);
     assert.equal(action.props.variant, fresh ? 'secondary' : 'primary');

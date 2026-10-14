@@ -2,6 +2,7 @@
 
 import copy
 import hashlib
+from uuid import NAMESPACE_URL, uuid5
 
 import pytest
 
@@ -49,8 +50,10 @@ async def test_dependency_edit_after_enqueue_preserves_artifact_without_promotio
             request_id=None,
         )
         asset = Asset(
+            id=str(uuid5(NAMESPACE_URL, f"ai-video-studio:GENERATED_VIDEO:{generation.id}")),
             project_id=video.project_id,
             kind="VIDEO",
+            role="GENERATED_VIDEO",
             filename="scene.mp4",
             content_type="video/mp4",
             object_key="dependency/scene.mp4",
@@ -58,6 +61,8 @@ async def test_dependency_edit_after_enqueue_preserves_artifact_without_promotio
             checksum=hashlib.sha256(b"scene-one").hexdigest(),
             size_bytes=9,
             created_by=user_id,
+            resource_owner_id=video.created_by,
+            ownership_provenance="VIDEO_PARENT",
         )
         session.add(asset)
         await session.flush()

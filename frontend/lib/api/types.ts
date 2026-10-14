@@ -422,6 +422,44 @@ export interface SceneGenerationConfig {
   audio?: DirectorAudioSettings;
 }
 
+export interface ResolvedGenerationConfiguration {
+  requested_mode?: GenerationMode | "AUTO" | null;
+  resolved_mode?: GenerationMode | null;
+  execution_scope?: "single_scene" | "aggregate" | null;
+  workflow_id?: string | null;
+  workflow_code?: string | null;
+  workflow_version?: string | null;
+  workflow_hash?: string | null;
+  profile_hash?: string | null;
+  quality_profile?: QualityProfile | null;
+  quality_label?: string | null;
+  quality_description?: string | null;
+  aspect_ratio?: GenerationAspectRatio | null;
+  native_width?: number | null;
+  native_height?: number | null;
+  expected_output_width?: number | null;
+  expected_output_height?: number | null;
+  resolution_display_label?: string | null;
+  sampling_steps?: number | null;
+  cfg?: number | null;
+  sampler?: string | null;
+  scheduler?: string | null;
+  runtime_identity?: string | null;
+  model_identity?: string | null;
+  fps?: number | null;
+  frames?: number | null;
+  duration_seconds?: number | null;
+  seed_policy?: SeedPolicy | null;
+  fixed_seed_or_null?: number | null;
+  refine_enabled?: boolean | null;
+  upscale_enabled?: boolean | null;
+  refine_mode?: string | null;
+  qualification_status: string;
+  runnable: boolean;
+  unavailable_reason?: string | null;
+  configuration_hash?: string | null;
+}
+
 export interface GenerationCapability {
   workflow_id: string;
   mode: GenerationMode;
@@ -453,6 +491,7 @@ export interface GenerationCapability {
   supports_audio?: boolean;
   audio_modes?: Array<"generate" | "source" | "mute">;
   director_settings?: Array<Pick<SceneGenerationConfig, "motion_context" | "refine" | "face_refine" | "audio_policy">>;
+  resolved_configuration?: ResolvedGenerationConfiguration | null;
 }
 
 export interface GenerationSourceCapabilities {
@@ -551,12 +590,14 @@ export interface GenerationInputSnapshot {
   director_execution_spec?: DirectorExecutionSpec;
   audio_policy?: DirectorAudioPolicy;
   director_execution?: FrozenDirectorExecutionSpec;
+  resolved_configuration?: ResolvedGenerationConfiguration;
   assets?: GenerationInputAssetSnapshot[];
   [key: string]: unknown;
 }
 
 export interface GenerationRequest {
   workflow_id?: string | null;
+  preview_configuration_hash?: string | null;
   mode?: GenerationMode | "AUTO" | null;
   quality_profile?: QualityProfile;
   aspect_ratio?: GenerationAspectRatio;
@@ -593,9 +634,35 @@ export interface GenerateAllRequest {
   expected_scene_revisions?: Record<string, number>;
 }
 
+export interface BatchGenerationPreviewDTO {
+  contract_version: number;
+  video_id: string;
+  video_revision: number;
+  anchor_scene_id: string;
+  anchor_scene_revision: number;
+  scene_ids: string[];
+  scenes: Array<{
+    scene_id: string;
+    scene_revision: number;
+    duration_seconds: number;
+    execution_scope: "single_scene" | "aggregate";
+    workflow_id: string;
+    requested_workflow_id: string | null;
+    resolved_configuration: ResolvedGenerationConfiguration;
+    configuration_hash: string;
+  }>;
+  execution_groups: Array<{
+    execution_scope: "single_scene" | "aggregate";
+    scene_ids: string[];
+    generation_configuration_hashes: string[];
+  }>;
+  preview_configuration_hash: string;
+}
+
 export interface VariationRequest {
   parent_generation_id: string;
   workflow_id?: string | null;
+  preview_configuration_hash?: string | null;
   mode?: GenerationMode | "AUTO" | null;
   quality_profile?: QualityProfile;
   aspect_ratio?: GenerationAspectRatio;
@@ -626,6 +693,19 @@ export interface PromptPreviewDTO {
   warnings: string[];
   scene_revision: number;
   video_revision: number;
+  resolved_configuration?: ResolvedGenerationConfiguration | null;
+}
+
+export interface GenerationOutputMetadata extends Record<string, unknown> {
+  measured_width?: number | null;
+  measured_height?: number | null;
+  measured_fps?: number | null;
+  measured_frame_count?: number | null;
+  measured_duration_seconds?: number | null;
+  measured_has_video?: boolean | null;
+  measured_has_audio?: boolean | null;
+  checksum?: string | null;
+  size_bytes?: number | null;
 }
 
 export interface GenerationDTO {
@@ -643,7 +723,8 @@ export interface GenerationDTO {
   progress_total: number | null;
   revision: number;
   input_snapshot: GenerationInputSnapshot;
-  output_metadata: Record<string, unknown>;
+  output_metadata: GenerationOutputMetadata;
+  resolved_configuration?: ResolvedGenerationConfiguration | null;
   request_id: string | null;
   comfy_prompt_id: string | null;
   output_asset_id: string | null;

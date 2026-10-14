@@ -16,9 +16,22 @@ function setup() {
   const sent = [];
   const selections = [];
   const actual = loadTypeScript("lib/api/generations.ts");
+  let hookCursor = 0;
+  const hookRefs = [];
+  const hookReact = {
+    useRef(initial) {
+      const index = hookCursor++;
+      return hookRefs[index] ??= { current: initial };
+    },
+    useCallback: callback => callback,
+  };
+  const actionModule = loadTypeScript("lib/hooks/use-generate-all-action.ts", { react: hookReact });
+  hookCursor = 0;
+  const generateAllAction = actionModule.useGenerateAllAction();
   const harness = pageHarness(rendered, {
     "@/lib/api/errors": errors,
     "@/lib/api/generations": { ...actual, generateAll: async (...args) => { sent.push(args); throw state.failure; } },
+    "@/lib/hooks/use-generate-all-action": { useGenerateAllAction: () => generateAllAction },
     "@/lib/api/scenes": { selectGeneration: async (...args) => { selections.push(args); } },
   });
   let queryCursor = 0;
@@ -33,9 +46,19 @@ function setup() {
   const page = loadTypeScript("app/videos/[videoId]/page.tsx", harness.mocks).default;
   function render() { queryCursor = 0; harness.render(page, { videoId: rendered.id }); }
   async function submit() {
+    let input;
+    try {
+      input = await generateAllAction.prepare(rendered, async () => {
+        state.refreshes++;
+        if (state.refreshError) throw state.refreshError;
+        return state.fresh;
+      });
+    } catch (error) {
+      return error;
+    }
     render();
     const action = harness.mutations.at(-1);
-    try { await action.mutationFn(); assert.fail("request should fail"); }
+    try { await action.mutationFn(input); assert.fail("request should fail"); }
     catch (error) { action.onError(error); return error; }
   }
   async function select(generationId) {

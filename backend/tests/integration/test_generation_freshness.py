@@ -1,13 +1,23 @@
 """Freshness through actual generation, selection and assembly services."""
 
 import copy
+from uuid import NAMESPACE_URL, uuid5
 
 import pytest
 
 from apps.api.app.api.scenes import select_generation
 from apps.api.app.core.config import Settings
 from apps.api.app.core.errors import AppError
-from apps.api.app.db.models import Asset, Brand, Product, Scene, SceneGeneration, User, Video
+from apps.api.app.db.models import (
+    Asset,
+    Brand,
+    GenerationAsset,
+    Product,
+    Scene,
+    SceneGeneration,
+    User,
+    Video,
+)
 from apps.api.app.schemas.api import AssemblyRequest, GenerateAll, GenerationRequest, Selection
 from apps.api.app.services.assembly_service import AssemblyService
 from apps.api.app.services.batch_identity import capture_batch_inputs, unchanged_batch_inputs
@@ -36,8 +46,13 @@ async def generated_selection(factory, tmp_path):
             user_id=user_id,
             request_id=None,
         )
+        scene = await session.get(Scene, scene_id)
+        video = await session.get(Video, scene.video_id)
         asset = Asset(
+            id=str(uuid5(NAMESPACE_URL, f"ai-video-studio:GENERATED_VIDEO:{generation.id}")),
+            project_id=video.project_id,
             kind="VIDEO",
+            role="GENERATED_VIDEO",
             filename="clip.mp4",
             content_type="video/mp4",
             object_key="freshness/clip.mp4",
@@ -50,12 +65,53 @@ async def generated_selection(factory, tmp_path):
         await session.flush()
         generation.status = "COMPLETED"
         generation.output_asset_id = asset.id
-        scene = await session.get(Scene, scene_id)
         scene.selected_generation_id = generation.id
         scene.revision += 1
-        video = await session.get(Video, scene.video_id)
         video.revision += 1
         return user_id, video.id, scene_id, generation.id
+
+
+@pytest.mark.asyncio
+async def test_selection_allows_owned_reference_generation_assets(session_factory, tmp_path):
+    user_id, video_id, scene_id, generation_id = await generated_selection(
+        session_factory, tmp_path
+    )
+    async with session_factory() as session, session.begin():
+        video = await session.get(Video, video_id)
+        scene = await session.get(Scene, scene_id)
+        generation = await session.get(SceneGeneration, generation_id)
+        assert video is not None and scene is not None and generation is not None
+        reference = Asset(
+            project_id=video.project_id,
+            kind="IMAGE",
+            role="REFERENCE",
+            filename="generation-reference.png",
+            content_type="image/png",
+            object_key="freshness/generation-reference.png",
+            status="READY",
+            size_bytes=8,
+            checksum="b" * 64,
+            created_by=user_id,
+        )
+        session.add(reference)
+        await session.flush()
+        session.add(
+            GenerationAsset(
+                generation_id=generation_id,
+                asset_id=reference.id,
+                role="REFERENCE_IMAGE",
+                order_index=0,
+            )
+        )
+        selected = await select_generation(
+            scene_id,
+            Selection(generation_id=generation_id),
+            revision=scene.revision,
+            user=await session.get(User, user_id),
+            session=session,
+        )
+        assert selected.id == scene_id
+        assert scene.selected_generation_id == generation_id
 
 
 @pytest.mark.asyncio

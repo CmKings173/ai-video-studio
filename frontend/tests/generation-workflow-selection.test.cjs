@@ -1,15 +1,21 @@
 const assert = require("node:assert/strict");
 const test = require("node:test");
+const { createHash } = require("node:crypto");
 const React = require("react");
 const { loadTypeScript } = require("./load-typescript.cjs");
 
-const combination = (workflow_id, extra = {}) => ({
-  workflow_id, workflow_version: `${workflow_id}-v1`, execution_scope: "single_scene",
-  mode: "t2v", quality_profile: "STANDARD", aspect_ratio: "9:16",
-  resolved_width: 480, resolved_height: 864, fps: 24, required_asset_slots: [],
-  max_reference_images: 0, max_reference_videos: 0, max_reference_audio: 0, max_total_reference_files: 0,
-  ...extra,
-});
+const hash = (value) => createHash("sha256").update(value).digest("hex");
+
+const combination = (workflow_id, extra = {}) => {
+  const item = {
+    workflow_id, workflow_version: `${workflow_id}-v1`, workflow_hash: `workflow-${workflow_id}`, execution_scope: "single_scene",
+    mode: "t2v", quality_profile: "STANDARD", aspect_ratio: "9:16",
+    resolved_width: 480, resolved_height: 864, fps: 24, required_asset_slots: [],
+    max_reference_images: 0, max_reference_videos: 0, max_reference_audio: 0, max_total_reference_files: 0,
+    ...extra,
+  };
+  return { ...item, resolved_configuration: resolvedConfiguration(item) };
+};
 const first = combination("test-first");
 const second = combination("test-second", { resolved_width: 720, resolved_height: 1280 });
 const sameSizeVariant = combination("test-first-variant", { workflow_version: "alternate-v1" });
@@ -43,16 +49,42 @@ test("unknown workflow IDs and incompatible contexts fail closed without a scope
   assert.deepEqual(api.matchingQualifiedCapabilities({ ...caps, available: false }, input, "single_scene"), []);
 });
 
+test("resolved configurations require a 64-character hexadecimal SHA-256 hash", () => {
+  const { resolvedConfigurationMatchesRequest } = loadTypeScript("lib/generation/capabilities.ts");
+  const caps = { available: true, qualified_capabilities: [first] };
+  const input = { mode: "AUTO", quality_profile: "STANDARD", aspect_ratio: "9:16" };
+  const valid = { ...first.resolved_configuration, configuration_hash: "a".repeat(64) };
+  assert.equal(resolvedConfigurationMatchesRequest(valid, input, "single_scene", caps), true);
+  for (const configuration_hash of ["short", "g".repeat(64), "A".repeat(63)]) {
+    assert.equal(resolvedConfigurationMatchesRequest({ ...valid, configuration_hash }, input, "single_scene", caps), false);
+  }
+});
+
+// Bind preview identity to the selected capability and the actual request settings.
+function resolvedConfiguration(item, payload = {}) {
+  return {
+    runnable: true, requested_mode: payload.mode ?? "AUTO", resolved_mode: item.mode,
+    workflow_id: item.workflow_id, workflow_version: item.workflow_version,
+    workflow_hash: item.workflow_hash, profile_hash: `profile-${item.workflow_id}`,
+    configuration_hash: hash(JSON.stringify(payload)),
+    execution_scope: item.execution_scope, quality_profile: item.quality_profile,
+    aspect_ratio: item.aspect_ratio, native_width: item.resolved_width,
+    native_height: item.resolved_height, output_width: item.resolved_width,
+    output_height: item.resolved_height, seed_policy: payload.seed_policy ?? "RANDOM",
+    fixed_seed_or_null: payload.seed_policy === "FIXED" ? payload.seed : null,
+  };
+}
+
 function nodes(node) {
   return !node || typeof node !== "object" ? [] : [node, ...React.Children.toArray(node.props?.children).flatMap(nodes)];
 }
-function harness(locale = "vi", config = {}) {
+function harness(locale = "vi", config = {}, capabilitiesOverride) {
   let cursor = 0, tree;
   const states = [], sent = [], previews = [], saved = [], effectDeps = new Map();
   const scene = { id: "scene", revision: 2, scene_order: 0, duration_seconds: 5, enabled: true, spec: { continuity: "CUT" }, generation_config: config };
   const scenes = [scene];
   const video = { id: "video", revision: 4, project_id: "project", aspect_ratio: "9:16" };
-  const caps = { available: true, qualified_capabilities: [first, second, sameSizeVariant, highSameSize,
+  const caps = capabilitiesOverride ?? { available: true, qualified_capabilities: [first, second, sameSizeVariant, highSameSize,
     combination("wrong-scope", { execution_scope: "aggregate" }),
     combination("high", { quality_profile: "HIGH", resolved_width: 1080, resolved_height: 1920 }),
     combination("wrong-mode", { mode: "i2v" }),
@@ -73,13 +105,13 @@ function harness(locale = "vi", config = {}) {
     "@/lib/i18n": { useI18n: () => ({ locale, t }), translateText: t },
     "@tanstack/react-query": {
       useQuery: () => ({ data: caps }), useQueries: () => [],
-      useQueryClient: () => ({ invalidateQueries: async () => {} }),
+      useQueryClient: () => ({ fetchQuery: async ({ queryFn }) => queryFn(), invalidateQueries: async () => {} }),
       useInfiniteQuery: () => ({ data: { pages: [{ items: [] }] } }),
     },
     "@/lib/api/scenes": { patchScene: async (...args) => saved.push(args) },
     "@/lib/api/generations": {
       generationCapabilities: async () => caps,
-      previewPrompt: async (id, payload) => { previews.push(payload); return { execution_prompt: "User prompt", scene_revision: scene.revision, video_revision: video.revision, warnings: [] }; },
+      previewPrompt: async (id, payload) => { previews.push(payload); return { execution_prompt: "User prompt", scene_revision: scene.revision, video_revision: video.revision, warnings: [], resolved_configuration: resolvedConfiguration(caps.qualified_capabilities.find(item => item.workflow_id === payload.workflow_id), payload) }; },
     },
   }).GenerationEditor;
   const render = () => {
@@ -89,7 +121,12 @@ function harness(locale = "vi", config = {}) {
   const all = () => nodes(tree);
   const button = label => { const node = all().find(node => node.props?.children === label); assert.ok(node, label); return node; };
   const workflow = () => all().find(node => node.type === "select" && nodes(node).some(child => child.type === "option" && child.props.children === t("Tự động chọn workflow phù hợp", "Automatically select a compatible workflow")));
-  const resolution = () => all().find(node => node.type === "select" && nodes(node).some(child => child.type === "option" && child.props.children === t("Tự động chọn độ phân giải phù hợp", "Automatically select a compatible resolution")));
+  const resolution = () => {
+    const label = all().find(node => node.type === "label" && React.Children.toArray(node.props.children)[0] === t("Độ phân giải gốc đã xác minh", "Qualified native resolution"));
+    const select = nodes(label).find(node => node.type === "select");
+    assert.ok(select, "qualified native resolution selector exists");
+    return select;
+  };
   const choose = value => { workflow().props.onChange({ target: { value } }); render(); };
   render();
   return { render, all, button, workflow, resolution, choose, sent, previews, saved, scene, scenes, caps, t };
@@ -136,6 +173,22 @@ test("quality profile collisions keep their own pixel-resolution choices", () =>
   assert.deepEqual(nodes(h.resolution()).filter(node => node.type === "option").map(node => node.props.value), ["", "480x864", "1080x1920"]);
   assert.ok(nodes(h.workflow()).some(node => node.type === "option" && node.props.value === "test-high-same-size"));
   assert.ok(!nodes(h.workflow()).some(node => node.type === "option" && node.props.value === second.workflow_id));
+});
+
+test("saved STANDARD canvas can be changed to a separately qualified HIGH canvas", () => {
+  const highOnly = combination("high-only", { quality_profile: "HIGH", resolved_width: 1080, resolved_height: 1920 });
+  const caps = { available: true, qualified_capabilities: [first, highOnly] };
+  const h = harness("en", { quality_profile: "STANDARD", aspect_ratio: "9:16", width: 480, height: 864 }, caps);
+  const profileLabel = h.all().find(node => node.type === "label"
+    && React.Children.toArray(node.props.children)[0] === h.t("C?u h�nh ch?t lu?ng", "Quality profile"));
+  const profile = nodes(profileLabel).find(node => node.type === "select");
+  const highOption = nodes(profile).find(node => node.type === "option" && node.props.value === "HIGH");
+  assert.ok(highOption, "qualified HIGH profile remains selectable from a saved STANDARD canvas");
+  assert.notEqual(highOption.props.disabled, true);
+  profile.props.onChange({ target: { value: "HIGH" } }); h.render();
+  assert.ok(nodes(h.resolution()).some(node => node.type === "option" && node.props.value === "1080x1920"));
+  h.resolution().props.onChange({ target: { value: "1080x1920" } }); h.render();
+  assert.equal(h.button("Preview prompt").props.disabled, false);
 });
 
 test("editor rejects unknown workflow IDs and invalidates accepted prompts on selection and context changes", async () => {

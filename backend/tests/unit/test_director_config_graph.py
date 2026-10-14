@@ -133,26 +133,57 @@ def test_historical_unwired_base_graph_remains_compatible():
 
 
 def installed_info(graph):
+    output_types = {
+        "UNETLoader": ["MODEL"],
+        "CLIPLoader": ["CLIP"],
+        "VAELoader": ["VAE"],
+        "MiniMaxH3Director": [
+            "IMAGE",
+            "AUDIO",
+            "FLOAT",
+            "IMAGE",
+            "IMAGE",
+            "STRING",
+            "IMAGE",
+            "IMAGE",
+        ],
+        "CreateVideo": ["VIDEO"],
+        "SaveVideo": [],
+        "BasicScheduler": ["SIGMAS"],
+        "MiniMaxH3DirectorRefine": ["MMX_DIR_REFINE", "INT", "INT"],
+        "MiniMaxH3DirectorFaceRefine": ["MMX_DIR_FACE_REFINE"],
+    }
     info = {}
     for node in graph.values():
         fields = {}
-        for key in node["inputs"]:
-            kind = (
-                "MODEL"
-                if key in {"model", "refine_model"}
-                else "SIGMAS"
-                if key == "sigmas"
-                else "STRING"
-            )
-            fields[key] = [kind, {}]
-        info[node["class_type"]] = {"input": {"required": fields}}
+        for value_name, value in node["inputs"].items():
+            if (
+                isinstance(value, list)
+                and len(value) == 2
+                and isinstance(value[0], str)
+                and value[0] in graph
+                and type(value[1]) is int
+            ):
+                source_class = graph[value[0]]["class_type"]
+                kind = output_types[source_class][value[1]]
+            elif isinstance(value, str):
+                kind = "STRING"
+            elif isinstance(value, bool):
+                kind = "BOOLEAN"
+            elif isinstance(value, int):
+                kind = "INT"
+            elif isinstance(value, float):
+                kind = "FLOAT"
+            else:
+                kind = "*"
+            fields[value_name] = [kind, {}]
+        info[node["class_type"]] = {
+            "input": {"required": fields},
+            "output": output_types[node["class_type"]],
+        }
     director = info["MiniMaxH3Director"]["input"]["required"]
     director["refine"] = ["MMX_DIR_REFINE", {}]
     director["face_refine"] = ["MMX_DIR_FACE_REFINE", {}]
-    info["MiniMaxH3DirectorRefine"]["output"] = ["MMX_DIR_REFINE", "INT", "INT"]
-    info["MiniMaxH3DirectorFaceRefine"]["output"] = ["MMX_DIR_FACE_REFINE"]
-    info["BasicScheduler"]["output"] = ["SIGMAS"]
-    info["UNETLoader"]["output"] = ["MODEL"]
     return info
 
 

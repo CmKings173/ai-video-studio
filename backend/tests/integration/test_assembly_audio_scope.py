@@ -1,8 +1,9 @@
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 
+from apps.api.app.api import assembly as assembly_api
 from apps.api.app.api.assembly import assemble_video
 from apps.api.app.core.config import Settings
 from apps.api.app.core.errors import AppError
@@ -106,3 +107,55 @@ async def test_background_audio_must_belong_to_video_scope(
             await session.flush()
             assert await session.scalar(select(func.count()).select_from(FinalVideo)) == 0
             assert video.status != "ASSEMBLING"
+
+
+@pytest.mark.asyncio
+async def test_background_audio_is_refreshed_after_preflight_before_assembly_claim(
+    session_factory, tmp_path, monkeypatch
+):
+    user_id, video_id, _scene_id = await seed_ready_video(session_factory)
+    async with session_factory() as session, session.begin():
+        video = await session.get(Video, video_id)
+        audio = Asset(
+            project_id=video.project_id,
+            kind="AUDIO",
+            filename="music.wav",
+            content_type="audio/wav",
+            object_key="audio/stale-ready.wav",
+            status="READY",
+            checksum="d" * 64,
+            size_bytes=10,
+            created_by=user_id,
+        )
+        session.add(audio)
+        await session.flush()
+        audio_id = audio.id
+        revision = video.revision
+        original_claim = assembly_api.claim
+
+        async def mark_audio_deleted_after_preflight(session, **kwargs):
+            await session.execute(
+                update(Asset)
+                .where(Asset.id == audio_id)
+                .values(status="DELETED")
+                .execution_options(synchronize_session=False)
+            )
+            return await original_claim(session, **kwargs)
+
+        monkeypatch.setattr(assembly_api, "claim", mark_audio_deleted_after_preflight)
+        with pytest.raises(AppError) as rejected:
+            await assemble_video(
+                video_id,
+                AssemblyRequest(background_audio_asset_id=audio_id),
+                SimpleNamespace(state=SimpleNamespace(request_id="audio-race")),
+                revision=revision,
+                key="audio-race",
+                user=await session.get(User, user_id),
+                session=session,
+                settings=Settings(_env_file=None, workspace_root=tmp_path),
+            )
+
+        assert rejected.value.status_code == 409
+        assert rejected.value.code == "BACKGROUND_AUDIO_NOT_READY"
+        assert await session.scalar(select(func.count()).select_from(FinalVideo)) == 0
+        assert video.status != "ASSEMBLING"

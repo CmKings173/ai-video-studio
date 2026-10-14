@@ -12,3 +12,4 @@ export * from "./generations";
 export * from "./assembly";
 export * from "./assets";
 export * from "./admin";
+export * from "./deletions";

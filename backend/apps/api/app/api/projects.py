@@ -3,9 +3,10 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from apps.api.app.api.common import apply_patch, pagination
-from apps.api.app.api.deps import expected_revision, require_csrf, require_editor
+from apps.api.app.api.deps import AuthPrincipal, expected_revision, require_csrf, require_editor
+from apps.api.app.api.ownership import get_owned, owner_scope, principal_id
 from apps.api.app.core.errors import AppError
-from apps.api.app.db.models import Asset, Project, User, Video
+from apps.api.app.db.models import Asset, Project, Video
 from apps.api.app.db.session import get_session
 from apps.api.app.schemas.api import (
     AssetDTO,
@@ -24,11 +25,11 @@ async def list_projects(
     paging: tuple[int, int] = Depends(pagination),
     search: str | None = Query(default=None, min_length=1, max_length=200),
     archived: bool | None = None,
-    user: User = Depends(require_editor),
+    user: AuthPrincipal = Depends(require_editor),
     session: AsyncSession = Depends(get_session),
 ) -> Page[ProjectDTO]:
     page, size = paging
-    filters = []
+    filters = [owner_scope(Project, user)]
     if search:
         filters.append(Project.name.ilike(f"%{search}%"))
     if archived is not None:
@@ -42,8 +43,7 @@ async def list_projects(
     rows = list(
         (
             await session.scalars(
-                query
-                .order_by(Project.created_at.desc(), Project.id.desc())
+                query.order_by(Project.created_at.desc(), Project.id.desc())
                 .offset((page - 1) * size)
                 .limit(size)
             )
@@ -60,10 +60,10 @@ async def list_projects(
 @router.post("", response_model=ProjectDTO, status_code=201)
 async def create_project(
     payload: ResourceCreate,
-    user: User = Depends(require_csrf),
+    user: AuthPrincipal = Depends(require_csrf),
     session: AsyncSession = Depends(get_session),
 ) -> ProjectDTO:
-    project = Project(**payload.model_dump(), created_by=user.id)
+    project = Project(**payload.model_dump(), created_by=principal_id(user))
     session.add(project)
     await session.flush()
     return ProjectDTO.model_validate(project)
@@ -72,12 +72,17 @@ async def create_project(
 @router.get("/{project_id}", response_model=ProjectDTO)
 async def get_project(
     project_id: str,
-    user: User = Depends(require_editor),
+    user: AuthPrincipal = Depends(require_editor),
     session: AsyncSession = Depends(get_session),
 ) -> ProjectDTO:
-    project = await session.get(Project, project_id)
-    if project is None:
-        raise AppError("PROJECT_NOT_FOUND", "Project not found", 404)
+    project = await get_owned(
+        session,
+        Project,
+        project_id,
+        user,
+        error_code="PROJECT_NOT_FOUND",
+        message="Project not found",
+    )
     return ProjectDTO.model_validate(project)
 
 
@@ -86,10 +91,14 @@ async def patch_project(
     project_id: str,
     payload: ResourcePatch,
     revision: int = Depends(expected_revision),
-    user: User = Depends(require_csrf),
+    user: AuthPrincipal = Depends(require_csrf),
     session: AsyncSession = Depends(get_session),
 ) -> ProjectDTO:
-    project = await session.get(Project, project_id, with_for_update=True)
+    project = await session.scalar(
+        select(Project)
+        .where(Project.id == project_id, owner_scope(Project, user))
+        .with_for_update()
+    )
     if project is None:
         raise AppError("PROJECT_NOT_FOUND", "Project not found", 404)
     apply_patch(project, payload, revision)
@@ -100,10 +109,14 @@ async def patch_project(
 async def archive_project(
     project_id: str,
     revision: int = Depends(expected_revision),
-    user: User = Depends(require_csrf),
+    user: AuthPrincipal = Depends(require_csrf),
     session: AsyncSession = Depends(get_session),
 ) -> ProjectDTO:
-    project = await session.get(Project, project_id, with_for_update=True)
+    project = await session.scalar(
+        select(Project)
+        .where(Project.id == project_id, owner_scope(Project, user))
+        .with_for_update()
+    )
     if project is None:
         raise AppError("PROJECT_NOT_FOUND", "Project not found", 404)
     if project.revision != revision:
@@ -123,13 +136,19 @@ async def archive_project(
 async def project_videos(
     project_id: str,
     paging: tuple[int, int] = Depends(pagination),
-    user: User = Depends(require_editor),
+    user: AuthPrincipal = Depends(require_editor),
     session: AsyncSession = Depends(get_session),
 ) -> Page[VideoDTO]:
-    if await session.get(Project, project_id) is None:
-        raise AppError("PROJECT_NOT_FOUND", "Project not found", 404)
+    await get_owned(
+        session,
+        Project,
+        project_id,
+        user,
+        error_code="PROJECT_NOT_FOUND",
+        message="Project not found",
+    )
     page, size = paging
-    where = Video.project_id == project_id
+    where = (Video.project_id == project_id) & owner_scope(Video, user)
     total = await session.scalar(select(func.count()).select_from(Video).where(where)) or 0
     rows = list(
         (
@@ -154,13 +173,23 @@ async def project_videos(
 async def project_assets(
     project_id: str,
     paging: tuple[int, int] = Depends(pagination),
-    user: User = Depends(require_editor),
+    user: AuthPrincipal = Depends(require_editor),
     session: AsyncSession = Depends(get_session),
 ) -> Page[AssetDTO]:
-    if await session.get(Project, project_id) is None:
-        raise AppError("PROJECT_NOT_FOUND", "Project not found", 404)
+    await get_owned(
+        session,
+        Project,
+        project_id,
+        user,
+        error_code="PROJECT_NOT_FOUND",
+        message="Project not found",
+    )
     page, size = paging
-    where = (Asset.project_id == project_id) & Asset.deleted_at.is_(None)
+    where = (
+        (Asset.project_id == project_id)
+        & Asset.deleted_at.is_(None)
+        & owner_scope(Asset, user)
+    )
     total = await session.scalar(select(func.count()).select_from(Asset).where(where)) or 0
     rows = list(
         (

@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from apps.api.app.api.assets import store
 from apps.api.app.api.common import pagination
-from apps.api.app.api.deps import require_admin, require_admin_csrf
+from apps.api.app.api.deps import AuthPrincipal, require_admin, require_admin_csrf
 from apps.api.app.core.config import Settings, get_settings
 from apps.api.app.core.errors import AppError
 from apps.api.app.core.security import hash_password
@@ -20,9 +20,6 @@ from apps.api.app.db.models import (
     User,
     WorkflowRecord,
     utcnow,
-)
-from apps.api.app.db.models import (
-    Session as AuthSession,
 )
 from apps.api.app.db.session import get_session, get_session_factory
 from apps.api.app.integrations.comfy_adapter import ComfyAdapter
@@ -70,7 +67,7 @@ def _disk_usage(root: Path):
 @router.get("/users", response_model=Page[UserDTO])
 async def list_users(
     paging: tuple[int, int] = Depends(pagination),
-    admin: User = Depends(require_admin),
+    admin: AuthPrincipal = Depends(require_admin),
     session: AsyncSession = Depends(get_session),
 ) -> Page[UserDTO]:
     page, size = paging
@@ -96,7 +93,7 @@ async def list_users(
 @router.post("/users", response_model=UserDTO, status_code=201)
 async def create_user(
     payload: UserCreate,
-    admin: User = Depends(require_admin_csrf),
+    admin: AuthPrincipal = Depends(require_admin_csrf),
     session: AsyncSession = Depends(get_session),
 ) -> UserDTO:
     email = _email(payload.email)
@@ -121,7 +118,7 @@ async def create_user(
 async def patch_user(
     user_id: str,
     payload: UserPatch,
-    admin: User = Depends(require_admin_csrf),
+    admin: AuthPrincipal = Depends(require_admin_csrf),
     session: AsyncSession = Depends(get_session),
 ) -> UserDTO:
     # Serialize every active-admin mutation in a deterministic order. Locking
@@ -155,15 +152,13 @@ async def patch_user(
             setattr(user, key, value)
     if password is not None:
         user.password_hash = hash_password(password)
-    if password is not None or values.get("is_active") is False:
-        await session.execute(AuthSession.__table__.delete().where(AuthSession.user_id == user.id))
     return UserDTO.model_validate(user)
 
 
 @router.get("/workflows", response_model=Page[WorkflowDTO])
 async def list_workflows(
     paging: tuple[int, int] = Depends(pagination),
-    admin: User = Depends(require_admin),
+    admin: AuthPrincipal = Depends(require_admin),
     session: AsyncSession = Depends(get_session),
 ) -> Page[WorkflowDTO]:
     page, size = paging
@@ -213,7 +208,7 @@ def _approved(payload: WorkflowCreate) -> ApprovedWorkflow:
 @router.post("/workflows", response_model=WorkflowDTO, status_code=201)
 async def create_workflow(
     payload: WorkflowCreate,
-    admin: User = Depends(require_admin_csrf),
+    admin: AuthPrincipal = Depends(require_admin_csrf),
     session: AsyncSession = Depends(get_session),
 ) -> WorkflowDTO:
     approved = _approved(payload)
@@ -239,7 +234,7 @@ async def create_workflow(
 async def approve_workflow(
     workflow_id: str,
     payload: WorkflowApproval,
-    admin: User = Depends(require_admin_csrf),
+    admin: AuthPrincipal = Depends(require_admin_csrf),
     session: AsyncSession = Depends(get_session),
 ) -> WorkflowDTO:
     record = await session.get(WorkflowRecord, workflow_id, with_for_update=True)
@@ -316,7 +311,7 @@ async def _system_status(
 
 @router.get("/system/status", response_model=SystemStatusDTO)
 async def admin_system_status(
-    admin: User = Depends(require_admin),
+    admin: AuthPrincipal = Depends(require_admin),
     session: AsyncSession = Depends(get_session),
     settings: Settings = Depends(get_settings),
     asset_store: AssetStore = Depends(store),
@@ -326,7 +321,7 @@ async def admin_system_status(
 
 @router.get("/storage/summary", response_model=StorageSummaryDTO)
 async def storage_summary(
-    admin: User = Depends(require_admin),
+    admin: AuthPrincipal = Depends(require_admin),
     session: AsyncSession = Depends(get_session),
     settings: Settings = Depends(get_settings),
     asset_store: AssetStore = Depends(store),
@@ -359,7 +354,7 @@ async def storage_summary(
 @router.post("/storage/cleanup", response_model=CleanupResultDTO)
 async def cleanup_storage(
     payload: CleanupRequest,
-    admin: User = Depends(require_admin_csrf),
+    admin: AuthPrincipal = Depends(require_admin_csrf),
     factory=Depends(get_session_factory),
     asset_store: AssetStore = Depends(store),
     settings: Settings = Depends(get_settings),
@@ -378,7 +373,7 @@ async def cleanup_storage(
 
 @router.post("/storage/reconcile", response_model=ReconciliationDTO)
 async def reconcile_storage(
-    admin: User = Depends(require_admin_csrf),
+    admin: AuthPrincipal = Depends(require_admin_csrf),
     factory=Depends(get_session_factory),
     settings: Settings = Depends(get_settings),
     asset_store: AssetStore = Depends(store),

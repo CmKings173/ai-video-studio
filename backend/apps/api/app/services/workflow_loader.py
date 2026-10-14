@@ -8,7 +8,11 @@ from sqlalchemy import select
 
 from apps.api.app.core.errors import AppError
 from apps.api.app.db.models import User, WorkflowRecord, utcnow
-from apps.api.app.services.workflow_contracts import require_contract
+from apps.api.app.providers.minimax_h3_director.capabilities import DIRECTOR_SOURCE
+from apps.api.app.providers.minimax_h3_director.workflow_builder import (
+    validate_export_bindings,
+)
+from apps.api.app.services.workflow_contracts import WorkflowProfile, require_contract
 from apps.api.app.services.workflow_qualification import qualification_status
 from apps.api.app.services.workflow_registry import (
     ApprovedWorkflow,
@@ -32,13 +36,89 @@ def load_manifests(directory: Path) -> list[dict]:
     if not isinstance(entries, list):
         raise ValueError("workflow registry must contain a workflows list")
     result = []
+    identities: set[tuple[str, str]] = set()
     for entry in entries:
+        if not isinstance(entry, dict):
+            raise ValueError("workflow registry entries must be objects")
         current = dict(entry)
+        code, version = current.get("code"), current.get("version")
+        if (
+            not isinstance(code, str)
+            or not code.strip()
+            or not isinstance(version, str)
+            or not version.strip()
+        ):
+            raise ValueError("workflow code and version are required")
+        identity = (code, version)
+        if identity in identities:
+            raise ValueError(f"duplicate workflow code/version identity: {code}/{version}")
+        identities.add(identity)
+
         current["execution_scope"] = ingest_execution_scope(current)
+        profile = current.get("profile")
+        if not isinstance(profile, dict):
+            raise ValueError(f"workflow {code}/{version} profile must be an object")
+        try:
+            require_execution_scope(
+                SimpleNamespace(execution_scope=current["execution_scope"], profile=profile)
+            )
+        except AppError as exc:
+            raise ValueError(f"workflow {code}/{version} has an invalid execution scope") from exc
+
+        is_h3_template = code.startswith("H3_DIRECTOR_") or profile.get("provider") == (
+            DIRECTOR_SOURCE["provider"]
+        )
+        quality_profile = current.get("quality_profile")
+        if is_h3_template and (
+            not isinstance(quality_profile, str)
+            or not quality_profile
+            or profile.get("quality_profile") != quality_profile
+        ):
+            raise ValueError(f"workflow {code}/{version} quality profile is inconsistent")
+        if is_h3_template and (
+            profile.get("provider") != DIRECTOR_SOURCE["provider"]
+            or profile.get("provider_source") != DIRECTOR_SOURCE
+        ):
+            raise ValueError(f"workflow {code}/{version} provider source pin is invalid")
+
+        raw_slots = current.get("slots")
+        required_slots = current.get("required_slots", [])
+        if not isinstance(raw_slots, dict) or any(
+            not isinstance(binding, list)
+            or len(binding) != 2
+            or any(not isinstance(value, str) or not value for value in binding)
+            for binding in raw_slots.values()
+        ):
+            raise ValueError(f"workflow {code}/{version} slots must map to [node, input] strings")
+        if not isinstance(required_slots, list) or any(
+            not isinstance(name, str) or not name for name in required_slots
+        ):
+            raise ValueError(f"workflow {code}/{version} required_slots must be a string list")
+
         current["workflow"] = _read_workflow(directory, current)
         require_director_execution(
-            SimpleNamespace(workflow=current["workflow"], profile=current.get("profile", {}))
+            SimpleNamespace(workflow=current["workflow"], profile=profile)
         )
+        approved = ApprovedWorkflow(
+            mode=current.get("mode"),
+            version=version,
+            workflow=current["workflow"],
+            slots={name: (binding[0], binding[1]) for name, binding in raw_slots.items()},
+            required_slots=frozenset(required_slots),
+            execution_scope=current["execution_scope"],
+        )
+        approved.validate()
+        for name, actual in (
+            ("workflow_hash", approved.workflow_hash),
+            ("slot_map_hash", approved.slot_map_hash),
+        ):
+            if (is_h3_template and name not in profile) or (
+                name in profile and profile[name] != actual
+            ):
+                raise ValueError(f"workflow {code}/{version} {name} does not match content")
+        if is_h3_template:
+            validate_export_bindings(approved.workflow, profile)
+            WorkflowProfile.model_validate(profile)
         result.append(current)
     return result
 

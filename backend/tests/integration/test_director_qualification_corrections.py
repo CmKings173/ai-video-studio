@@ -188,9 +188,15 @@ async def test_capabilities_and_creation_filter_exact_executed_input(session_fac
         small = next(c for c in caps.combinations if c["aspect_ratio"] == "16:9")
         large = next(c for c in caps.combinations if c["aspect_ratio"] == "Custom")
         assert small["supports_refine"] and small["supports_face_refine"]
-        assert small["director_settings"] == [config]
+        assert config in small["director_settings"]
         assert not large["supports_refine"] and not large["supports_face_refine"]
-        assert large["director_settings"] == []
+        assert config not in large["director_settings"]
+        assert (large["native_width"], large["native_height"]) == (1728, 960)
+        assert (large["expected_output_width"], large["expected_output_height"]) == (1728, 960)
+        assert all(
+            not choice["refine"]["enabled"] and not choice["face_refine"]["enabled"]
+            for choice in large["director_settings"]
+        )
         service = GenerationService(
             Settings(_env_file=None, workspace_root=tmp_path, min_free_disk_bytes=0)
         )

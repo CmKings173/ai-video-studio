@@ -1,6 +1,7 @@
 import copy
 import hashlib
 from types import SimpleNamespace
+from uuid import NAMESPACE_URL, uuid5
 
 import pytest
 from sqlalchemy import select
@@ -62,22 +63,7 @@ async def seed_ready_video(session_factory):
             prompt="Scene one",
             duration_seconds=5,
         )
-        asset = Asset(
-            project_id=project.id,
-            kind="VIDEO",
-            role="GENERATED_VIDEO",
-            filename="scene.mp4",
-            content_type="video/mp4",
-            object_key=f"generated/{checksum}.mp4",
-            status="READY",
-            size_bytes=9,
-            checksum=checksum,
-            width=480,
-            height=864,
-            duration_seconds=5,
-            created_by=user.id,
-        )
-        session.add_all([scene, asset])
+        session.add(scene)
         await session.flush()
         generation = SceneGeneration(
             video_id=video.id,
@@ -92,12 +78,33 @@ async def seed_ready_video(session_factory):
                 "scene_revision": 1,
                 "generation_freshness": await capture_generation_freshness(session, scene, video),
             },
-            output_asset_id=asset.id,
             created_by=user.id,
         )
         session.add(generation)
         await session.flush()
+        asset = Asset(
+            id=str(uuid5(NAMESPACE_URL, f"ai-video-studio:GENERATED_VIDEO:{generation.id}")),
+            project_id=project.id,
+            kind="VIDEO",
+            role="GENERATED_VIDEO",
+            filename="scene.mp4",
+            content_type="video/mp4",
+            object_key=f"outputs/generated_video/{generation.id}/{checksum}.mp4",
+            status="READY",
+            size_bytes=9,
+            checksum=checksum,
+            width=480,
+            height=864,
+            duration_seconds=5,
+            resource_owner_id=user.id,
+            ownership_provenance="VIDEO_PARENT",
+            created_by=user.id,
+        )
+        session.add(asset)
+        await session.flush()
+        generation.output_asset_id = asset.id
         scene.selected_generation_id = generation.id
+        await session.flush()
         return user.id, video.id, scene.id
 
 

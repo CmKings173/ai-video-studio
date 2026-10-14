@@ -37,6 +37,7 @@ from apps.api.app.services.asset_claims import (
 )
 from apps.api.app.services.asset_retention import AssetRetentionService
 from apps.api.app.services.asset_service import has_durable_validation, upload_staging_key
+from apps.api.app.services.deletion_cleanup import DeletionCleanupService
 from workers.common import staging_directory
 
 logger = logging.getLogger(__name__)
@@ -78,6 +79,10 @@ class ReconciliationReport:
     repaired_assets: list[str] = field(default_factory=list)
     compensation_failures: list[str] = field(default_factory=list)
     skipped_claimed_assets: list[str] = field(default_factory=list)
+    deletion_cleanup_completed: list[str] = field(default_factory=list)
+    deletion_cleanup_pending: list[dict[str, str]] = field(default_factory=list)
+    deletion_cleanup_blocked: list[dict[str, str]] = field(default_factory=list)
+    deletion_cleanup_failed: list[dict[str, str]] = field(default_factory=list)
 
 
 class AssetReconciler:
@@ -86,6 +91,7 @@ class AssetReconciler:
         self.store = store
         self.settings = settings
         self.retention = AssetRetentionService(factory, store, settings)
+        self.deletion_cleanup = DeletionCleanupService(factory, settings)
         self.claim_timeout_seconds = int(
             getattr(settings, "asset_operation_claim_timeout_seconds", 900)
         )
@@ -597,6 +603,20 @@ class AssetReconciler:
 
     async def run_once(self) -> bool:
         report = await self.run()
+        try:
+            deletion_report = await self.deletion_cleanup.run()
+            report.deletion_cleanup_completed.extend(deletion_report.completed)
+            report.deletion_cleanup_pending.extend(deletion_report.pending)
+            report.deletion_cleanup_blocked.extend(deletion_report.blocked)
+            report.deletion_cleanup_failed.extend(deletion_report.failed)
+        except Exception as exc:
+            logger.warning(
+                "deletion_cleanup_reconciliation_failed",
+                extra={"error_type": type(exc).__name__},
+            )
+            report.deletion_cleanup_failed.append(
+                {"operation_id": "", "error_code": "CLEANUP_LOOP_FAILURE"}
+            )
         await self.cleanup_staging()
         await self.cleanup_assets()
         if (
@@ -607,6 +627,9 @@ class AssetReconciler:
             or report.repaired_assets
             or report.compensation_failures
             or report.skipped_claimed_assets
+            or report.deletion_cleanup_pending
+            or report.deletion_cleanup_blocked
+            or report.deletion_cleanup_failed
         ):
             logger.warning(
                 "asset_reconciliation_drift",
@@ -618,6 +641,10 @@ class AssetReconciler:
                     "repaired_assets": report.repaired_assets,
                     "compensation_failures": report.compensation_failures,
                     "skipped_claimed_assets": report.skipped_claimed_assets,
+                    "deletion_cleanup_completed": report.deletion_cleanup_completed,
+                    "deletion_cleanup_pending": report.deletion_cleanup_pending,
+                    "deletion_cleanup_blocked": report.deletion_cleanup_blocked,
+                    "deletion_cleanup_failed": report.deletion_cleanup_failed,
                 },
             )
         return False

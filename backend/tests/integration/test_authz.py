@@ -5,11 +5,14 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import httpx
+import jwt
 import pytest
+from sqlalchemy import event, func, select
 
 from apps.api.app.core.config import get_settings
 from apps.api.app.core.login_throttle import login_throttle
 from apps.api.app.core.security import hash_password
+from apps.api.app.db.models import Session as AuthSession
 from apps.api.app.db.models import User
 from apps.api.app.db.session import get_session
 from apps.api.app.main import app
@@ -23,7 +26,13 @@ def clean_login_throttle():
 
 
 @asynccontextmanager
-async def api_client(session_factory, *, client=("127.0.0.1", 12345)):
+async def api_client(
+    session_factory,
+    *,
+    client=("127.0.0.1", 12345),
+    cookie_secure: bool = False,
+    jwt_expiration_seconds: int = 2_592_000,
+):
     async def session_override():
         async with session_factory() as session:
             try:
@@ -34,9 +43,12 @@ async def api_client(session_factory, *, client=("127.0.0.1", 12345)):
                 raise
 
     settings = SimpleNamespace(
-        session_cookie_name="studio_session",
-        session_hours=24,
-        cookie_secure=False,
+        auth_cookie_name="studio_session",
+        jwt_secret="integration-test-only-signing-secret-with-at-least-32-bytes",
+        jwt_issuer="ai-video-studio-tests",
+        jwt_audience="ai-video-studio-api-tests",
+        jwt_expiration_seconds=jwt_expiration_seconds,
+        cookie_secure=cookie_secure,
         csrf_header_name="X-CSRF-Token",
     )
     app.dependency_overrides[get_session] = session_override
@@ -63,7 +75,7 @@ async def seed_user(session_factory, *, email: str, password: str, role: str = "
 
 
 @pytest.mark.asyncio
-async def test_login_preserves_password_whitespace_and_returns_opaque_cookie(
+async def test_login_preserves_password_whitespace_and_returns_jwt_cookie(
     session_factory,
 ):
     await seed_user(
@@ -83,7 +95,57 @@ async def test_login_preserves_password_whitespace_and_returns_opaque_cookie(
         cookie = response.headers["set-cookie"]
         assert "HttpOnly" in cookie
         assert "SameSite=strict" in cookie
+        assert "Max-Age=2592000" in cookie
+        assert "Path=/" in cookie
+        jwt_cookie = cookie.split(";", 1)[0].split("=", 1)[1]
+        assert jwt_cookie.count(".") == 2
+        assert "access_token" not in response.json()
         assert "correct horse" not in cookie
+
+
+@pytest.mark.asyncio
+async def test_custom_jwt_lifetime_matches_cookie_max_age(session_factory):
+    lifetime = 7_200
+    await seed_user(
+        session_factory,
+        email="custom-expiry@example.test",
+        password="correct horse battery",
+    )
+    async with api_client(session_factory, jwt_expiration_seconds=lifetime) as client:
+        response = await client.post(
+            "/api/v1/auth/login",
+            json={"email": "custom-expiry@example.test", "password": "correct horse battery"},
+        )
+
+    assert response.status_code == 200
+    cookie = response.headers["set-cookie"]
+    assert f"Max-Age={lifetime}" in cookie
+    token = cookie.split(";", 1)[0].split("=", 1)[1]
+    claims = jwt.decode(
+        token,
+        "integration-test-only-signing-secret-with-at-least-32-bytes",
+        algorithms=["HS256"],
+        issuer="ai-video-studio-tests",
+        audience="ai-video-studio-api-tests",
+    )
+    assert claims["exp"] - claims["iat"] == lifetime
+
+
+@pytest.mark.asyncio
+async def test_secure_cookie_flag_follows_configuration(session_factory):
+    await seed_user(
+        session_factory,
+        email="secure@example.test",
+        password="correct horse battery",
+    )
+    async with api_client(session_factory, cookie_secure=True) as client:
+        response = await client.post(
+            "/api/v1/auth/login",
+            json={"email": "secure@example.test", "password": "correct horse battery"},
+        )
+
+    assert response.status_code == 200
+    assert "Secure" in response.headers["set-cookie"]
 
 
 @pytest.mark.asyncio
@@ -168,7 +230,7 @@ async def test_repeated_failed_logins_are_throttled_without_account_enumeration(
 
 
 @pytest.mark.asyncio
-async def test_logout_requires_csrf_and_revokes_server_session(session_factory):
+async def test_logout_clears_cookie_without_revoking_a_copied_access_token(session_factory):
     await seed_user(
         session_factory,
         email="editor@example.test",
@@ -181,10 +243,187 @@ async def test_logout_requires_csrf_and_revokes_server_session(session_factory):
         )
         csrf = login.json()["csrf_token"]
         assert (await client.post("/api/v1/auth/logout")).status_code == 403
-        assert (
-            await client.post("/api/v1/auth/logout", headers={"X-CSRF-Token": csrf})
-        ).status_code == 204
+        logout = await client.post("/api/v1/auth/logout", headers={"X-CSRF-Token": csrf})
+        assert logout.status_code == 204
+        assert "Max-Age=0" in logout.headers["set-cookie"]
+        assert "HttpOnly" in logout.headers["set-cookie"]
+        assert "SameSite=strict" in logout.headers["set-cookie"]
         assert (await client.get("/api/v1/auth/me")).status_code == 401
+        copied_token = login.headers["set-cookie"].split(";", 1)[0].split("=", 1)[1]
+        client.cookies.set("studio_session", copied_token)
+        assert (await client.get("/api/v1/auth/me")).status_code == 200
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stale_cookie", ["expired-jwt", "pre-jwt-opaque"])
+async def test_logout_clears_expired_or_pre_jwt_cookie(session_factory, stale_cookie):
+    if stale_cookie == "expired-jwt":
+        stale_cookie = jwt.encode(
+            {
+                "sub": "00000000-0000-0000-0000-000000000001",
+                "role": "EDITOR",
+                "iss": "ai-video-studio-tests",
+                "aud": "ai-video-studio-api-tests",
+                "iat": 1,
+                "exp": 2,
+                "csrf": "expired-token-csrf-value-that-is-long-enough",
+            },
+            "integration-test-only-signing-secret-with-at-least-32-bytes",
+            algorithm="HS256",
+        )
+
+    async with api_client(session_factory) as client:
+        client.cookies.set("studio_session", stale_cookie)
+        response = await client.post("/api/v1/auth/logout")
+
+    assert response.status_code == 204
+    assert "Max-Age=0" in response.headers["set-cookie"]
+    assert "HttpOnly" in response.headers["set-cookie"]
+    assert "SameSite=strict" in response.headers["set-cookie"]
+
+
+@pytest.mark.asyncio
+async def test_login_and_authenticated_request_never_read_or_write_session_rows(session_factory):
+    await seed_user(
+        session_factory,
+        email="stateless@example.test",
+        password="correct horse battery",
+    )
+    statements: list[str] = []
+    engine = session_factory.kw["bind"].sync_engine
+
+    def capture_sql(_connection, _cursor, statement, _parameters, _context, _executemany):
+        statements.append(statement.lower())
+
+    event.listen(engine, "before_cursor_execute", capture_sql)
+    try:
+        async with api_client(session_factory) as client:
+            login = await client.post(
+                "/api/v1/auth/login",
+                json={"email": "stateless@example.test", "password": "correct horse battery"},
+            )
+            assert login.status_code == 200
+            statements.clear()
+            response = await client.get("/api/v1/projects")
+            assert response.status_code == 200
+    finally:
+        event.remove(engine, "before_cursor_execute", capture_sql)
+
+    assert not any("sessions" in statement for statement in statements)
+    async with session_factory() as session:
+        assert await session.scalar(select(func.count()).select_from(AuthSession)) == 0
+
+
+@pytest.mark.asyncio
+async def test_csrf_token_from_another_jwt_is_rejected(session_factory):
+    await seed_user(
+        session_factory,
+        email="first@example.test",
+        password="correct horse battery",
+    )
+    await seed_user(
+        session_factory,
+        email="second@example.test",
+        password="correct horse battery",
+    )
+    async with api_client(session_factory) as first, api_client(session_factory) as second:
+        first_login = await first.post(
+            "/api/v1/auth/login",
+            json={"email": "first@example.test", "password": "correct horse battery"},
+        )
+        second_login = await second.post(
+            "/api/v1/auth/login",
+            json={"email": "second@example.test", "password": "correct horse battery"},
+        )
+        assert first_login.status_code == second_login.status_code == 200
+
+        rejected = await second.post(
+            "/api/v1/projects",
+            json={"name": "Cross-token", "description": ""},
+            headers={"X-CSRF-Token": first_login.json()["csrf_token"]},
+        )
+        accepted = await second.post(
+            "/api/v1/projects",
+            json={"name": "Same-token", "description": ""},
+            headers={"X-CSRF-Token": second_login.json()["csrf_token"]},
+        )
+
+        assert rejected.status_code == 403
+        assert rejected.json()["error"]["code"] == "CSRF_INVALID"
+        assert accepted.status_code == 201
+
+
+@pytest.mark.asyncio
+async def test_inactive_user_cannot_log_in(session_factory):
+    user_id = await seed_user(
+        session_factory,
+        email="inactive@example.test",
+        password="correct horse battery",
+    )
+    async with session_factory() as session, session.begin():
+        user = await session.get(User, user_id)
+        user.is_active = False
+
+    async with api_client(session_factory) as client:
+        response = await client.post(
+            "/api/v1/auth/login",
+            json={"email": "inactive@example.test", "password": "correct horse battery"},
+        )
+
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "ACCOUNT_DISABLED"
+
+
+@pytest.mark.asyncio
+async def test_issued_jwt_is_revoked_after_account_is_disabled(session_factory):
+    user_id = await seed_user(
+        session_factory,
+        email="disable-after-login@example.test",
+        password="correct horse battery",
+    )
+    async with api_client(session_factory) as client:
+        login = await client.post(
+            "/api/v1/auth/login",
+            json={
+                "email": "disable-after-login@example.test",
+                "password": "correct horse battery",
+            },
+        )
+        assert login.status_code == 200
+        async with session_factory() as session, session.begin():
+            user = await session.get(User, user_id)
+            user.is_active = False
+
+        response = await client.get("/api/v1/projects")
+
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "AUTH_REQUIRED"
+
+
+@pytest.mark.asyncio
+async def test_me_rejects_a_valid_jwt_when_the_user_record_no_longer_exists(session_factory):
+    user_id = await seed_user(
+        session_factory,
+        email="deleted-after-login@example.test",
+        password="correct horse battery",
+    )
+    async with api_client(session_factory) as client:
+        login = await client.post(
+            "/api/v1/auth/login",
+            json={
+                "email": "deleted-after-login@example.test",
+                "password": "correct horse battery",
+            },
+        )
+        assert login.status_code == 200
+        async with session_factory() as session, session.begin():
+            user = await session.get(User, user_id)
+            await session.delete(user)
+
+        response = await client.get("/api/v1/auth/me")
+
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "AUTH_REQUIRED"
 
 
 @pytest.mark.asyncio

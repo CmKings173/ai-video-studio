@@ -8,13 +8,27 @@ function setup() {
   ] };
   const sent = [];
   const actual = loadTypeScript("lib/api/generations.ts");
+  let hookCursor = 0;
+  const hookRefs = [];
+  const hookReact = {
+    useRef(initial) {
+      const index = hookCursor++;
+      return hookRefs[index] ??= { current: initial };
+    },
+    useCallback: callback => callback,
+  };
+  const actionModule = loadTypeScript("lib/hooks/use-generate-all-action.ts", { react: hookReact });
+  hookCursor = 0;
+  const action = actionModule.useGenerateAllAction();
   const harness = pageHarness(video, {
     "@/lib/api/generations": { ...actual, generateAll: async (...args) => { sent.push(args); throw new TypeError("lost response"); } },
+    "@/lib/hooks/use-generate-all-action": { useGenerateAllAction: () => action },
   });
   const page = loadTypeScript("app/videos/[videoId]/page.tsx", harness.mocks).default;
   const submit = async () => {
+    const input = await action.prepare(video, async () => video);
     harness.render(page, { videoId: video.id });
-    await assert.rejects(harness.mutations.at(-1).mutationFn(), /lost response/);
+    await assert.rejects(harness.mutations.at(-1).mutationFn(input), /lost response/);
     return sent.at(-1);
   };
   return { video, submit };

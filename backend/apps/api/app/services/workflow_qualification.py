@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field, StrictBool, ValidationError, 
 from apps.api.app.core.errors import AppError
 
 SHA256 = Annotated[str, Field(pattern=r"^[a-f0-9]{64}$")]
+REVISION = Annotated[str, Field(pattern=r"^[a-f0-9]{40,64}$")]
 
 
 class MeasuredOutput(BaseModel):
@@ -19,10 +20,23 @@ class MeasuredOutput(BaseModel):
     height: int = Field(gt=0, strict=True)
     fps: float = Field(gt=0, strict=True)
     duration_seconds: float = Field(gt=0, strict=True)
+    frame_count: int = Field(gt=0, strict=True)
+    video_codec: str = Field(min_length=1, strict=True)
+    container: str = Field(min_length=1, strict=True)
     has_video: StrictBool
     has_audio: StrictBool
+    audio_sample_rate: int = Field(gt=0, strict=True)
+    audio_channels: int = Field(gt=0, strict=True)
+    audio_codec: str = Field(min_length=1, strict=True)
     checksum: SHA256
     size_bytes: int = Field(gt=0, strict=True)
+
+    @field_validator("video_codec", "container", "audio_codec")
+    @classmethod
+    def media_formats_are_named(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("measured media format must be named")
+        return value
 
 
 class ExecutionEvidence(BaseModel):
@@ -35,8 +49,26 @@ class ExecutionEvidence(BaseModel):
     model_hash: SHA256
     lora_hashes: dict[str, SHA256]
     comfyui_commit: str = Field(pattern=r"^[a-f0-9]{40,64}$")
+    studio_revision: REVISION
+    director_repository: str = Field(min_length=1, strict=True)
+    director_commit: REVISION
+    comfyui_version: str = Field(min_length=1, strict=True)
+    execution_spec_hash: SHA256
+    gpu_model: str = Field(min_length=1, strict=True)
+    gpu_count: int = Field(gt=0, strict=True)
+    driver_version: str = Field(min_length=1, strict=True)
+    cuda_runtime: str = Field(min_length=1, strict=True)
     custom_node_versions: dict[str, str]
     output: MeasuredOutput
+
+    @field_validator(
+        "director_repository", "comfyui_version", "gpu_model", "driver_version", "cuda_runtime"
+    )
+    @classmethod
+    def runtime_identity_is_named(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("runtime identity must be named")
+        return value
 
     @field_validator("tested_at")
     @classmethod
@@ -81,6 +113,28 @@ def qualification_status(
         return QualificationStatus(
             False, "STATIC_VALIDATED", "Executed evidence belongs to different workflow or slots"
         )
+    if profile.get("execution_spec_hash") != evidence.execution_spec_hash:
+        return QualificationStatus(
+            False,
+            "STATIC_VALIDATED",
+            "Executed DirectorExecutionSpec differs from qualification target",
+        )
+    if profile.get("studio_revision") != evidence.studio_revision:
+        return QualificationStatus(
+            False, "STATIC_VALIDATED", "Executed Studio revision differs from qualification target"
+        )
+    if profile.get("comfyui_version") != evidence.comfyui_version:
+        return QualificationStatus(
+            False, "STATIC_VALIDATED", "Executed ComfyUI version differs from qualification target"
+        )
+    provider_source = profile.get("provider_source")
+    if not isinstance(provider_source, dict) or (
+        provider_source.get("repository") != evidence.director_repository
+        or provider_source.get("commit") != evidence.director_commit
+    ):
+        return QualificationStatus(
+            False, "STATIC_VALIDATED", "Executed Director source differs from qualification target"
+        )
     if not evidence.output.has_video or not evidence.output.has_audio:
         return QualificationStatus(
             False, "STATIC_VALIDATED", "Executed H3 output must contain measured video and audio"
@@ -114,6 +168,62 @@ def qualification_status(
             False, "STATIC_VALIDATED", "Executed custom-node versions differ from profile"
         )
     return QualificationStatus(True, "POC_EXECUTED", None, evidence)
+
+
+def qualification_for_combination(
+    profile: dict[str, Any],
+    workflow_hash: str,
+    slot_map_hash: str,
+    *,
+    mode: str,
+    quality_profile: str,
+    aspect_ratio: str,
+) -> tuple[QualificationStatus, dict[str, Any] | None]:
+    """Return the executed combination for one exact mode/profile/ratio request.
+
+    A profile-level PoC does not by itself prove every advertised combination.
+    Ambiguous duplicate evidence is rejected instead of selecting by list order.
+    """
+    status = qualification_status(profile, workflow_hash, slot_map_hash)
+    if not status.qualified:
+        return status, None
+
+    execution_evidence = profile.get("execution_evidence")
+    combinations = (
+        execution_evidence.get("combinations")
+        if isinstance(execution_evidence, dict)
+        else None
+    )
+    if not isinstance(combinations, list):
+        return (
+            QualificationStatus(
+                False,
+                "STATIC_VALIDATED",
+                "Executed mode/profile/ratio combinations are missing",
+                status.evidence,
+            ),
+            None,
+        )
+
+    matches = [
+        value
+        for value in combinations
+        if isinstance(value, dict)
+        and value.get("mode") == mode
+        and value.get("quality_profile") == quality_profile
+        and value.get("aspect_ratio") == aspect_ratio
+    ]
+    if len(matches) != 1:
+        reason = (
+            "Executed evidence contains an ambiguous duplicate for the requested combination"
+            if matches
+            else "No executed evidence matches the requested mode, quality profile and aspect ratio"
+        )
+        return (
+            QualificationStatus(False, "STATIC_VALIDATED", reason, status.evidence),
+            None,
+        )
+    return status, matches[0]
 
 
 def require_qualified(

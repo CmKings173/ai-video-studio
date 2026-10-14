@@ -5,7 +5,7 @@ PostgreSQL and MinIO environment was not available during implementation.
 
 | ID | Acceptance check | Expected evidence | Status |
 | --- | --- | --- | --- |
-| UAT-01 | editor login, CSRF and logout revocation | HTTP transcript with no secret values | NOT_RUN |
+| UAT-01 | editor login, JWT-bound CSRF and logout cookie clearing | HTTP transcript with no secret values | NOT_RUN |
 | UAT-02 | create project/video, edit with stale `If-Match` | 412 structured error | NOT_RUN |
 | UAT-03 | upload, interrupted completion, reconciliation | asset reaches READY and checksum matches | NOT_RUN |
 | UAT-04 | H3 t2v/i2v/i2v-first-last/r2v execution | `docs/h3-poc/results.json` with executed PASS and model/custom-node hashes | NOT_RUN |

@@ -40,6 +40,9 @@ def qualified_record():
         if x["code"] == "H3_DIRECTOR_T2V_BASE"
     )
     approved.slots.update({key: tuple(value) for key, value in entry["slots"].items()})
+    profile["studio_revision"] = "1" * 40
+    profile["comfyui_version"] = "0.3.50-test"
+    profile["execution_spec_hash"] = spec.execution_hash
     profile["weight_hashes"] = {
         value: "a" * 64
         for node in graph.values()
@@ -51,6 +54,11 @@ def qualified_record():
     evidence.update(
         workflow_hash=approved.workflow_hash,
         slot_map_hash=approved.slot_map_hash,
+        studio_revision=profile["studio_revision"],
+        director_repository=profile["provider_source"]["repository"],
+        director_commit=profile["provider_source"]["commit"],
+        comfyui_version=profile["comfyui_version"],
+        execution_spec_hash=spec.execution_hash,
         weight_hashes=deepcopy(profile["weight_hashes"]),
         dependency_versions=deepcopy(profile["dependency_versions"]),
         profile_hash=profile_hash(profile),

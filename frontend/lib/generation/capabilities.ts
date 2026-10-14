@@ -1,5 +1,9 @@
 import { translateText as t } from "@/lib/i18n";
-import type { AssetDTO, GenerationCapabilitiesDTO, GenerationCapability, GenerationMode, GenerationRequest } from "@/lib/api/types";
+import type { AssetDTO, GenerationCapabilitiesDTO, GenerationCapability, GenerationMode, GenerationRequest, ResolvedGenerationConfiguration } from "@/lib/api/types";
+
+export function isGenerationConfigurationHash(value: unknown): value is string {
+  return typeof value === "string" && /^[a-fA-F0-9]{64}$/.test(value);
+}
 
 export function qualifiedCombinations(caps: GenerationCapabilitiesDTO | undefined): GenerationCapability[] {
   if (!caps) return [];
@@ -22,16 +26,135 @@ export function deriveMode(input: Pick<GenerationRequest,
   return "t2v";
 }
 
+/**
+ * AUTO keeps compatible input modes discoverable until the user has chosen a
+ * kind of source. Once inputs identify a route, discovery narrows to routes
+ * that can still accept that source (for example v2v/rv2v for a source video).
+ */
+function discoveryModes(input: GenerationRequest): GenerationMode[] {
+  if (input.mode && input.mode !== "AUTO") return [input.mode];
+  if (input.source_video_asset_id) {
+    return hasReferences(input) ? ["rv2v"] : ["v2v", "rv2v"];
+  }
+  if (hasReferences(input)) return ["r2v"];
+  if (input.first_frame_asset_id && input.last_frame_asset_id) return ["i2v_first_last"];
+  if (input.first_frame_asset_id) return ["i2v", "i2v_first_last"];
+  if (input.last_frame_asset_id) return ["i2v_last", "i2v_first_last"];
+  return ["t2v", "i2v", "i2v_last", "i2v_first_last", "r2v", "v2v", "rv2v"];
+}
+
+function hasReferences(input: GenerationRequest): boolean {
+  return Boolean(input.reference_image_asset_ids?.length || input.reference_video_asset_ids?.length
+    || input.reference_audio_asset_ids?.length);
+}
+
+function capabilitySupportsMode(capability: GenerationCapability, mode: GenerationMode): boolean {
+  return capabilityModeMatches(capability.mode, mode);
+}
+
+function capabilityModeMatches(capabilityMode: GenerationMode, mode: GenerationMode): boolean {
+  return capabilityMode === mode
+    || (capabilityMode === "fl2v" && ["i2v_last", "i2v_first_last"].includes(mode));
+}
+
+export function capabilityRunnable(capability: GenerationCapability): boolean {
+  return (capability as GenerationCapability & { runnable?: boolean }).runnable !== false;
+}
+
 /** The editor and execution resolver use the same qualified scope/mode/profile/ratio filter. */
-export function matchingQualifiedCapabilities(caps: GenerationCapabilitiesDTO | undefined, input: GenerationRequest, scope: "single_scene" | "aggregate", matchCustomDimensions = true): GenerationCapability[] {
+export function matchingQualifiedCapabilities(caps: GenerationCapabilitiesDTO | undefined, input: GenerationRequest, scope: "single_scene" | "aggregate", matchDimensions = true): GenerationCapability[] {
   const mode = input.mode && input.mode !== "AUTO" ? input.mode : deriveMode(input);
-  return caps?.available ? qualifiedCombinations(caps).filter((item) => (item.mode === mode
-    || (item.mode === "fl2v" && ["i2v_last", "i2v_first_last"].includes(mode)))
+  return caps?.available ? qualifiedCombinations(caps).filter((item) => capabilitySupportsMode(item, mode)
+    && capabilityRunnable(item)
     && item.quality_profile === (input.quality_profile ?? "STANDARD")
     && item.aspect_ratio === input.aspect_ratio
     && item.execution_scope === scope
-    && (input.aspect_ratio !== "Custom" || !matchCustomDimensions || (input.width === item.resolved_width && input.height === item.resolved_height))
+    && (!matchDimensions || (input.width == null && input.height == null)
+      || (input.width === item.resolved_width && input.height === item.resolved_height))
     && (input.workflow_id == null || item.workflow_id === input.workflow_id)) : [];
+}
+
+/** Options for controls that precede final AUTO task resolution, such as exact
+ * native canvas and workflow discovery. */
+export function qualifiedDiscoveryCapabilities(
+  caps: GenerationCapabilitiesDTO | undefined,
+  input: GenerationRequest,
+  scope: "single_scene" | "aggregate",
+  matchDimensions = true,
+): GenerationCapability[] {
+  if (!caps?.available) return [];
+  const modes = discoveryModes(input);
+  return qualifiedCombinations(caps).filter((item) => capabilityRunnable(item)
+    && modes.some((mode) => capabilitySupportsMode(item, mode))
+    && item.quality_profile === (input.quality_profile ?? "STANDARD")
+    && item.aspect_ratio === input.aspect_ratio
+    && item.execution_scope === scope
+    && (!matchDimensions || (input.width == null && input.height == null)
+      || (input.width === item.resolved_width && input.height === item.resolved_height))
+    && (input.workflow_id == null || item.workflow_id === input.workflow_id));
+}
+
+/** Quality choices are drawn only from qualified combinations compatible with
+ * the current mode/input discovery state, not from display labels or defaults. */
+export function qualifiedQualityProfiles(
+  caps: GenerationCapabilitiesDTO | undefined,
+  input: GenerationRequest,
+  scope: "single_scene" | "aggregate",
+): string[] {
+  if (!caps?.available) return [];
+  const modes = discoveryModes(input);
+  return Array.from(new Set(qualifiedCombinations(caps)
+    .filter((item) => capabilityRunnable(item)
+      && modes.some((mode) => capabilitySupportsMode(item, mode))
+      && item.aspect_ratio === input.aspect_ratio
+      && item.execution_scope === scope
+      && (input.workflow_id == null || item.workflow_id === input.workflow_id))
+    .map((item) => item.quality_profile)));
+}
+
+/** A preview is usable only when its server resolution still matches a live,
+ * qualified capability and the execution-relevant request the user reviewed. */
+export function resolvedConfigurationMatchesRequest(
+  resolved: ResolvedGenerationConfiguration | null | undefined,
+  input: GenerationRequest,
+  scope: "single_scene" | "aggregate",
+  caps: GenerationCapabilitiesDTO | undefined,
+): boolean {
+  if (!caps?.available || !resolved?.runnable || !resolved.workflow_id || !resolved.resolved_mode
+    || !resolved.quality_profile || !resolved.aspect_ratio || !resolved.execution_scope
+    || !resolved.workflow_version || !resolved.workflow_hash
+    || !resolved.profile_hash
+    || !isGenerationConfigurationHash(resolved.configuration_hash)
+    || resolved.native_width == null || resolved.native_height == null) return false;
+
+  if (resolved.execution_scope !== scope
+    || resolved.quality_profile !== (input.quality_profile ?? "STANDARD")
+    || resolved.aspect_ratio !== input.aspect_ratio
+    || (input.workflow_id != null && resolved.workflow_id !== input.workflow_id)
+    || ((input.width != null || input.height != null)
+      && (resolved.native_width !== input.width || resolved.native_height !== input.height))
+    || (input.seed_policy != null && resolved.seed_policy !== input.seed_policy)
+    || (input.seed_policy === "FIXED" && resolved.fixed_seed_or_null !== input.seed)) return false;
+
+  if (input.mode && input.mode !== "AUTO" && !capabilityModeMatches(resolved.resolved_mode, input.mode)) {
+    return false;
+  }
+  if (input.mode && input.mode !== "AUTO" && resolved.requested_mode
+    && resolved.requested_mode !== input.mode) return false;
+
+  return qualifiedCombinations(caps).some((item) => capabilityRunnable(item)
+    && item.workflow_id === resolved.workflow_id
+    && item.mode === resolved.resolved_mode
+    && item.quality_profile === resolved.quality_profile
+    && item.aspect_ratio === resolved.aspect_ratio
+    && item.execution_scope === resolved.execution_scope
+    && item.workflow_version === resolved.workflow_version
+    && item.workflow_hash === resolved.workflow_hash
+    // Capability DTOs use a discovery duration/default seed. Compare the stable
+    // workflow profile identity, not the scene-specific resolved configuration hash.
+    && item.resolved_configuration?.profile_hash === resolved.profile_hash
+    && item.resolved_width === resolved.native_width
+    && item.resolved_height === resolved.native_height);
 }
 
 function capabilityForScope(caps: GenerationCapabilitiesDTO | undefined, input: GenerationRequest, scope: "single_scene" | "aggregate"): GenerationCapability | null {

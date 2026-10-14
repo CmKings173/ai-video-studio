@@ -40,7 +40,7 @@ async def editor_clients(stack):
     return clients
 
 
-async def test_five_sessions_stay_distinct_when_one_editor_is_throttled(session_factory):
+async def test_five_editor_tokens_stay_distinct_when_one_editor_is_throttled(session_factory):
     emails = [f"fixture-editor-{index}@example.test" for index in range(5)]
     user_ids = [
         await seed_user(session_factory, email=email, password=PASSWORD) for email in emails
@@ -49,6 +49,9 @@ async def test_five_sessions_stay_distinct_when_one_editor_is_throttled(session_
         app.dependency_overrides[get_settings] = lambda: Settings(
             _env_file=None,
             internal_proxy_token=TOKEN,
+            jwt_secret="five-editor-integration-signing-secret-at-least-32-bytes",
+            jwt_issuer="ai-video-studio-tests",
+            jwt_audience="ai-video-studio-api-tests",
             cookie_secure=False,
         )
         clients = await editor_clients(stack)
@@ -120,6 +123,9 @@ async def test_five_trusted_ips_cannot_bypass_shared_identity_throttle(session_f
         app.dependency_overrides[get_settings] = lambda: Settings(
             _env_file=None,
             internal_proxy_token=TOKEN,
+            jwt_secret="five-editor-integration-signing-secret-at-least-32-bytes",
+            jwt_issuer="ai-video-studio-tests",
+            jwt_audience="ai-video-studio-api-tests",
             cookie_secure=False,
         )
         clients = await editor_clients(stack)

@@ -3,7 +3,7 @@ import hashlib
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import event, select
 
 from apps.api.app.core.errors import AppError
 from apps.api.app.db.models import Asset, Project, Scene, WorkflowRecord
@@ -95,6 +95,7 @@ async def test_reference_prompt_and_variation_assets_remain_frozen(session_facto
         )
         parent.status = "COMPLETED"
         original = copy.deepcopy(parent.input_snapshot)
+        # An unchanged variation accepts the real parent's resolved configuration contract.
         asset = await session.get(Asset, ids[0])
         asset.media_metadata = {"new_observation": "must not replace frozen parent metadata"}
         scene = await session.get(Scene, scene_id)
@@ -109,6 +110,7 @@ async def test_reference_prompt_and_variation_assets_remain_frozen(session_facto
                 operation="VARIATION",
                 parent_generation_id=parent.id,
                 execution_prompt=accepted,
+                preview_configuration_hash=original["resolved_configuration_hash"],
                 source_scene_revision=scene.revision,
                 source_video_revision=video.revision,
             ),
@@ -167,14 +169,28 @@ async def test_old_snapshot_regeneration_uses_new_seed_when_lock_unknown(session
 
 
 @pytest.mark.asyncio
-async def test_pre_migration_batch_key_replays_only_original_inputs(session_factory, tmp_path):
-    from apps.api.app.api.generations import generate_all
+async def test_preview_bound_older_batch_fingerprint_replays_only_original_inputs(
+    session_factory, tmp_path
+):
+    from apps.api.app.api.generations import generate_all, preview_generate_all
     from apps.api.app.db.models import IdempotencyKey, User, Video
     from apps.api.app.schemas.api import GenerateAll
     from apps.api.app.services.idempotency import payload_hash
 
     user, scene_id = await seed(session_factory)
     payload = GenerateAll()
+    async with session_factory() as session:
+        scene = await session.get(Scene, scene_id)
+        manifest = await preview_generate_all(
+            scene.video_id,
+            payload,
+            user=await session.get(User, user),
+            session=session,
+            settings=settings(tmp_path),
+        )
+    payload = GenerateAll(settings={
+        "preview_configuration_hash": manifest["preview_configuration_hash"]
+    })
     async with session_factory() as session, session.begin():
         scene = await session.get(Scene, scene_id)
         video = await session.get(Video, scene.video_id)
@@ -192,6 +208,8 @@ async def test_pre_migration_batch_key_replays_only_original_inputs(session_fact
         saved["_batch"]["inputs"]["scenes"][0]["generation_config"] = None
         legacy = {
             "settings": {
+                # Older full-default fingerprint, still bound to the accepted preview.
+                "preview_configuration_hash": manifest["preview_configuration_hash"],
                 "workflow_id": None,
                 "mode": None,
                 "operation": "ORIGINAL",
@@ -225,16 +243,161 @@ async def test_pre_migration_batch_key_replays_only_original_inputs(session_fact
             settings=settings(tmp_path),
         )
         assert replay == dto
-        with pytest.raises(AppError):
+        with pytest.raises(AppError) as error:
             await generate_all(
                 video.id,
-                GenerateAll(settings={"quality_profile": "HIGH"}),
+                payload.model_copy(update={
+                    "settings": payload.settings.model_copy(update={"quality_profile": "HIGH"})
+                }),
                 request=SimpleNamespace(state=SimpleNamespace()),
                 key="historical",
                 user=await session.get(User, user),
                 session=session,
                 settings=settings(tmp_path),
             )
+        assert error.value.code == "IDEMPOTENCY_KEY_REUSED"
+        assert error.value.status_code == 409
+        # Missing acceptance is a separate request change from changing quality.
+        with pytest.raises(AppError) as missing_hash:
+            await generate_all(
+                video.id,
+                GenerateAll(),
+                request=SimpleNamespace(state=SimpleNamespace()),
+                key="historical",
+                user=await session.get(User, user),
+                session=session,
+                settings=settings(tmp_path),
+            )
+        assert missing_hash.value.code == "IDEMPOTENCY_KEY_REUSED"
+        assert missing_hash.value.status_code == 409
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fingerprint", ["older_defaults", "matching_request"])
+async def test_unbound_historical_batch_key_fails_closed_without_writes(
+    session_factory, tmp_path, fingerprint
+):
+    from apps.api.app.api.generations import generate_all, preview_generate_all
+    from apps.api.app.db.models import IdempotencyKey, SceneGeneration, User, Video
+    from apps.api.app.schemas.api import GenerateAll
+    from apps.api.app.services.generation_intent import stable_hash
+    from apps.api.app.services.idempotency import payload_hash
+
+    user, scene_id = await seed(session_factory)
+    payload = GenerateAll()
+    async with session_factory() as session:
+        scene = await session.get(Scene, scene_id)
+        video_id = scene.video_id
+        manifest = await preview_generate_all(
+            video_id,
+            payload,
+            user=await session.get(User, user),
+            session=session,
+            settings=settings(tmp_path),
+        )
+    async with session_factory() as session, session.begin():
+        await generate_all(
+            video_id,
+            GenerateAll(settings={
+                "preview_configuration_hash": manifest["preview_configuration_hash"]
+            }),
+            request=SimpleNamespace(state=SimpleNamespace()),
+            key="unbound-historical",
+            user=await session.get(User, user),
+            session=session,
+            settings=settings(tmp_path),
+        )
+        key = await session.scalar(select(IdempotencyKey))
+        saved = copy.deepcopy(key.response)
+        saved["_batch"].pop("preview")
+        preview_fields = {
+            "resolved_configuration", "resolved_configuration_hash",
+            "preview_configuration_hash", "batch_preview_configuration_hash",
+        }
+        for entry in saved["generations"]:
+            snapshot = {
+                name: value for name, value in entry["input_snapshot"].items()
+                if name not in preview_fields | {"semantic_hash"}
+            }
+            snapshot["semantic_hash"] = stable_hash(snapshot)
+            entry["input_snapshot"] = snapshot
+            generation = await session.get(SceneGeneration, entry["id"])
+            generation.input_snapshot = copy.deepcopy(snapshot)
+        assert "preview" not in saved["_batch"]
+        assert all(
+            not preview_fields.intersection(entry["input_snapshot"])
+            for entry in saved["generations"]
+        )
+        if fingerprint == "older_defaults":
+            # The pre-preview full-default request really had no preview hash field.
+            older_fields = (
+                "workflow_id", "mode", "operation", "parent_generation_id",
+                "first_frame_asset_id", "last_frame_asset_id",
+                "reference_image_asset_ids", "reference_audio_asset_ids",
+                "reference_video_asset_ids", "execution_prompt", "source_scene_revision",
+                "source_video_revision", "seed", "width", "height", "steps",
+            )
+            defaults = payload.settings.model_dump(mode="json")
+            historical_request = payload.model_dump(mode="json")
+            historical_request["settings"] = {name: defaults[name] for name in older_fields}
+            historical_request["settings"]["steps"] = 8
+        else:
+            # A matching request fingerprint must still reach and fail the saved-contract gate.
+            historical_request = payload.model_dump(mode="json", exclude_unset=True)
+        key.request_hash = payload_hash({
+            "request": historical_request, "inputs": saved["_batch"]["inputs"]
+        })
+        key.response = saved
+        await session.flush()
+        original_key = copy.deepcopy(dict((await session.execute(
+            select(*IdempotencyKey.__table__.c)
+        )).mappings().one()))
+        original_generations = copy.deepcopy([
+            dict(row) for row in (await session.execute(
+                select(*SceneGeneration.__table__.c).order_by(SceneGeneration.id)
+            )).mappings()
+        ])
+
+    writes = []
+
+    def capture_writes(_connection, _cursor, statement, _parameters, _context, _many):
+        if statement.lstrip().split()[0].upper() in {"INSERT", "UPDATE", "DELETE", "REPLACE"}:
+            writes.append(statement)
+
+    async with session_factory() as session, session.begin():
+        engine = session.bind.sync_engine
+        event.listen(engine, "before_cursor_execute", capture_writes)
+        try:
+            with pytest.raises(AppError) as error:
+                await generate_all(
+                    video_id,
+                    payload,
+                    request=SimpleNamespace(state=SimpleNamespace()),
+                    key="unbound-historical",
+                    user=await session.get(User, user),
+                    session=session,
+                    settings=settings(tmp_path),
+                )
+            assert error.value.status_code == 409
+            assert error.value.code == (
+                "IDEMPOTENCY_KEY_REUSED" if fingerprint == "older_defaults"
+                else "PREVIEW_CONFIGURATION_STALE"
+            )
+            await session.flush()
+            assert not session.new and not session.dirty and not session.deleted
+            assert writes == []
+        finally:
+            event.remove(engine, "before_cursor_execute", capture_writes)
+    async with session_factory() as session:
+        assert dict((await session.execute(
+            select(*IdempotencyKey.__table__.c)
+        )).mappings().one()) == original_key
+        assert [
+            dict(row) for row in (await session.execute(
+                select(*SceneGeneration.__table__.c).order_by(SceneGeneration.id)
+            )).mappings()
+        ] == original_generations
+        assert await session.get(Video, video_id) is not None
 
 
 @pytest.mark.asyncio
@@ -251,9 +414,11 @@ async def test_reference_clip_requires_stream_span_not_container_span(session_fa
         request = GenerationRequest(reference_audio_asset_ids=[asset.id])
         service = GenerationService(settings(tmp_path))
         with pytest.raises(AppError, match="stream duration"):
-            await service._load_assets(session, request, video)
+            await service._load_assets(session, request, video, user_id=video.created_by)
         asset.media_metadata = {**asset.media_metadata, "audio_duration_seconds": 3}
-        _, durations, _ = await service._load_assets(session, request, video)
+        _, durations, _ = await service._load_assets(
+            session, request, video, user_id=video.created_by
+        )
         assert durations == [3]
 
 

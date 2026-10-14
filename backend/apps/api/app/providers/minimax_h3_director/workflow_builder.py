@@ -36,6 +36,57 @@ def _find_one(
     return matches[0]
 
 
+def _validate_graph_links(graph: Mapping[str, Any]) -> None:
+    for node_id, node in graph.items():
+        if not isinstance(node, Mapping) or not isinstance(node.get("class_type"), str):
+            raise DirectorWorkflowError(f"Director graph node {node_id} has no class_type")
+        inputs = node.get("inputs")
+        if not isinstance(inputs, Mapping):
+            raise DirectorWorkflowError(f"Director graph node {node_id} has no inputs object")
+        for input_name, value in inputs.items():
+            if not (
+                isinstance(value, list)
+                and len(value) == 2
+                and isinstance(value[0], str)
+            ):
+                continue
+            if type(value[1]) is not int or value[1] < 0:
+                raise DirectorWorkflowError(f"Invalid ComfyUI link on {node_id}.{input_name}")
+            if value[0] not in graph:
+                raise DirectorWorkflowError(
+                    f"ComfyUI link on {node_id}.{input_name} references missing node {value[0]}"
+                )
+
+
+def _validate_director_dependencies(
+    graph: Mapping[str, Any], director: Mapping[str, Any]
+) -> None:
+    inputs = director.get("inputs")
+    if not isinstance(inputs, Mapping):
+        raise DirectorWorkflowError("Director node has no inputs object")
+    expected_classes = {
+        "model": "UNETLoader",
+        "video_vae": "VAELoader",
+        "audio_vae": "VAELoader",
+        "clip": "CLIPLoader",
+    }
+    for name, class_type in expected_classes.items():
+        link = inputs.get(name)
+        if (
+            not isinstance(link, list)
+            or len(link) != 2
+            or not isinstance(link[0], str)
+            or type(link[1]) is not int
+            or link[1] != 0
+        ):
+            raise DirectorWorkflowError(f"Director.{name} must bind output zero of {class_type}")
+        source = graph.get(link[0])
+        if not isinstance(source, Mapping) or source.get("class_type") != class_type:
+            raise DirectorWorkflowError(
+                f"Director.{name} must be wired to a {class_type} node"
+            )
+
+
 def _object_inputs(object_info: Mapping[str, Any] | None, class_type: str) -> set[str] | None:
     if object_info is None:
         return None
@@ -49,6 +100,128 @@ def _object_inputs(object_info: Mapping[str, Any] | None, class_type: str) -> se
         if isinstance(values, Mapping):
             names.update(str(name) for name in values)
     return names
+
+
+def _validate_installed_graph(
+    graph: Mapping[str, Any],
+    object_info: Mapping[str, Any],
+    *,
+    require_required_inputs: bool,
+    validate_connections: bool,
+) -> None:
+    schemas: dict[str, Mapping[str, Any]] = {}
+    input_schemas: dict[str, dict[str, Any]] = {}
+
+    for node_id, node in graph.items():
+        if not isinstance(node, Mapping):
+            raise DirectorWorkflowError(f"Director graph node {node_id} is malformed")
+        class_type = node.get("class_type")
+        inputs = node.get("inputs")
+        if not isinstance(class_type, str) or not isinstance(inputs, Mapping):
+            raise DirectorWorkflowError(f"Director graph node {node_id} is not an API node")
+        schema = object_info.get(class_type)
+        if not isinstance(schema, Mapping):
+            raise DirectorWorkflowError(f"ComfyUI object_info is missing {class_type}")
+        groups = schema.get("input")
+        if not isinstance(groups, Mapping):
+            raise DirectorWorkflowError(f"ComfyUI object_info has no input schema for {class_type}")
+
+        descriptors: dict[str, Any] = {}
+        required: set[str] = set()
+        for group in ("required", "optional", "hidden"):
+            fields = groups.get(group) or {}
+            if not isinstance(fields, Mapping):
+                raise DirectorWorkflowError(
+                    f"ComfyUI object_info has an invalid {group} input schema for {class_type}"
+                )
+            descriptors.update(fields)
+            if group == "required":
+                required.update(str(name) for name in fields)
+
+        unknown = set(inputs) - set(descriptors)
+        if unknown:
+            raise DirectorWorkflowError(
+                f"ComfyUI object_info does not expose {class_type} input(s): "
+                f"{', '.join(sorted(unknown))}"
+            )
+        if require_required_inputs:
+            missing = required - set(inputs)
+            if missing:
+                raise DirectorWorkflowError(
+                    f"Director graph node {node_id} is missing required installed input(s): "
+                    f"{', '.join(sorted(missing))}"
+                )
+
+        schemas[str(node_id)] = schema
+        input_schemas[str(node_id)] = descriptors
+
+    if not validate_connections:
+        return
+
+    for node_id, node in graph.items():
+        inputs = node["inputs"]
+        descriptors = input_schemas[str(node_id)]
+        for name, value in inputs.items():
+            if not (
+                isinstance(value, list)
+                and len(value) == 2
+                and isinstance(value[0], str)
+                and value[0] in graph
+            ):
+                continue
+            if type(value[1]) is not int:
+                raise DirectorWorkflowError(f"Invalid ComfyUI link on {node_id}.{name}")
+
+            source_id, output_index = value
+            source_schema = schemas[source_id]
+            outputs = source_schema.get("output")
+            if not isinstance(outputs, list):
+                raise DirectorWorkflowError(
+                    "ComfyUI object_info has no output metadata for "
+                    f"{graph[source_id]['class_type']}"
+                )
+            if not 0 <= output_index < len(outputs):
+                raise DirectorWorkflowError(
+                    f"ComfyUI object_info has no output {output_index} for "
+                    f"{graph[source_id]['class_type']}"
+                )
+
+            descriptor = descriptors.get(name)
+            if not isinstance(descriptor, (list, tuple)) or not descriptor:
+                raise DirectorWorkflowError(
+                    f"ComfyUI object_info has no type for {node['class_type']}.{name}"
+                )
+            input_type = descriptor[0]
+            output_type = outputs[output_index]
+            if (
+                not isinstance(input_type, str)
+                or not isinstance(output_type, str)
+                or (input_type != output_type and input_type != "*" and output_type != "*")
+            ):
+                raise DirectorWorkflowError(
+                    f"ComfyUI socket type mismatch for {node['class_type']}.{name}"
+                )
+
+    for node_id, node in graph.items():
+        descriptors = input_schemas[str(node_id)]
+        for name, value in node["inputs"].items():
+            if (
+                isinstance(value, list)
+                and len(value) == 2
+                and isinstance(value[0], str)
+                and value[0] in graph
+            ):
+                continue
+            descriptor = descriptors.get(name)
+            if not isinstance(descriptor, (list, tuple)) or not descriptor:
+                raise DirectorWorkflowError(
+                    f"ComfyUI object_info has no input descriptor for {node['class_type']}.{name}"
+                )
+            choices = descriptor[0]
+            if isinstance(choices, list) and value not in choices:
+                raise DirectorWorkflowError(
+                    f"Installed {node['class_type']}.{name} does not support {value!r}"
+                )
 
 
 def _patch_existing(
@@ -186,7 +359,18 @@ class DirectorWorkflowBuilder:
         object_info: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         graph = copy.deepcopy(dict(base_workflow))
+        _validate_graph_links(graph)
+        if object_info is not None:
+            if not isinstance(object_info, Mapping):
+                raise DirectorWorkflowError("ComfyUI object_info must be an object")
+            _validate_installed_graph(
+                graph,
+                object_info,
+                require_required_inputs=True,
+                validate_connections=False,
+            )
         _node_id, director = _find_one(graph, DIRECTOR_CLASS_TYPES)
+        _validate_director_dependencies(graph, director)
         class_type = str(director["class_type"])
         allowed = _object_inputs(object_info, class_type)
         if any(
@@ -283,4 +467,11 @@ class DirectorWorkflowBuilder:
                 continue
             exporter = graph[str(binding["node_id"])]
             exporter["inputs"]["filename_prefix"] = f"{spec.output_prefix}/{binding['role']}"
+        if object_info is not None:
+            _validate_installed_graph(
+                graph,
+                object_info,
+                require_required_inputs=False,
+                validate_connections=True,
+            )
         return graph

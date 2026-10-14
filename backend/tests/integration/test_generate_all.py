@@ -5,7 +5,7 @@ import pytest
 from pydantic import ValidationError
 from sqlalchemy import func, select
 
-from apps.api.app.api.generations import generate_all
+from apps.api.app.api.generations import generate_all, preview_generate_all
 from apps.api.app.core.config import Settings
 from apps.api.app.core.errors import AppError
 from apps.api.app.db.models import Asset, Scene, SceneGeneration, User, Video, WorkflowRecord
@@ -15,6 +15,24 @@ from tests.integration.test_generation_preparation import director_workflow_data
 
 
 async def submit(factory, tmp_path, user_id, video_id, payload, key="batch-1"):
+    settings = Settings(_env_file=None, workspace_root=tmp_path, min_free_disk_bytes=0)
+    if payload.settings.preview_configuration_hash is None:
+        async with factory() as preview_session:
+            user = await preview_session.get(User, user_id)
+            manifest = await preview_generate_all(
+                video_id=video_id,
+                payload=payload,
+                user=user,
+                session=preview_session,
+                settings=settings,
+            )
+        payload = payload.model_copy(
+            update={
+                "settings": payload.settings.model_copy(
+                    update={"preview_configuration_hash": manifest["preview_configuration_hash"]}
+                )
+            }
+        )
     async with factory() as session, session.begin():
         return await generate_all(
             video_id=video_id,
@@ -23,7 +41,7 @@ async def submit(factory, tmp_path, user_id, video_id, payload, key="batch-1"):
             key=key,
             user=await session.get(User, user_id),
             session=session,
-            settings=Settings(_env_file=None, workspace_root=tmp_path, min_free_disk_bytes=0),
+            settings=settings,
         )
 
 
@@ -255,6 +273,19 @@ async def test_changed_batch_rejects_stale_preconditions(session_factory, tmp_pa
         expected_video_revision=video_rev,
         expected_scene_revisions={scene: scene_rev},
     )
+    async with session_factory() as preview_session:
+        manifest = await preview_generate_all(
+            video_id=video,
+            payload=payload,
+            user=await preview_session.get(User, user),
+            session=preview_session,
+            settings=Settings(_env_file=None, workspace_root=tmp_path, min_free_disk_bytes=0),
+        )
+    payload = payload.model_copy(
+        update={"settings": payload.settings.model_copy(
+            update={"preview_configuration_hash": manifest["preview_configuration_hash"]}
+        )}
+    )
     async with session_factory() as session, session.begin():
         row = await session.get(Scene, scene)
         parent = await session.get(Video, video)
@@ -447,17 +478,33 @@ async def test_disabled_prefix_preserves_aggregate_qualification_and_snapshots(
             profile["execution_evidence"].pop("director_aggregate_cases", None)
             workflow.profile = profile
 
+    batch_payload = GenerateAll(settings=GenerationRequest(quality_profile="BASE", seed=42))
+    batch_settings = Settings(_env_file=None, workspace_root=tmp_path, min_free_disk_bytes=0)
+    if qualified:
+        async with session_factory() as preview_session:
+            manifest = await preview_generate_all(
+                video_id=video_id,
+                payload=batch_payload,
+                user=await preview_session.get(User, user_id),
+                session=preview_session,
+                settings=batch_settings,
+            )
+        batch_payload = batch_payload.model_copy(
+            update={"settings": batch_payload.settings.model_copy(
+                update={"preview_configuration_hash": manifest["preview_configuration_hash"]}
+            )}
+        )
     async with session_factory() as session, session.begin():
         rows = list((await session.scalars(select(Scene).where(Scene.video_id == video_id))).all())
         assert [[row.id for row in chain] for chain in continuity_chains(rows)] == [scene_ids]
         arguments = dict(
             video_id=video_id,
-            payload=GenerateAll(settings=GenerationRequest(quality_profile="BASE", seed=42)),
+            payload=batch_payload,
             request=SimpleNamespace(state=SimpleNamespace(request_id="disabled-aggregate")),
             key="disabled-aggregate",
             user=await session.get(User, user_id),
             session=session,
-            settings=Settings(_env_file=None, workspace_root=tmp_path, min_free_disk_bytes=0),
+            settings=batch_settings,
         )
         if not qualified:
             with pytest.raises(AppError) as caught:

@@ -8,20 +8,27 @@ import pytest
 from apps.api.app.api.scenes import select_generation
 from apps.api.app.core.config import Settings
 from apps.api.app.core.errors import AppError
-from apps.api.app.db.models import Asset, DirectorRun, Scene, SceneGeneration, User, Video
+from apps.api.app.db.models import (
+    Asset,
+    DirectorRun,
+    GenerationAsset,
+    Scene,
+    SceneGeneration,
+    User,
+    Video,
+)
 from apps.api.app.schemas.api import AssemblyRequest, GenerateAll, GenerationRequest, Selection
 from apps.api.app.services.assembly_service import AssemblyService
 from apps.api.app.services.generation_freshness import (
     bind_execution_group_freshness,
     is_assembly_source_current,
     is_generation_fresh,
+    is_selected_execution_group_fresh,
     is_selected_generation_fresh,
 )
 from apps.api.app.services.generation_intent import stable_hash
 from tests.integration.test_director_dynamic_aggregate import (
-    prepared_members,
     qualified_batch_state,
-    qualify_run,
     submit_batch,
 )
 from tests.integration.test_generate_all import submit
@@ -32,8 +39,17 @@ from workers.director_dispatcher import DirectorDispatcher
 @pytest.mark.parametrize(
     "field", ["prompt", "negative_prompt", "duration_seconds", "spec", "generation_config"]
 )
-async def test_upstream_edit_stales_downstream_native_source(session_factory, tmp_path, field):
-    _, video_id, scene_ids, ids = await prepared_members(session_factory, tmp_path, 2)
+async def test_upstream_edit_stales_downstream_native_source(
+    session_factory, tmp_path, monkeypatch, field
+):
+    user_id, video_id, scene_ids = await qualified_batch_state(
+        session_factory,
+        tmp_path,
+        monkeypatch,
+        ["CUT", "CONTINUOUS"],
+    )
+    batch = await submit_batch(session_factory, tmp_path, user_id, video_id)
+    ids = [generation.id for generation in batch.generations]
     async with session_factory() as session, session.begin():
         scenes = [await session.get(Scene, key) for key in scene_ids]
         generations = [await session.get(SceneGeneration, key) for key in ids]
@@ -68,10 +84,13 @@ async def complete_run(factory, tmp_path, run_id):
     assert await dispatcher.claim() == run_id
     async with factory() as session, session.begin():
         run = await session.get(DirectorRun, run_id)
+        video = await session.get(Video, run.video_id)
         artifacts = []
         for member in run.input_snapshot["members"]:
             asset = Asset(
+                project_id=video.project_id,
                 kind="VIDEO",
+                role="GENERATED_VIDEO",
                 filename="clip.mp4",
                 content_type="video/mp4",
                 object_key=f"{run.id}/{member['member_index']}.mp4",
@@ -79,9 +98,19 @@ async def complete_run(factory, tmp_path, run_id):
                 checksum=hashlib.sha256(b"clip").hexdigest(),
                 size_bytes=4,
                 created_by=run.created_by,
+                resource_owner_id=video.created_by,
+                ownership_provenance="VIDEO_PARENT",
             )
             session.add(asset)
             await session.flush()
+            session.add(
+                GenerationAsset(
+                    generation_id=member["scene_generation_id"],
+                    asset_id=asset.id,
+                    role="DIRECTOR_SEGMENT",
+                    order_index=member["member_index"],
+                )
+            )
             artifacts.append(
                 {"role": "segment", "member_index": member["member_index"], "asset_id": asset.id}
             )
@@ -263,34 +292,36 @@ async def test_partial_prefix_binding_cannot_certify_full_native_chain(
     tmp_path,
     monkeypatch,
 ):
-    from apps.api.app.services.director_run_service import (
-        create_director_run,
-        persist_prepared_director_run,
-    )
-    from apps.api.app.services.generation_service import GenerationService
-
-    user, video_id, scene_ids, generations = await prepared_members(
-        session_factory,
-        tmp_path,
-        2,
-        persist=False,
+    user, video_id, scene_ids, generation_ids, run_id = await selected_chain(
+        session_factory, tmp_path, monkeypatch
     )
     async with session_factory() as session, session.begin():
-        scenes = [await session.get(Scene, key) for key in scene_ids]
-        video = await session.get(Video, video_id)
-        await qualify_run(session, generations[:1], scenes[:1], video, user, monkeypatch)
-        run = await create_director_run(
-            session, generations[:1], scenes[:1], video=video, user_id=user, persist=False
-        )
-        await GenerationService.persist_prepared(session, generations[0], video)
-        await persist_prepared_director_run(session, run)
-        run_id, generation_id = run.id, generations[0].id
-    await complete_run(session_factory, tmp_path, run_id)
-    async with session_factory() as session:
+        run = await session.get(DirectorRun, run_id)
+        generation = await session.get(SceneGeneration, generation_ids[0])
         scene = await session.get(Scene, scene_ids[0])
         video = await session.get(Video, video_id)
-        generation = await session.get(SceneGeneration, generation_id)
+        assert run is not None and generation is not None and scene is not None
+        partial_binding = {
+            "run_id": run.id,
+            "scene_ids": [scene_ids[0]],
+            "generation_ids": [generation_ids[0]],
+        }
+        run_snapshot = copy.deepcopy(run.input_snapshot)
+        run_snapshot["execution_group"] = partial_binding
+        first_member = run_snapshot["members"][0]
+        member_snapshot = copy.deepcopy(generation.input_snapshot)
+        member_snapshot["generation_freshness"]["execution_group"] = partial_binding
+        member_snapshot["semantic_hash"] = stable_hash(
+            {key: value for key, value in member_snapshot.items() if key != "semantic_hash"}
+        )
+        first_member["input_snapshot"] = member_snapshot
+        run_snapshot["semantic_hash"] = stable_hash(
+            {key: value for key, value in run_snapshot.items() if key != "semantic_hash"}
+        )
+        run.input_snapshot = run_snapshot
+        generation.input_snapshot = member_snapshot
         assert await is_generation_fresh(session, scene, video, generation)
+        assert not await is_selected_execution_group_fresh(session, scene, video, generation)
         assert not await is_selected_generation_fresh(session, scene, video)
 
 
