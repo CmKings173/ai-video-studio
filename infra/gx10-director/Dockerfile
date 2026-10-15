@@ -20,15 +20,15 @@ RUN set -eux; \
       "deb [check-valid-until=no] https://snapshot.ubuntu.com/ubuntu/${APT_SNAPSHOT} jammy main universe" \
       "deb [check-valid-until=no] https://snapshot.ubuntu.com/ubuntu/${APT_SNAPSHOT} jammy-updates main universe" \
       "deb [check-valid-until=no] https://snapshot.ubuntu.com/ubuntu/${APT_SNAPSHOT} jammy-security main universe" \
-      > /tmp/gx10-director.sources; \
-    apt-get -o Dir::Etc::sourcelist=/tmp/gx10-director.sources \
+      > /tmp/gx10-director.list; \
+    apt-get -o Dir::Etc::sourcelist=/tmp/gx10-director.list \
       -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0 update; \
-    apt-get -o Dir::Etc::sourcelist=/tmp/gx10-director.sources \
+    apt-get -o Dir::Etc::sourcelist=/tmp/gx10-director.list \
       -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0 \
       install -y --no-install-recommends "ffmpeg=${FFMPEG_VERSION}"; \
     test "$(dpkg-query -W -f='${Version}' ffmpeg)" = "${FFMPEG_VERSION}"; \
     command -v ffmpeg; command -v ffprobe; \
-    rm -rf /var/lib/apt/lists/* /tmp/gx10-director.sources
+    rm -rf /var/lib/apt/lists/* /tmp/gx10-director.list
 
 RUN set -eux; \
     stack_before="$(${PYTHON} -c 'import torch, torchvision; print(torch.__version__ + "|" + torchvision.__version__ + "|" + str(torch.version.cuda))')"; \
