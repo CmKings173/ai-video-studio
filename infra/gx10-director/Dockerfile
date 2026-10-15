@@ -11,10 +11,6 @@ ARG FFMPEG_VERSION=7:4.4.2-0ubuntu0.22.04.1
 
 USER root
 
-COPY requirements.lock /opt/gx10-director/requirements.lock
-COPY wheels/ /opt/gx10-director/wheels/
-COPY verify_runtime.py /opt/gx10-director/verify_runtime.py
-
 RUN set -eux; \
     printf '%s\n' \
       "deb [check-valid-until=no] https://snapshot.ubuntu.com/ubuntu/${APT_SNAPSHOT} jammy main universe" \
@@ -30,6 +26,9 @@ RUN set -eux; \
     command -v ffmpeg; command -v ffprobe; \
     rm -rf /var/lib/apt/lists/* /tmp/gx10-director.list
 
+COPY requirements.lock /opt/gx10-director/requirements.lock
+COPY wheels/ /opt/gx10-director/wheels/
+
 RUN set -eux; \
     stack_before="$(${PYTHON} -c 'import torch, torchvision; print(torch.__version__ + "|" + torchvision.__version__ + "|" + str(torch.version.cuda))')"; \
     test "${stack_before}" = "${EXPECTED_TORCH}|${EXPECTED_TORCHVISION}|${EXPECTED_CUDA}"; \
@@ -38,7 +37,11 @@ RUN set -eux; \
       --only-binary=:all: --no-deps --require-hashes \
       -r /opt/gx10-director/requirements.lock; \
     stack_after="$(${PYTHON} -c 'import torch, torchvision; print(torch.__version__ + "|" + torchvision.__version__ + "|" + str(torch.version.cuda))')"; \
-    test "${stack_before}" = "${stack_after}"; \
+    test "${stack_before}" = "${stack_after}"
+
+COPY verify_runtime.py /opt/gx10-director/verify_runtime.py
+
+RUN set -eux; \
     EXPECTED_TORCH="${EXPECTED_TORCH}" \
     EXPECTED_TORCHVISION="${EXPECTED_TORCHVISION}" \
     EXPECTED_CUDA="${EXPECTED_CUDA}" \

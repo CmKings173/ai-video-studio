@@ -18,6 +18,7 @@ from packaging.version import Version
 ROOT = Path(__file__).resolve().parent
 BASE_RUNTIME_PACKAGES = ("scipy", "safetensors", "aiohttp")
 DIRECTOR_IMPORTS = ("PIL", "cv2", "imageio_ffmpeg", "scenedetect", "numpy")
+OPENCV_ALIAS_CONSUMERS = ("ultralytics", "scenedetect")
 CONFLICTING_OPENCV_DISTRIBUTIONS = (
     "opencv-python", "opencv-contrib-python", "opencv-contrib-python-headless",
 )
@@ -74,9 +75,9 @@ def verify_director_imports(importer=import_module) -> tuple[str, ...]:
 
 
 def verify_opencv_provider(metadata_version=metadata.version,
-                           metadata_requires=metadata.requires) -> dict[str, str]:
-    from packaging.requirements import Requirement
-    from packaging.version import Version
+                           metadata_requires=metadata.requires) -> dict:
+    from packaging.requirements import InvalidRequirement, Requirement
+    from packaging.utils import canonicalize_name
 
     try:
         headless_version = Version(metadata_version("opencv-python-headless"))
@@ -89,35 +90,50 @@ def verify_opencv_provider(metadata_version=metadata.version,
             continue
         raise SystemExit(f"conflicting OpenCV distributions are installed: {distribution}")
 
-    opencv_requirement = None
-    for raw_requirement in metadata_requires("ultralytics") or []:
-        requirement = Requirement(raw_requirement)
-        if requirement.name.lower() == "opencv-python":
-            opencv_requirement = requirement
-            break
-    if opencv_requirement is None or not opencv_requirement.specifier.contains(
-            headless_version, prereleases=True):
-        raise SystemExit("OpenCV headless provider does not satisfy Ultralytics")
+    satisfied = {}
+    for consumer in OPENCV_ALIAS_CONSUMERS:
+        requirements = []
+        try:
+            for raw_requirement in metadata_requires(consumer) or []:
+                requirement = Requirement(raw_requirement)
+                if canonicalize_name(requirement.name) == "opencv-python" and (
+                    requirement.marker is None or requirement.marker.evaluate()
+                ):
+                    requirements.append(requirement)
+        except (InvalidRequirement, metadata.PackageNotFoundError) as exc:
+            raise SystemExit(f"invalid OpenCV dependency metadata: {consumer}") from exc
+        if len(requirements) != 1:
+            raise SystemExit(f"expected one active OpenCV dependency: {consumer}")
+        requirement = requirements[0]
+        if (requirement.url or requirement.extras
+                or (not requirement.specifier and consumer != "scenedetect")
+                or not requirement.specifier.contains(headless_version, prereleases=True)):
+            raise SystemExit(f"OpenCV headless provider does not satisfy {consumer}")
+        satisfied[consumer] = str(requirement)
     return {"distribution": "opencv-python-headless", "version": str(headless_version),
-            "satisfies": str(opencv_requirement)}
+            "satisfies": satisfied}
 
 
 def verify_pip_check(
-    run=subprocess.run, installed_version=metadata.version
-) -> dict[str, str | None]:
+    run=subprocess.run, installed_version=metadata.version,
+    metadata_requires=metadata.requires,
+) -> dict:
     result = run([sys.executable, "-m", "pip", "check"],
                  capture_output=True, text=True, check=False)
     lines = [line.strip() for line in (result.stdout + "\n" + result.stderr).splitlines()
              if line.strip()]
     if result.returncode == 0 and lines in ([], ["No broken requirements found."]):
-        return {"status": "clean", "allowed_alias": None}
+        return {"status": "clean", "allowed_aliases": []}
 
-    expected_alias = (
-        f"ultralytics {installed_version('ultralytics')} requires opencv-python, "
-        "which is not installed."
-    )
-    if result.returncode == 1 and lines == [expected_alias]:
-        return {"status": "documented_opencv_alias_only", "allowed_alias": expected_alias}
+    expected_aliases = [
+        f"{consumer} {installed_version(consumer)} requires opencv-python, "
+        "which is not installed." for consumer in OPENCV_ALIAS_CONSUMERS
+    ]
+    if (result.returncode == 1 and len(lines) == len(expected_aliases)
+            and set(lines) == set(expected_aliases)):
+        # Never waive metadata errors without revalidating the actual provider.
+        verify_opencv_provider(installed_version, metadata_requires)
+        return {"status": "documented_opencv_alias_only", "allowed_aliases": expected_aliases}
     raise SystemExit(f"pip check found unexpected dependency errors: {lines!r}")
 
 

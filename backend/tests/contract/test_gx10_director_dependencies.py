@@ -195,18 +195,21 @@ def test_director_import_smoke_fails_closed(module_name):
         _VERIFY_MODULE.verify_director_imports(broken_import)
 
 
-def test_opencv_headless_is_one_explicit_provider_for_ultralytics():
+def test_opencv_headless_is_one_explicit_provider_for_both_consumers():
     def package_version(name):
         if name == "opencv-python-headless":
             return "5.0.0.93"
         raise PackageNotFoundError(name)
 
     provider = _VERIFY_MODULE.verify_opencv_provider(
-        package_version, lambda _: ["opencv-python!=4.13.0.90,>=4.7.0"]
+        package_version, _alias_requirements
     )
     assert provider == {
         "distribution": "opencv-python-headless", "version": "5.0.0.93",
-        "satisfies": "opencv-python!=4.13.0.90,>=4.7.0",
+        "satisfies": {
+            "ultralytics": "opencv-python!=4.13.0.90,>=4.7.0",
+            "scenedetect": "opencv-python",
+        },
     }
 
     def too_old_headless(name):
@@ -214,7 +217,7 @@ def test_opencv_headless_is_one_explicit_provider_for_ultralytics():
             return "4.5.0"
         raise PackageNotFoundError(name)
 
-    with pytest.raises(SystemExit, match="does not satisfy Ultralytics"):
+    with pytest.raises(SystemExit, match="does not satisfy ultralytics"):
         _VERIFY_MODULE.verify_opencv_provider(
             too_old_headless, lambda _: ["opencv-python>=4.7.0"]
         )
@@ -238,33 +241,115 @@ def test_opencv_provider_rejects_every_other_distribution(conflict):
         )
 
 
-def test_pip_check_allows_only_the_exact_opencv_alias_error():
-    expected = "ultralytics 8.4.177 requires opencv-python, which is not installed."
+def _alias_package_version(name):
+    versions = {
+        "ultralytics": "8.4.177", "scenedetect": "0.7.2",
+        "opencv-python-headless": "5.0.0.93",
+    }
+    if name not in versions:
+        raise PackageNotFoundError(name)
+    return versions[name]
+
+
+def _alias_requirements(name):
+    # Exact declarations audited from the hash-selected PyPI wheel metadata.
+    return ["opencv-python" if name == "scenedetect"
+            else "opencv-python!=4.13.0.90,>=4.7.0"]
+
+
+def test_pip_check_allows_only_the_exact_opencv_alias_errors():
+    expected = [
+        "ultralytics 8.4.177 requires opencv-python, which is not installed.",
+        "scenedetect 0.7.2 requires opencv-python, which is not installed.",
+    ]
 
     def alias_only(_args, **_kwargs):
-        return SimpleNamespace(returncode=1, stdout=expected + "\n", stderr="")
+        return SimpleNamespace(returncode=1, stdout="\n".join(reversed(expected)), stderr="")
 
-    assert _VERIFY_MODULE.verify_pip_check(alias_only, lambda _: "8.4.177") == {
-        "status": "documented_opencv_alias_only", "allowed_alias": expected,
+    assert _VERIFY_MODULE.verify_pip_check(
+        alias_only, _alias_package_version, _alias_requirements
+    ) == {
+        "status": "documented_opencv_alias_only", "allowed_aliases": expected,
     }
 
     def clean(_args, **_kwargs):
         return SimpleNamespace(returncode=0, stdout="No broken requirements found.\n", stderr="")
 
-    assert _VERIFY_MODULE.verify_pip_check(clean, lambda _: "8.4.177") == {
-        "status": "clean", "allowed_alias": None,
+    assert _VERIFY_MODULE.verify_pip_check(clean, _alias_package_version) == {
+        "status": "clean", "allowed_aliases": [],
     }
 
     def extra_error(_args, **_kwargs):
         return SimpleNamespace(
             returncode=1,
-            stdout=(expected + "\nother-package 1.0 requires missing-package, "
+            stdout=("\n".join(expected) + "\nother-package 1.0 requires missing-package, "
                     "which is not installed.\n"),
             stderr="",
         )
 
     with pytest.raises(SystemExit, match="unexpected dependency errors"):
-        _VERIFY_MODULE.verify_pip_check(extra_error, lambda _: "8.4.177")
+        _VERIFY_MODULE.verify_pip_check(
+            extra_error, _alias_package_version, _alias_requirements
+        )
+
+
+@pytest.mark.parametrize("consumer", ["ultralytics", "scenedetect"])
+@pytest.mark.parametrize("declarations", [
+    [], ["opencv-python<5"], ["opencv-python-headless>=4.7"],
+    ["opencv-python>=4; python_version<'1'"],
+    ["opencv-python>=4", "opencv-python>=5"],
+    ["opencv-python @ https://example.invalid/opencv.whl"], ["not a requirement!"],
+])
+def test_opencv_alias_fails_closed_for_changed_declarations(consumer, declarations):
+    def requirements(name):
+        return declarations if name == consumer else _alias_requirements(name)
+
+    with pytest.raises(SystemExit):
+        _VERIFY_MODULE.verify_opencv_provider(_alias_package_version, requirements)
+
+
+def test_ultralytics_cannot_drop_its_version_constraint():
+    with pytest.raises(SystemExit, match="does not satisfy ultralytics"):
+        _VERIFY_MODULE.verify_opencv_provider(_alias_package_version, lambda _: ["opencv-python"])
+
+
+@pytest.mark.parametrize("returncode, lines", [
+    (1, []), (1, ["No broken requirements found."]), (0, ["unexpected warning"]),
+    (2, ["ultralytics 8.4.177 requires opencv-python, which is not installed."]),
+    (1, ["ultralytics 8.4.177 requires opencv-python, which is not installed."]),
+    (1, ["scenedetect 0.7.2 requires opencv-python, which is not installed."]),
+    (1, ["ultralytics 8.4.177 requires opencv-python, which is not installed."] * 2),
+])
+def test_pip_check_rejects_unexpected_output(returncode, lines):
+    def run(*args, **kwargs):
+        return SimpleNamespace(returncode=returncode, stdout="\n".join(lines), stderr="")
+
+    with pytest.raises(SystemExit, match="unexpected dependency errors"):
+        _VERIFY_MODULE.verify_pip_check(run, _alias_package_version, _alias_requirements)
+
+
+def test_pip_alias_errors_require_a_verified_provider():
+    def run(*args, **kwargs):
+        lines = [f"{name} {_alias_package_version(name)} requires opencv-python, "
+                 "which is not installed." for name in ("ultralytics", "scenedetect")]
+        return SimpleNamespace(returncode=1, stdout="\n".join(lines), stderr="")
+
+    with pytest.raises(SystemExit):
+        _VERIFY_MODULE.verify_pip_check(run, _alias_package_version, lambda _: [])
+
+
+def test_verifier_changes_do_not_invalidate_dependency_install_layers():
+    dockerfile = (PACKAGE / "Dockerfile").read_text(encoding="utf-8")
+    assert dockerfile.index('install -y --no-install-recommends') < dockerfile.index(
+        'COPY requirements.lock'
+    )
+    assert dockerfile.index('COPY wheels/') < dockerfile.index('-m pip install')
+    assert dockerfile.index('test "${stack_before}" = "${stack_after}"') < dockerfile.index(
+        'COPY verify_runtime.py'
+    )
+    assert dockerfile.index('COPY verify_runtime.py') < dockerfile.index(
+        'RUN set -eux;', dockerfile.index('COPY verify_runtime.py')
+    )
 
 
 def test_generated_wheels_are_ignored_without_ignoring_directory_marker():

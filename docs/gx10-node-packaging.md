@@ -86,21 +86,45 @@ This establishes a documented compatibility candidate, not proof on the GB10.
 
 The same lock pins all 30 direct and transitive Python wheels, one SHA-256 per
 artifact, for CPython 3.10 on ARM64. The lock deliberately omits `torch`,
-`torchvision`, and `opencv-python`. Ultralytics declares `opencv-python`, while the
+`torchvision`, and `opencv-python`. Ultralytics and SceneDetect declare `opencv-python`, while the
 pinned Director declares `opencv-python-headless`; the image uses the headless wheel
 as the single `cv2` provider. The build fails if a desktop `opencv-python` distribution
 or either `opencv-contrib-python` distribution is also present, or if the headless
-version does not satisfy Ultralytics' declared version range. It imports `cv2`,
+version does not satisfy either consumer's active dependency declaration. It imports `cv2`,
 `imageio_ffmpeg`, `scenedetect`, and `ultralytics` (with a temporary YOLO config
 directory) without loading a model. This deliberate package-name substitution avoids
 overlapping native files. Upstream metadata does not recognize this alias, so the
-runtime accepts `pip check` only when its sole output is the exact missing
-`ultralytics ... requires opencv-python` line for the installed Ultralytics version.
+runtime accepts failing `pip check` only when its output consists of exactly the
+two missing `opencv-python` lines for the installed Ultralytics and SceneDetect
+versions (in either order), after revalidating the headless provider against both
+packages' actual metadata. Missing, duplicate, malformed, URL-based or inactive-only
+OpenCV declarations fail closed; other errors, warnings, duplicates and exit codes
+remain fatal. SceneDetect 0.7.2 legitimately declares unversioned `opencv-python`;
+Ultralytics must retain a version constraint.
 Every other `pip check` failure remains fatal. `pip download --require-hashes --only-binary` verified
 all 30 artifacts from PyPI on 2026-10-15: 159,177,563 bytes. No source builds were
 needed. The wheel files are generated inputs and are not committed. An empty
 `wheels/` directory is expected until the fetch step below runs; `.gitignore` excludes
 only generated `*.whl` files and keeps the directory marker tracked.
+
+The follow-up metadata audit matched all 30 lock hashes to official PyPI release
+JSON and read the selected artifacts' published wheel metadata for Linux aarch64 /
+Python 3.10 (without extras). The only OpenCV aliases were
+`ultralytics==8.4.177`: `opencv-python!=4.13.0.90,>=4.7.0`, and
+`scenedetect==0.7.2`: `opencv-python`. All other active requirements were satisfied
+by the lock plus the supplied Torch/Torchvision base versions. This metadata audit
+does not validate native ABI compatibility or the entire existing base image.
+TorchAudio's metadata declares no Torch dependency; runtime smoke tests remain
+mandatory. Base scipy/safetensors/aiohttp versions and their dependency closure
+still require the actual GX10 inventory and final `pip check`.
+
+Docker layers install pinned FFmpeg first, then copy the lock/wheels and install
+them with the existing exact Torch/Torchvision/CUDA checks before and after pip.
+Only afterward is `verify_runtime.py` copied and executed in a separate layer.
+Changing the verifier therefore reuses the dependency-install layers when the
+base image, build arguments, lock, wheels and Docker cache are unchanged. The first
+build after this layer reorder may rebuild those layers once; cache reuse itself
+must be verified on GX10. Do not clear the build cache to apply a verifier fix.
 
 Ubuntu's [Jammy ARM64 package](https://packages.ubuntu.com/jammy/ffmpeg) supplies
 FFmpeg `7:4.4.2-0ubuntu0.22.04.1`; its [ffprobe tool](https://manpages.ubuntu.com/manpages/jammy/man1/ffprobe-all.1.html)
