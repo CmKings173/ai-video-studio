@@ -44,3 +44,4 @@ pytest-of-Admin/
 /tasks/evidence/*.txt
 /tasks/h3-reference-artifacts/
 /docs/h3-poc/runtime-cpu-verification-*.json
+infra/gx10-director/wheels/*.whl
