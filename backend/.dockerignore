@@ -1,10 +1,33 @@
-.git
-.gitignore
-.dockerignore
-.venv
-tests
-*.env
-*.env.*
+# Only Dockerfile inputs: unrelated checkouts, comfy_nodes (built separately),
+# local storage and test databases stay outside the context.
+*
+!apps/
+!workers/
+!migrations/
+!workflows/
+!alembic.ini
+!pyproject.toml
+!uv.lock
+
+# Exclude artifacts and secrets even inside allowed runtime directories.
+**/.git
+**/.worktrees
+**/node_modules
+**/.venv
 **/__pycache__
-**/.pytest_cache
+**/*.pyc
+**/.cache
+**/.pytest*
+**/pytest-of-*
 **/.ruff_cache
+**/.mypy_cache
+**/.tmp
+**/.env
+**/.env.*
+**/*.env
+**/*.env.*
+**/*.pem
+**/*.key
+**/*.p12
+**/*.pfx
+**/*.log

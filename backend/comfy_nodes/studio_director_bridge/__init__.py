@@ -16,11 +16,11 @@ from pathlib import Path
 
 VERSION = "studio-director-bridge-v1"
 SOURCE_FILES = {
-    "nodes/director.py": "640090027e562004d8cb0e486812a122432624a247683d88a9dc781a1f2b0185",
-    "nodes/director_common.py": "be4782b420f2722cbc7b17131b96c5823ecbb16320806b2b819fe8ea2128b001",
-    "director/executor_core.py": "72dae4eb1cd87a9ad1036ac61ca8ec8ade140036935f0ba4c5495b1d6965c1d2",
+    "nodes/director.py": "e78bd70810275679b22c1ddaebaa6e9a6a259921a4977f6dc616d5594162f215",
+    "nodes/director_common.py": "612696844b613b46a824e5322029a3d89b8937cdc7a54a40bb2fc8cad7f9ab8a",
+    "director/executor_core.py": "4ad334c54e8b24cbbcf196316af19a3ad11822a8dc59189e2740e352d36e60cb",
     "director/segment_mp4_export.py": (
-        "df35f95710d4130d9fb12feb660aaf6409f34074aa089e83e7b0cd6b0ca67082"
+        "e733780e7ef3bfa70fbdff0808b780288be6d689abfc777362d0d4e1170d338e"
     ),
 }
 _capture = ContextVar("studio_director_plan", default=None)
@@ -36,7 +36,9 @@ def source_class():
     module = importlib.import_module(source.__module__)
     root = Path(module.__file__).resolve().parents[1]
     for relative, expected in SOURCE_FILES.items():
-        if hashlib.sha256((root / relative).read_bytes()).hexdigest() != expected:
+        # Official GitHub blob bytes use LF; Windows checkouts may use CRLF.
+        content = (root / relative).read_bytes().replace(b"\r\n", b"\n")
+        if hashlib.sha256(content).hexdigest() != expected:
             raise RuntimeError(f"Director source drift: {relative}")
     # Install once; ordinary Director executions have no capture context and keep
     # their original result. ContextVars isolate concurrent execution threads.

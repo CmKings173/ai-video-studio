@@ -1,0 +1,53 @@
+# Merge after compose.yaml with Docker Compose >= 2.24.4 (ports !override).
+# Source-only UAT recipe: never point its volumes at an existing deployment.
+name: ai-video-studio-gx10-uat
+
+x-gx10-backend: &gx10-backend
+  platform: linux/arm64
+  image: ai-video-studio-backend:${GX10_SOURCE_TAG:?Set GX10_SOURCE_TAG to the source revision}
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+
+services:
+  postgres:
+    platform: linux/arm64
+    ports: !override []
+
+  minio:
+    platform: linux/arm64
+    # The pinned security release is source-only; this build includes curl.
+    image: ai-video-studio-minio:RELEASE.2025-10-15T17-29-55Z
+    build:
+      context: ./minio
+    ports: !override
+      - "127.0.0.1:${GX10_MINIO_PORT:-19000}:9000"
+      - "127.0.0.1:${GX10_MINIO_CONSOLE_PORT:-19001}:9001"
+
+  migrate:
+    <<: *gx10-backend
+
+  api:
+    <<: *gx10-backend
+    ports: !override []
+
+  frontend:
+    platform: linux/arm64
+    image: ai-video-studio-frontend:${GX10_SOURCE_TAG:?Set GX10_SOURCE_TAG to the source revision}
+    ports: !override []
+
+  ingress:
+    platform: linux/arm64
+    ports: !override
+      - "127.0.0.1:${GX10_INGRESS_PORT:-18080}:8080"
+
+  dispatcher:
+    <<: *gx10-backend
+
+  assembler:
+    <<: *gx10-backend
+
+  asset-validator:
+    <<: *gx10-backend
+
+  reconciler:
+    <<: *gx10-backend
