@@ -1,0 +1,2 @@
+# Keep manifest-pinned package bytes identical on Windows and Linux checkouts.
+* text eol=lf

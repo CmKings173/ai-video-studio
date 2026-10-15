@@ -1,6 +1,37 @@
-.next
-node_modules
-npm-debug.log*
-.env*
-Dockerfile
-.dockerignore
+# Explicit build inputs keep unrelated nested checkouts, tests and local storage
+# out of COPY . . while preserving source, assets and build configuration.
+*
+!app/
+!components/
+!lib/
+!public/
+!package.json
+!yarn.lock
+!next.config.ts
+!next-env.d.ts
+!tsconfig.json
+!postcss.config.mjs
+!tailwind.config.ts
+
+# Exclude artifacts and secrets even inside allowed directories.
+**/.git
+**/.worktrees
+**/node_modules
+**/.venv
+**/.next
+**/__pycache__
+**/.cache
+**/.pytest*
+**/pytest-of-*
+**/.ruff_cache
+**/.tmp
+**/.env
+**/.env.*
+**/*.env
+**/*.env.*
+**/*.pem
+**/*.key
+**/*.p12
+**/*.pfx
+**/*.log
+**/*.tsbuildinfo
