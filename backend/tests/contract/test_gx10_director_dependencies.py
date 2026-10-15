@@ -81,6 +81,16 @@ def test_derived_image_uses_offline_locked_wheels_and_keeps_torch_stack():
     assert set(_VERIFY_MODULE.BASE_RUNTIME_PACKAGES) == {"scipy", "safetensors", "aiohttp"}
 
 
+def test_apt_one_line_entries_use_list_format_consistently():
+    dockerfile = (PACKAGE / "Dockerfile").read_text(encoding="utf-8")
+    source_paths = re.findall(r"/tmp/gx10-director\.(?:sources|list)", dockerfile)
+
+    # One-line deb entries require .list; .sources is reserved for Deb822.
+    assert source_paths == ["/tmp/gx10-director.list"] * 4
+    assert dockerfile.count('"deb [check-valid-until=no]') == 3
+    assert "-o Dir::Etc::sourceparts=-" in dockerfile
+
+
 def test_runtime_verifier_fails_closed_when_comfyui_base_dependency_is_missing():
     def missing(name):
         if name == "scipy":
