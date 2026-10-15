@@ -3,6 +3,7 @@ import copy
 import hashlib
 import importlib.util
 import io
+import math
 import sys
 import types
 import zipfile
@@ -63,6 +64,77 @@ def test_missing_dependency_rejected():
 def test_incompatible_dependency_rejected():
     with pytest.raises(ValueError, match="dependency"):
         load().check_dependencies("scenedetect>=0.6.4,<0.8", lambda _: "0.8.0")
+
+
+def _audio_runtime_modules(torch_version="2.14.1+cu130", audio_version="2.11.0",
+                           output_shape=(1, 1, 4410), output_mode="valid"):
+    class Tensor:
+        def __init__(self, values, shape):
+            self.values = values
+            self.shape = shape
+
+        def reshape(self, *shape):
+            return Tensor(self.values, shape)
+
+        def detach(self):
+            return self
+
+        def cpu(self):
+            return self
+
+        def tolist(self):
+            return self.values
+
+    class Torch:
+        __version__ = torch_version
+        float32 = object()
+
+        @staticmethod
+        def tensor(values, dtype):
+            assert dtype is Torch.float32
+            return Tensor(list(values), (len(values),))
+
+    def resample(_waveform, source_rate, target_rate):
+        assert source_rate == 32000
+        assert any(value > 0.49 for value in _waveform.values)
+        count = math.prod(output_shape)
+        frequency = 2000 if output_mode == "wrong-frequency" else 1000
+        values = [0.5 * math.sin(2 * math.pi * frequency * index / target_rate)
+                  for index in range(count)]
+        if output_mode == "zero":
+            values = [0.0] * count
+        elif output_mode == "non-finite":
+            values[0] = float("nan")
+        return Tensor(values, output_shape)
+
+    audio = types.SimpleNamespace(
+        __version__=audio_version,
+        functional=types.SimpleNamespace(resample=resample),
+    )
+    return Torch, audio
+
+
+def test_audio_runtime_requires_stable_abi_resample_smoke():
+    m = load()
+    torch, audio = _audio_runtime_modules()
+    assert m.verify_audio_runtime(torch, audio) == {
+        "torch": "2.14.1", "torchaudio": "2.11.0",
+        "input_samples": 3200, "output_samples": 4410,
+    }
+
+
+@pytest.mark.parametrize(("kwargs", "message"), [
+    ({"audio_version": "2.14.1"}, "stable-ABI"),
+    ({"torch_version": "2.10.2+cu130"}, "too old"),
+    ({"output_shape": (1, 1, 4409)}, "smoke test failed"),
+    ({"output_mode": "zero"}, "smoke test failed"),
+    ({"output_mode": "wrong-frequency"}, "smoke test failed"),
+    ({"output_mode": "non-finite"}, "smoke test failed"),
+])
+def test_audio_runtime_fails_closed_on_incompatible_abi_or_resampler(kwargs, message):
+    torch, audio = _audio_runtime_modules(**kwargs)
+    with pytest.raises(ValueError, match=message):
+        load().verify_audio_runtime(torch, audio)
 
 
 def test_symlink_rejected(tmp_path, monkeypatch):
@@ -292,6 +364,10 @@ def test_offline_install_preflight_and_verified_copy(tmp_path, monkeypatch, miss
         return {"example": "1.0"}
 
     monkeypatch.setattr(m, "check_dependencies", dependencies)
+    monkeypatch.setattr(m, "verify_audio_runtime", lambda: {
+        "torch": "2.14.1", "torchaudio": "2.11.0",
+        "input_samples": 3200, "output_samples": 4410,
+    })
 
     def no_network(*args, **kwargs):
         raise AssertionError("offline installation attempted network access")

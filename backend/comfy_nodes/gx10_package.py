@@ -4,8 +4,10 @@ from __future__ import annotations
 import argparse
 import ast
 import hashlib
+import importlib
 import io
 import json
+import math
 import stat
 import tempfile
 import urllib.request
@@ -41,6 +43,8 @@ INPUT_CONTRACTS = {
         {"sigmas": "SIGMAS"},
     ),
 }
+TORCHAUDIO_ABI_VERSION = "2.11.0"
+TORCH_AUDIO_ABI_MINIMUM = "2.11.0"
 
 
 def load_manifest():
@@ -118,6 +122,58 @@ def check_dependencies(requirements, get_version=version):
     return result
 
 
+def verify_audio_runtime(torch_module=None, torchaudio_module=None):
+    """Fail closed unless the stable-ABI resampler imports and returns valid PCM."""
+    from packaging.version import Version
+
+    try:
+        torch_module = torch_module or importlib.import_module("torch")
+        torchaudio_module = torchaudio_module or importlib.import_module("torchaudio")
+        torch_version = Version(torch_module.__version__.split("+", 1)[0])
+        torchaudio_version = Version(torchaudio_module.__version__.split("+", 1)[0])
+    except Exception as exc:
+        raise ValueError("torchaudio runtime import/version check failed") from exc
+
+    if torchaudio_version != Version(TORCHAUDIO_ABI_VERSION):
+        raise ValueError(
+            f"incompatible torchaudio stable-ABI version: {torchaudio_version}; "
+            f"expected {TORCHAUDIO_ABI_VERSION}"
+        )
+    if torch_version < Version(TORCH_AUDIO_ABI_MINIMUM):
+        raise ValueError(f"torch {torch_version} is too old for torchaudio {torchaudio_version}")
+
+    try:
+        source_samples = 3200
+        source_rate = 32000
+        target_rate = 44100
+        signal = [0.5 * math.sin(2 * math.pi * 1000 * index / source_rate)
+                  for index in range(source_samples)]
+        waveform = torch_module.tensor(signal, dtype=torch_module.float32).reshape(
+            1, 1, source_samples
+        )
+        resampled = torchaudio_module.functional.resample(waveform, source_rate, target_rate)
+        if tuple(resampled.shape) != (1, 1, 4410):
+            raise ValueError("resampler returned an unexpected waveform shape")
+        values = resampled.detach().cpu().reshape(-1).tolist()
+        expected = [0.5 * math.sin(2 * math.pi * 1000 * index / target_rate)
+                    for index in range(len(values))]
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError("resampler returned non-finite samples")
+        observed_power = math.fsum(value * value for value in values)
+        expected_power = math.fsum(value * value for value in expected)
+        rms = math.sqrt(observed_power / len(values))
+        similarity = math.fsum(
+            value * reference for value, reference in zip(values, expected, strict=True)
+        )
+        similarity /= math.sqrt(observed_power * expected_power)
+        if not 0.25 <= rms <= 0.40 or similarity < 0.95:
+            raise ValueError("resampler did not preserve the non-zero 1 kHz signal")
+    except Exception as exc:
+        raise ValueError("torchaudio functional resampler smoke test failed") from exc
+    return {"torch": str(torch_version), "torchaudio": str(torchaudio_version),
+            "input_samples": 3200, "output_samples": 4410}
+
+
 def validate_nodes(info):
     if not isinstance(info, dict):
         raise ValueError("node inventory must be a mapping")
@@ -167,10 +223,13 @@ def verify_installed(comfy_root, info):
     requirements = (custom / "ComfyUI_MiniMaxH3_Director" / "requirements.txt").read_text()
     dependencies = check_dependencies(requirements)
     dependencies.update(check_dependencies(
-        "torch\ntorchaudio\nnumpy\nPillow\nscipy\nsafetensors\naiohttp\npackaging"
+        f"torch\ntorchaudio=={TORCHAUDIO_ABI_VERSION}\n"
+        "numpy\nPillow\nscipy\nsafetensors\naiohttp\npackaging"
     ))
+    audio_runtime = verify_audio_runtime()
     validate_nodes(info)
     return {"commit": manifest["commit"], "dependencies": dependencies,
+            "audio_runtime": audio_runtime,
             "qualification": "UNQUALIFIED: H3 runtime evidence still required"}
 
 
@@ -197,8 +256,10 @@ def install(comfy_root, archive_path=None):
             ast.parse(path.read_bytes(), filename=str(path))
         dependencies = check_dependencies((source / "requirements.txt").read_text())
         dependencies.update(check_dependencies(
-            "torch\ntorchaudio\nnumpy\nPillow\nscipy\nsafetensors\naiohttp\npackaging"
+            f"torch\ntorchaudio=={TORCHAUDIO_ABI_VERSION}\n"
+            "numpy\nPillow\nscipy\nsafetensors\naiohttp\npackaging"
         ))
+        audio_runtime = verify_audio_runtime()
         # Copy only verified bytes, never caches or local extras. No package hooks run.
         for src, dst, inventory in (
             (source, targets[0], manifest["source"]),
@@ -214,6 +275,7 @@ def install(comfy_root, archive_path=None):
                 target.write_bytes(content)
             verify_tree(dst, inventory)
     return {"commit": manifest["commit"], "dependencies": dependencies,
+            "audio_runtime": audio_runtime,
             "qualification": "UNQUALIFIED: validate object_info; H3 gates still required"}
 
 

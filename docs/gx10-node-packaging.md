@@ -59,14 +59,87 @@ refuses to overwrite them. There is no automatic cleanup or upgrade operation.
 
 The pinned upstream requirements are `opencv-python-headless>=4.8`,
 `imageio-ffmpeg>=0.4`, `scenedetect>=0.6.4,<0.8`, and `ultralytics>=8.0`.
-The installer also requires installed metadata for torch, torchaudio, numpy,
-Pillow, scipy, safetensors, aiohttp, and packaging. Missing/incompatible declared
-dependencies fail closed before copying. The receipt records the exact installed
-versions; this is an environment inventory, not a wheel lock or ABI certification.
-No dependency artifacts are fetched or resolved. Provision any missing dependencies
-separately with reviewed ARM64 artifacts and constraints that protect the existing
-torch/CUDA stack. Upstream declares ComfyUI `>=0.30.0`; the target must also expose
-the MiniMax H3 core APIs used by this commit.
+The installer also requires torch, torchaudio, numpy, Pillow, scipy, safetensors,
+aiohttp, and packaging. It now requires `torchaudio==2.11.0`, imports it, and runs
+the exact 32 kHz to 44.1 kHz functional resample on a synthetic CPU waveform before
+copying any node files. This is a dependency smoke test, not H3 runtime qualification.
+Upstream declares ComfyUI `>=0.30.0`; the target must also expose the MiniMax H3
+core APIs used by this commit.
+
+## GX10 dependency image
+
+The upstream `audio_export.py` resamples source audio with `torchaudio`. If that
+call raises, the pinned code logs a warning and returns the original waveform;
+Motion Context instead raises when a rate mismatch requires unavailable
+`torchaudio`. There is no safe missing-resampler degraded mode, so do not install
+or advertise the Director until the resampler check succeeds.
+
+An exact `torchaudio==2.14.1` wheel was not found on PyPI. A compatible candidate
+is the official `torchaudio==2.11.0` CPython 3.10 `manylinux_2_28_aarch64` wheel.
+[TorchAudio's compatibility matrix](https://docs.pytorch.org/audio/stable/installation.html)
+says 2.11 uses PyTorch's stable ABI and supports PyTorch 2.11 and later; the
+[PyPI release](https://pypi.org/project/torchaudio/2.11.0/#files) has no declared
+dependencies that could ask pip to replace the existing Torch stack. The selected
+wheel SHA-256 is pinned in
+[`infra/gx10-director/requirements.lock`](../infra/gx10-director/requirements.lock).
+This establishes a documented compatibility candidate, not proof on the GB10.
+
+The same lock pins all 30 direct and transitive Python wheels, one SHA-256 per
+artifact, for CPython 3.10 on ARM64. The lock deliberately omits `torch`,
+`torchvision`, and `opencv-python`. Ultralytics declares `opencv-python`, while the
+pinned Director declares `opencv-python-headless`; the image uses the headless wheel
+as the single `cv2` provider. The build fails if a desktop `opencv-python` distribution
+or either `opencv-contrib-python` distribution is also present, or if the headless
+version does not satisfy Ultralytics' declared version range. It imports `cv2`,
+`imageio_ffmpeg`, `scenedetect`, and `ultralytics` (with a temporary YOLO config
+directory) without loading a model. This deliberate package-name substitution avoids
+overlapping native files. Upstream metadata does not recognize this alias, so the
+runtime accepts `pip check` only when its sole output is the exact missing
+`ultralytics ... requires opencv-python` line for the installed Ultralytics version.
+Every other `pip check` failure remains fatal. `pip download --require-hashes --only-binary` verified
+all 30 artifacts from PyPI on 2026-10-15: 159,177,563 bytes. No source builds were
+needed. The wheel files are generated inputs and are not committed. An empty
+`wheels/` directory is expected until the fetch step below runs; `.gitignore` excludes
+only generated `*.whl` files and keeps the directory marker tracked.
+
+Ubuntu's [Jammy ARM64 package](https://packages.ubuntu.com/jammy/ffmpeg) supplies
+FFmpeg `7:4.4.2-0ubuntu0.22.04.1`; its [ffprobe tool](https://manpages.ubuntu.com/manpages/jammy/man1/ffprobe-all.1.html)
+is provided by the same package. The image recipe pins that package and an
+[Ubuntu archive snapshot](https://snapshot.ubuntu.com/), rather than depending on
+whichever apt version is current at build time. The target's glibc 2.35 satisfies
+the selected manylinux 2.28 floor.
+
+On the GX10, after choosing to build the derived image:
+
+```sh
+# From the ai-video-studio checkout; this downloads wheels only, not models.
+bash infra/gx10-director/fetch-wheels.sh
+
+# Capture the exact local base image ID, then require the same ID at build time.
+docker image inspect --format '{{.Id}} {{.Config.User}}' comfyui:local
+EXPECTED_BASE_IMAGE_ID='sha256:<captured-image-id>' \
+  bash infra/gx10-director/build-image.sh
+```
+
+If ComfyUI uses a Python other than `/usr/bin/python3`, set `PYTHON` to that
+interpreter when invoking `build-image.sh`.
+
+`build-image.sh` refuses a changed or non-ARM64 base image, detects and preserves its configured
+user, and builds for `linux/arm64`. The Dockerfile installs only the hash-locked
+wheelhouse with `--no-index --no-deps --require-hashes`, installs the pinned Ubuntu
+FFmpeg package from the fixed snapshot, then verifies the exact Torch, torchvision,
+and CUDA versions are unchanged. Its CPU smoke test imports OpenCV and TorchAudio,
+checks Pillow and the ComfyUI-provided SciPy, safetensors, and aiohttp dependencies,
+round-trips a synthetic NumPy waveform through TorchAudio on CPU, and checks both
+`ffmpeg` and `ffprobe`; it does not query or execute a GPU. Change the recorded base
+ID, apt snapshot, or wheel lock only as a reviewed dependency update.
+
+This is a dependency-only image layer. Install the hash-verified Director source
+and Studio bridge with the existing source installer into the intended ComfyUI
+`custom_nodes` location; do not assume an existing custom-node volume will expose
+files baked into an image. Restart, fresh `/object_info`, model readiness, native
+media paths, GPU execution, and all H3 qualification gates still require operator
+verification on the target. No claim of GX10 runtime qualification is made here.
 
 NVIDIA VFX is optional upstream and is not installed or validated here. Do not
 enable `nvidia_rtx_vsr` without separate qualification. Dependency metadata does not
@@ -134,12 +207,11 @@ and tests. Official ZIP verification checks all 105 file hashes and all four
 bridge seam hashes without importing upstream code. Negative tests cover source
 drift, missing/extra files, symlinks, corrupt archives, unsafe paths, missing or
 incompatible dependencies, destination preservation, and node contract failures.
-Review: implementation self-review completed. Dalton's P2 malformed-schema finding
-was reproduced and addressed; independent re-review approved the final package,
-including all 34 known socket deletion cases and 133 passing scoped tests.
-No independent runtime review was performed.
+The source-package regression suite was expanded after malformed-schema review;
+an independent re-review approved that package iteration with 133 scoped tests.
+No independent GX10 runtime review was performed.
 
-Validation on 2026-10-15 (repository root):
+Source-package validation from the earlier iteration on 2026-10-15 (repository root):
 
 ```powershell
 # ast.parse on installer, bridge, new tests, and existing native-manifest tests: OK
@@ -164,7 +236,8 @@ types, and duplicate required/optional sockets. The positive fixture now reflect
 the official required schemas and essential optional sockets rather than using
 the same placeholder fields for all nodes.
 
-No SSH, containers, GPU, live database, migrations, model downloads, commit, push,
-reset, or clean operations were used. ARM64 imports, native codecs, ComfyUI startup,
-and GPU execution remain untested. The main task owns the cross-task ledger and
-Docker/compose validation; this scoped task writes no shared ledger or infra files.
+No SSH, container build/run, GPU, live database, migrations, model downloads, commit,
+push, reset, or clean operations were used for the dependency task. ARM64 imports,
+native codecs, ComfyUI startup, and GPU execution remain untested. Current recipe
+verification and target-side gates are recorded in
+[`tasks/gx10-director-dependencies-2026-10-15.md`](../tasks/gx10-director-dependencies-2026-10-15.md).
