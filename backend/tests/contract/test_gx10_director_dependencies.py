@@ -3,6 +3,7 @@
 import importlib.util
 import os
 import re
+import sys
 from importlib.metadata import PackageNotFoundError
 from pathlib import Path
 from types import SimpleNamespace
@@ -89,6 +90,57 @@ def test_apt_one_line_entries_use_list_format_consistently():
     assert source_paths == ["/tmp/gx10-director.list"] * 4
     assert dockerfile.count('"deb [check-valid-until=no]') == 3
     assert "-o Dir::Etc::sourceparts=-" in dockerfile
+
+
+@pytest.mark.parametrize("override, error", [
+    ({}, None),
+    ({"torch_metadata": "2.14.0"}, "runtime package version mismatch: torch"),
+    ({"torchvision_metadata": "0.29.0"}, "runtime package version mismatch: torchvision"),
+    ({"torch_runtime": "2.14.1+cpu"}, "torch/torchvision stack changed"),
+    ({"torchvision_runtime": "0.29.1+cpu"}, "torch/torchvision stack changed"),
+    ({"cuda": "12.9"}, "CUDA build changed"),
+    ({"numpy_metadata": "2.2.6+vendor"}, "locked package version mismatch: numpy"),
+])
+def test_nvidia_metadata_and_exact_runtime_integrity(monkeypatch, override, error):
+    verifier = _VERIFY_MODULE
+    monkeypatch.setenv("EXPECTED_TORCH", "2.14.1+cu130")
+    monkeypatch.setenv("EXPECTED_TORCHVISION", "0.29.1+cu130")
+    monkeypatch.setenv("EXPECTED_CUDA", "13.0")
+    monkeypatch.setattr(verifier.platform, "python_implementation", lambda: "CPython")
+    monkeypatch.setattr(verifier.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(verifier.platform, "machine", lambda: "aarch64")
+    monkeypatch.setattr(sys, "version_info", (3, 10, 0))
+    versions = verifier.locked_packages() | {
+        "torch": override.get("torch_metadata", "2.14.1"),
+        "torchvision": override.get("torchvision_metadata", "0.29.1"),
+    }
+    if "numpy_metadata" in override:
+        versions["numpy"] = override["numpy_metadata"]
+    monkeypatch.setattr(verifier.metadata, "version", versions.__getitem__)
+    monkeypatch.setattr(verifier, "verify_base_runtime_packages", lambda: {})
+    monkeypatch.setattr(verifier, "verify_opencv_provider", lambda: {})
+    monkeypatch.setattr(verifier, "verify_base_runtime_imports", lambda: None)
+    monkeypatch.setattr(verifier, "verify_director_imports", lambda: ())
+
+    def reached_resampler(*args, **kwargs):
+        raise RuntimeError("version checks passed; reached resampler")
+
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(
+        __version__=override.get("torch_runtime", "2.14.1+cu130"),
+        version=SimpleNamespace(cuda=override.get("cuda", "13.0")),
+        tensor=reached_resampler, float32=object(),
+    ))
+    monkeypatch.setitem(sys.modules, "torchvision", SimpleNamespace(
+        __version__=override.get("torchvision_runtime", "0.29.1+cu130"),
+    ))
+    monkeypatch.setitem(sys.modules, "torchaudio", SimpleNamespace())
+    monkeypatch.setitem(sys.modules, "cv2", SimpleNamespace())
+    if error is None:
+        with pytest.raises(RuntimeError, match="version checks passed; reached resampler"):
+            verifier.main()
+    else:
+        with pytest.raises(SystemExit, match=error):
+            verifier.main()
 
 
 def test_runtime_verifier_fails_closed_when_comfyui_base_dependency_is_missing():

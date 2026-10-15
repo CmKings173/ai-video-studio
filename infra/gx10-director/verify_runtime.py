@@ -13,6 +13,8 @@ import tempfile
 from importlib import import_module, metadata
 from pathlib import Path
 
+from packaging.version import Version
+
 ROOT = Path(__file__).resolve().parent
 BASE_RUNTIME_PACKAGES = ("scipy", "safetensors", "aiohttp")
 DIRECTOR_IMPORTS = ("PIL", "cv2", "imageio_ffmpeg", "scenedetect", "numpy")
@@ -141,7 +143,14 @@ def main() -> None:
         if version != locked[name]:
             raise SystemExit(f"locked package version mismatch: {name}={version}")
     for name, version in expected.items():
-        if metadata.version(name) != version:
+        installed_version = metadata.version(name)
+        if name in {"torch", "torchvision"}:
+            # NVIDIA metadata may omit the CUDA local suffix. Full imported
+            # runtime versions and the CUDA build are checked separately below.
+            matches = Version(installed_version).public == Version(version).public
+        else:
+            matches = installed_version == version
+        if not matches:
             raise SystemExit(f"runtime package version mismatch: {name}")
     base_versions = verify_base_runtime_packages()
     opencv_provider = verify_opencv_provider()
